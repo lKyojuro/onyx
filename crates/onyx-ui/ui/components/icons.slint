@@ -1,15 +1,77 @@
 import { OnyxTheme } from "../tokens.slint";
 
+export global OnyxIconSize {
+    out property <length> small: 12px;
+    out property <length> standard: 16px;
+    out property <length> medium: 24px;
+    out property <length> large: 40px;
+}
+
 // Crisp Lucide-style 24x24 vector icons for Onyx UI
 export component OnyxIcon inherits Rectangle {
     in property <string> name: "";
-    in property <length> size: 15px;
+    in property <length> size: OnyxIconSize.standard;
     in property <color> icon-color: OnyxTheme.text-primary;
-    in property <length> stroke-w: 1.6px;
+    property <length> stroke-w: 1.75px;
 
     width: size;
     height: size;
     background: transparent;
+
+    if name == "chevron-left" || name == "chevron-right" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: root.name == "chevron-left" ? 15 : 9; y: 5; }
+        LineTo { x: root.name == "chevron-left" ? 8 : 16; y: 12; }
+        LineTo { x: root.name == "chevron-left" ? 15 : 9; y: 19; }
+    }
+
+    if name == "sort-ascending" || name == "sort-descending" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 5; y: root.name == "sort-ascending" ? 15 : 9; }
+        LineTo { x: 12; y: root.name == "sort-ascending" ? 8 : 16; }
+        LineTo { x: 19; y: root.name == "sort-ascending" ? 15 : 9; }
+    }
+
+    if name == "arrow-up-right" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 4; y: 20; } LineTo { x: 20; y: 4; }
+        MoveTo { x: 7; y: 4; } LineTo { x: 20; y: 4; } LineTo { x: 20; y: 17; }
+    }
+
+    if name == "music" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 9; y: 18; } LineTo { x: 9; y: 5; }
+        LineTo { x: 20; y: 3; } LineTo { x: 20; y: 16; }
+        MoveTo { x: 9; y: 18; }
+        ArcTo { x: 3; y: 18; radius-x: 3; radius-y: 3; sweep: true; large-arc: false; }
+        ArcTo { x: 9; y: 18; radius-x: 3; radius-y: 3; sweep: true; large-arc: false; }
+        MoveTo { x: 20; y: 16; }
+        ArcTo { x: 14; y: 16; radius-x: 3; radius-y: 3; sweep: true; large-arc: false; }
+        ArcTo { x: 20; y: 16; radius-x: 3; radius-y: 3; sweep: true; large-arc: false; }
+    }
+
+    if name == "video" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 3; y: 5; } LineTo { x: 21; y: 5; }
+        LineTo { x: 21; y: 19; } LineTo { x: 3; y: 19; } Close { }
+        MoveTo { x: 10; y: 9; } LineTo { x: 15; y: 12; }
+        LineTo { x: 10; y: 15; } Close { }
+    }
 
     // Back arrow
     if name == "back" : Path {

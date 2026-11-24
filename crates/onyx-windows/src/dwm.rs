@@ -4,11 +4,18 @@ use onyx_core::{OnyxError, OnyxResult};
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::Mutex;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{
+    DWM_E_COMPOSITIONDISABLED, E_INVALIDARG, E_NOTIMPL, ERROR_NOT_SUPPORTED, HINSTANCE, HWND,
+    LPARAM, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{
     DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE, DWMSBT_MAINWINDOW, DWMSBT_NONE,
-    DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_ROUND, DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TEXT_COLOR,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+    DwmSetWindowAttribute,
+};
+use windows::Win32::Graphics::Gdi::{
+    DEFAULT_CHARSET, EnumFontFamiliesExW, GetDC, LOGFONTW, ReleaseDC, TEXTMETRICW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -90,6 +97,101 @@ fn load_exe_icons() -> windows::core::Result<[OwnedIcon; 2]> {
         .map(|handle| OwnedIcon(handle.0 as isize))
     };
     Ok([load(SM_CXSMICON, SM_CYSMICON)?, load(SM_CXICON, SM_CYICON)?])
+}
+
+/// Checks whether a system font family is available to the current Windows session.
+pub fn has_system_font_family(family: &str) -> bool {
+    let mut query = LOGFONTW {
+        lfCharSet: DEFAULT_CHARSET,
+        ..Default::default()
+    };
+    let name = crate::to_wide_null(family.as_ref());
+    let Some(face_name) = query.lfFaceName.get_mut(..name.len()) else {
+        return false;
+    };
+    if family.is_empty() || family.contains('\0') {
+        return false;
+    }
+    face_name.copy_from_slice(&name);
+
+    // SAFETY: A null HWND requests a screen DC, which is released below on this thread.
+    let dc = unsafe { GetDC(None) };
+    if dc.is_invalid() {
+        return false;
+    }
+    let mut found = false;
+    // SAFETY: The query and output remain valid for the synchronous enumeration.
+    unsafe {
+        EnumFontFamiliesExW(
+            dc,
+            &raw const query,
+            Some(mark_font_found),
+            LPARAM((&raw mut found) as isize),
+            0,
+        );
+        ReleaseDC(None, dc);
+    }
+    found
+}
+
+unsafe extern "system" fn mark_font_found(
+    _: *const LOGFONTW,
+    _: *const TEXTMETRICW,
+    _: u32,
+    found: LPARAM,
+) -> i32 {
+    // SAFETY: has_system_font_family passes a live, exclusively borrowed bool.
+    unsafe { *(found.0 as *mut bool) = true };
+    0
+}
+
+/// Sets the native caption, caption text, and border from packed 0xRRGGBB values.
+/// Builds before Windows 11 22000 can ignore these attributes.
+pub fn apply_titlebar_colors(
+    hwnd: isize,
+    caption_rgb: u32,
+    text_rgb: u32,
+    border_rgb: u32,
+) -> OnyxResult<()> {
+    let window = crate::own_window(hwnd)?;
+    for (attribute, rgb) in [
+        (DWMWA_CAPTION_COLOR, caption_rgb),
+        (DWMWA_TEXT_COLOR, text_rgb),
+        (DWMWA_BORDER_COLOR, border_rgb),
+    ] {
+        let color = rgb_to_colorref(rgb);
+        // SAFETY: The window belongs to this process and the payload is a 32-bit COLORREF.
+        if let Err(error) = unsafe {
+            DwmSetWindowAttribute(
+                window,
+                attribute,
+                (&raw const color).cast(),
+                size_of::<u32>() as u32,
+            )
+        } {
+            match error.code() {
+                E_INVALIDARG | E_NOTIMPL | DWM_E_COMPOSITIONDISABLED => {
+                    tracing::debug!(?attribute, %error, "DWM title bar color is unavailable");
+                }
+                code if code == ERROR_NOT_SUPPORTED.to_hresult() => {
+                    tracing::debug!(?attribute, %error, "DWM title bar color is unavailable");
+                }
+                _ => {
+                    return Err(OnyxError::Platform {
+                        message: format!(
+                            "Could not set DWM title bar attribute {attribute:?}: {error}"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rgb_to_colorref(rgb: u32) -> u32 {
+    let [_, red, green, blue] = rgb.to_be_bytes();
+    u32::from_le_bytes([red, green, blue, 0])
 }
 
 /// Applies Windows 11 DWM visual attributes to a top-level window handle:
@@ -179,5 +281,21 @@ mod tests {
     fn reject_null_and_invalid_hwnd() {
         assert!(apply_window_backdrop(0, true, true).is_err());
         assert!(apply_window_backdrop(0xDEAD_BEEF, true, false).is_err());
+    }
+
+    #[test]
+    fn titlebar_colors_reject_null_and_invalid_hwnds() {
+        for hwnd in [0, 0xDEAD_BEEF] {
+            assert!(matches!(
+                apply_titlebar_colors(hwnd, 0, 0xFFFFFF, 0),
+                Err(OnyxError::Platform { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn packs_opaque_colorref_in_windows_byte_order() {
+        assert_eq!(rgb_to_colorref(0x0012_34AB), 0x00AB_3412);
+        assert_eq!(rgb_to_colorref(0xFF12_34AB), 0x00AB_3412);
     }
 }

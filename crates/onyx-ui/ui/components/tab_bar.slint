@@ -1,7 +1,7 @@
 import { OnyxTheme } from "../tokens.slint";
 import { UiTabItem } from "../types.slint";
 import { FluentButton } from "common.slint";
-import { OnyxIcon } from "icons.slint";
+import { OnyxIcon, OnyxIconSize } from "icons.slint";
 
 export component TabBar inherits Rectangle {
     in property <[UiTabItem]> tabs;
@@ -41,9 +41,9 @@ export component TabBar inherits Rectangle {
             Text {
                 text: "ONYX";
                 font-family: OnyxTheme.font-brand;
-                font-size: 14px;
+                font-size: OnyxTheme.font-lg;
                 font-weight: 600;
-                letter-spacing: 2.4px;
+                letter-spacing: 1px;
                 color: OnyxTheme.text-primary;
                 vertical-alignment: center;
             }
@@ -141,12 +141,12 @@ export component TabBar inherits Rectangle {
                         accessible-role: button;
                         accessible-label: "Move tab left";
 
-                        Text {
-                            text: "‹";
-                            font-size: 12px;
-                            color: OnyxTheme.text-muted;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                        OnyxIcon {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            name: "chevron-left";
+                            size: OnyxIconSize.small;
+                            icon-color: OnyxTheme.text-muted;
                         }
 
                         left-ta := TouchArea {
@@ -166,12 +166,12 @@ export component TabBar inherits Rectangle {
                         accessible-role: button;
                         accessible-label: "Move tab right";
 
-                        Text {
-                            text: "›";
-                            font-size: 12px;
-                            color: OnyxTheme.text-muted;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                        OnyxIcon {
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            name: "chevron-right";
+                            size: OnyxIconSize.small;
+                            icon-color: OnyxTheme.text-muted;
                         }
 
                         right-ta := TouchArea {
@@ -191,10 +191,9 @@ export component TabBar inherits Rectangle {
                         accessible-label: "Close tab";
 
                         OnyxIcon {
-                            x: 4px;
-                            y: 4px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
                             name: "close";
-                            size: 12px;
                             icon-color: close-ta.has-hover ? OnyxTheme.text-primary : OnyxTheme.text-muted;
                         }
 

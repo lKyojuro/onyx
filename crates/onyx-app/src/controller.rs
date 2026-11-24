@@ -1,7 +1,7 @@
 use onyx_config::ConfigStore;
 use onyx_core::{FileEntry, KnownFolderKind, PaneId, ThemeMode, ViewMode};
 use onyx_fs::DirectoryWatcher;
-use onyx_ui::OnyxWindow;
+use onyx_ui::{OnyxTheme, OnyxWindow};
 use slint::{ComponentHandle, ModelRc, PhysicalSize, Weak};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -65,12 +65,20 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
                         .as_deref()
                         .and_then(ui_sync::accent_color)
                 });
-            Ok((store, config, session, home, path, dark, accent, folders))
+            let fonts = ui_sync::system_fonts();
+            Ok((
+                store, config, session, home, path, dark, accent, folders, fonts,
+            ))
         })
         .await
     })??;
-    let (store, config, session, home, path, dark, accent, folders) = startup;
+    let (store, config, session, home, path, dark, accent, folders, fonts) = startup;
     let ui = OnyxWindow::new()?;
+    let [ui_font, brand_font, mono_font] = fonts;
+    let theme = ui.global::<OnyxTheme>();
+    theme.set_font_family(ui_font.into());
+    theme.set_font_brand(brand_font.into());
+    theme.set_font_mono(mono_font.into());
     ui.window().set_size(PhysicalSize::new(
         session.window_width,
         session.window_height,
@@ -105,14 +113,17 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
         }
     });
     ui.show()?;
-    if let Some(hwnd) = ui_sync::window_hwnd(&ui) {
-        ui_sync::apply_backdrop(hwnd, ui.get_dark_mode());
-        controller.runtime.spawn_blocking(move || {
-            if let Err(error) = onyx_windows::set_window_icon_from_exe(hwnd) {
-                tracing::warn!(%error, "could not set the Windows window icon");
-            }
-        });
-    }
+    // Winit creates the native window when the event loop starts.
+    post(&controller.ui, |controller, ui| {
+        if let Some(hwnd) = ui_sync::window_hwnd(ui) {
+            ui_sync::apply_window_theme(hwnd, ui);
+            controller.runtime.spawn_blocking(move || {
+                if let Err(error) = onyx_windows::set_window_icon_from_exe(hwnd) {
+                    tracing::warn!(%error, "could not set the Windows window icon");
+                }
+            });
+        }
+    });
     controller.sync_chrome(&ui);
     controller.update_watcher();
     let visible: Vec<_> = controller.state.borrow().visible_panes().collect();
@@ -423,7 +434,7 @@ impl Controller {
         };
         ui.set_dark_mode(dark);
         if let Some(hwnd) = ui_sync::window_hwnd(ui) {
-            ui_sync::apply_backdrop(hwnd, dark);
+            ui_sync::apply_window_theme(hwnd, ui);
         }
     }
 }

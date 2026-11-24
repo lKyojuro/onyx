@@ -2,7 +2,7 @@ import { LineEdit } from "std-widgets.slint";
 import { OnyxTheme } from "../tokens.slint";
 import { UiBreadcrumb } from "../types.slint";
 import { FluentButton, FluentChip } from "common.slint";
-import { OnyxIcon } from "icons.slint";
+import { OnyxIcon, OnyxIconSize } from "icons.slint";
 
 export component NavBar inherits Rectangle {
     in property <int> active-pane: 0;
@@ -109,11 +109,13 @@ export component NavBar inherits Rectangle {
                     spacing: 2px;
                     horizontal-stretch: 0;
 
-                    if idx > 0 : Text {
-                        text: "›";
-                        font-size: OnyxTheme.font-sm;
-                        color: OnyxTheme.text-muted;
-                        vertical-alignment: center;
+                    if idx > 0 : VerticalLayout {
+                        alignment: center;
+                        OnyxIcon {
+                            name: "chevron-right";
+                            size: OnyxIconSize.small;
+                            icon-color: OnyxTheme.text-muted;
+                        }
                     }
 
                     Rectangle {
@@ -170,10 +172,9 @@ export component NavBar inherits Rectangle {
                     accessible-label: root.is-current-favorite ? "Remove folder from favorites" : "Pin folder to favorites";
 
                     OnyxIcon {
-                        x: 5px;
-                        y: 5px;
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
                         name: root.is-current-favorite ? "star-filled" : "star";
-                        size: 14px;
                         icon-color: root.is-current-favorite ? OnyxTheme.accent-bright : OnyxTheme.text-muted;
                     }
 
@@ -210,7 +211,7 @@ export component NavBar inherits Rectangle {
                         horizontal-stretch: 1;
                         text <=> root.address-text;
                         placeholder-text: "Enter path and press Enter...";
-                        font-size: OnyxTheme.font-sm;
+                        font-size: OnyxTheme.font-md;
                         accepted(text) => {
                             root.address-editing = false;
                             root.submit-address(text);
@@ -262,7 +263,6 @@ export component NavBar inherits Rectangle {
                         horizontal-stretch: 0;
                         OnyxIcon {
                             name: "search";
-                            size: 14px;
                             icon-color: OnyxTheme.text-muted;
                         }
                     }
@@ -271,7 +271,7 @@ export component NavBar inherits Rectangle {
                         horizontal-stretch: 1;
                         text <=> root.search-text;
                         placeholder-text: root.indexed-search ? "Search index..." : "Filter folder...";
-                        font-size: OnyxTheme.font-sm;
+                        font-size: OnyxTheme.font-md;
                         edited(text) => { root.search-changed(text); }
                         accepted(text) => { root.search-submitted(text); }
                     }
@@ -287,10 +287,9 @@ export component NavBar inherits Rectangle {
                         accessible-label: "Clear search";
 
                         OnyxIcon {
-                            x: 4px;
-                            y: 4px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
                             name: "close";
-                            size: 12px;
                             icon-color: OnyxTheme.text-muted;
                         }
 

@@ -32,11 +32,8 @@ export component Toolbar inherits Rectangle {
     callback toggle-theme();
     callback toggle-command-palette();
 
-    pure function sort-label(base: string, col: int) -> string {
-        if root.sort-column == col {
-            return base + (root.sort-ascending ? " ▲" : " ▼");
-        }
-        return base;
+    pure function sort-icon(column: int) -> string {
+        return root.sort-column == column ? (root.sort-ascending ? "sort-ascending" : "sort-descending") : "";
     }
 
     height: 40px;
@@ -134,7 +131,8 @@ export component Toolbar inherits Rectangle {
 
             // Sort column controls
             FluentButton {
-                label: root.sort-label("Name", 0);
+                label: "Name";
+                trailing-icon: root.sort-icon(0);
                 a11y-label: "Sort by name";
                 compact: true;
                 active: root.sort-column == 0;
@@ -142,7 +140,8 @@ export component Toolbar inherits Rectangle {
             }
 
             FluentButton {
-                label: root.sort-label("Date", 1);
+                label: "Date";
+                trailing-icon: root.sort-icon(1);
                 a11y-label: "Sort by date modified";
                 compact: true;
                 active: root.sort-column == 1;
@@ -150,7 +149,8 @@ export component Toolbar inherits Rectangle {
             }
 
             FluentButton {
-                label: root.sort-label("Type", 2);
+                label: "Type";
+                trailing-icon: root.sort-icon(2);
                 a11y-label: "Sort by type";
                 compact: true;
                 active: root.sort-column == 2;
@@ -158,7 +158,8 @@ export component Toolbar inherits Rectangle {
             }
 
             FluentButton {
-                label: root.sort-label("Size", 3);
+                label: "Size";
+                trailing-icon: root.sort-icon(3);
                 a11y-label: "Sort by size";
                 compact: true;
                 active: root.sort-column == 3;

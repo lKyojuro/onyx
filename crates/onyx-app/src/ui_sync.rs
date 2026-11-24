@@ -5,7 +5,8 @@ use onyx_core::{
 };
 use onyx_preview::PreviewContent;
 use onyx_ui::{
-    OnyxWindow, UiBreadcrumb, UiDriveItem, UiFileEntry, UiMetadataRow, UiSidebarItem, UiTabItem,
+    OnyxTheme, OnyxWindow, UiBreadcrumb, UiDriveItem, UiFileEntry, UiMetadataRow, UiSidebarItem,
+    UiTabItem,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
@@ -42,9 +43,38 @@ pub(crate) fn window_hwnd(ui: &OnyxWindow) -> Option<isize> {
     }
 }
 
-pub(crate) fn apply_backdrop(hwnd: isize, dark: bool) {
-    if let Err(error) = onyx_windows::apply_window_backdrop(hwnd, dark, true) {
+pub(crate) fn system_fonts() -> [&'static str; 3] {
+    fn preferred(preferred: &'static str, fallback: &'static str) -> &'static str {
+        if onyx_windows::has_system_font_family(preferred) {
+            preferred
+        } else {
+            fallback
+        }
+    }
+
+    let ui = preferred("Segoe UI Variable Text", "Segoe UI");
+    [
+        ui,
+        preferred("Bahnschrift", ui),
+        preferred("Cascadia Mono", "Consolas"),
+    ]
+}
+
+pub(crate) fn apply_window_theme(hwnd: isize, ui: &OnyxWindow) {
+    if let Err(error) = onyx_windows::apply_window_backdrop(hwnd, ui.get_dark_mode(), true) {
         tracing::debug!(%error, "could not apply the Windows backdrop");
+    }
+
+    let theme = ui.global::<OnyxTheme>();
+    let rgb =
+        |color: slint::Color| u32::from_be_bytes([0, color.red(), color.green(), color.blue()]);
+    if let Err(error) = onyx_windows::apply_titlebar_colors(
+        hwnd,
+        rgb(theme.get_bg_chrome()),
+        rgb(theme.get_text_primary()),
+        rgb(theme.get_border_subtle()),
+    ) {
+        tracing::debug!(%error, "could not apply the Windows title bar colors");
     }
 }
 
@@ -54,13 +84,13 @@ pub(crate) fn known_folders(ui: &OnyxWindow, folders: Vec<KnownFolder>) {
             label: folder.name.into(),
             path: display_path(&folder.path),
             icon_glyph: match folder.kind {
-                KnownFolderKind::Home => "⌂",
-                KnownFolderKind::Desktop => "▣",
-                KnownFolderKind::Downloads => "↓",
-                KnownFolderKind::Documents => "▤",
-                KnownFolderKind::Pictures => "▧",
-                KnownFolderKind::Music => "♫",
-                KnownFolderKind::Videos => "▷",
+                KnownFolderKind::Home => "home",
+                KnownFolderKind::Desktop => "desktop",
+                KnownFolderKind::Downloads => "download",
+                KnownFolderKind::Documents => "file",
+                KnownFolderKind::Pictures => "image",
+                KnownFolderKind::Music => "music",
+                KnownFolderKind::Videos => "video",
             }
             .into(),
             is_favorite: false,
@@ -100,7 +130,7 @@ pub(crate) fn chrome(ui: &OnyxWindow, state: &State) {
         UiSidebarItem {
             label: item.name.as_str().into(),
             path: display_path(&item.path),
-            icon_glyph: "★".into(),
+            icon_glyph: "star-filled".into(),
             is_favorite: true,
         }
     })));

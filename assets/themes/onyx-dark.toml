@@ -14,7 +14,7 @@ accent_subtle = "#8a7fe829"
 accent_border = "#b4aaff48"
 
 bg_base = "#000000"
-bg_chrome = "#080817eb"
+bg_chrome = "#080817"
 bg_sidebar = "#090913e8"
 bg_surface = "#0d0c20ee"
 bg_surface_alt = "#0b0a1cd6"
@@ -35,7 +35,7 @@ border_focus = "#8a7fe8"
 
 text_primary = "#f1f0ff"
 text_secondary = "#a6a3c0"
-text_muted = "#7c789c"
+text_muted = "#8884a8"
 text_on_accent = "#06061a"
 
 folder_tint = "#b4aaff"
@@ -61,10 +61,10 @@ md = 12
 lg = 16
 
 [typography]
-font_family = "Segoe UI"
-font_mono = "Consolas"
-size_xs = 11
-size_sm = 12
-size_md = 13
+font_family = "Segoe UI Variable Text"
+font_mono = "Cascadia Mono"
+size_xs = 12
+size_sm = 13
+size_md = 14
 size_lg = 15
 size_xl = 18

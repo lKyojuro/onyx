@@ -1,7 +1,7 @@
 import { ListView } from "std-widgets.slint";
 import { OnyxTheme } from "../tokens.slint";
 import { UiFileEntry } from "../types.slint";
-import { OnyxIcon } from "icons.slint";
+import { OnyxIcon, OnyxIconSize } from "icons.slint";
 
 component EntryGlyph inherits Rectangle {
     in property <bool> is-dir: false;
@@ -24,7 +24,6 @@ component EntryGlyph inherits Rectangle {
         name: root.is-dir ? "folder" : "file";
         size: root.icon-size;
         icon-color: root.is-dir ? OnyxTheme.folder-tint : OnyxTheme.file-tint;
-        stroke-w: root.icon-size > 24px ? 1.4px : 1.7px;
     }
 
     if root.is-symlink : Rectangle {
@@ -37,13 +36,10 @@ component EntryGlyph inherits Rectangle {
         border-width: 1px;
         border-color: OnyxTheme.symlink-tint;
 
-        Text {
-            text: "↗";
-            font-size: 7px;
-            font-weight: 700;
-            color: OnyxTheme.symlink-tint;
-            horizontal-alignment: center;
-            vertical-alignment: center;
+        OnyxIcon {
+            size: 8px;
+            name: "arrow-up-right";
+            icon-color: OnyxTheme.symlink-tint;
         }
     }
 }
@@ -68,18 +64,26 @@ component ColumnHeaderButton inherits Rectangle {
     HorizontalLayout {
         padding-left: 8px;
         padding-right: 8px;
+        spacing: 2px;
+        alignment: root.text-align == right ? end : start;
 
         Text {
-            text: root.active-column == root.column-index
-                ? (root.label + (root.ascending ? "  ▲" : "  ▼"))
-                : root.label;
+            text: root.label;
             font-size: OnyxTheme.font-xs;
             font-weight: root.active-column == root.column-index ? 600 : 500;
             color: root.active-column == root.column-index ? OnyxTheme.accent-bright : OnyxTheme.text-muted;
             vertical-alignment: center;
             horizontal-alignment: root.text-align;
-            horizontal-stretch: 1;
             overflow: elide;
+        }
+
+        if root.active-column == root.column-index : VerticalLayout {
+            alignment: center;
+            OnyxIcon {
+                name: root.ascending ? "sort-ascending" : "sort-descending";
+                size: OnyxIconSize.small;
+                icon-color: OnyxTheme.accent-bright;
+            }
         }
     }
 
@@ -567,7 +571,7 @@ export component FilePane inherits Rectangle {
 
                             Text {
                                 text: entry.size_label != "" ? entry.size_label : entry.type_label;
-                                font-size: 10px;
+                                font-size: OnyxTheme.font-xs;
                                 color: OnyxTheme.text-muted;
                                 horizontal-alignment: center;
                                 overflow: elide;

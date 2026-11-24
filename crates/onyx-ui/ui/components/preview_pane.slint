@@ -2,7 +2,7 @@ import { ScrollView } from "std-widgets.slint";
 import { OnyxTheme } from "../tokens.slint";
 import { UiMetadataRow } from "../types.slint";
 import { FluentButton, FluentChip, HorizontalDivider } from "common.slint";
-import { OnyxIcon } from "icons.slint";
+import { OnyxIcon, OnyxIconSize } from "icons.slint";
 
 export component PreviewPane inherits Rectangle {
     in property <string> preview-title: "";
@@ -138,7 +138,7 @@ export component PreviewPane inherits Rectangle {
                     alignment: center;
                     OnyxIcon {
                         name: "panel-right";
-                        size: 28px;
+                        size: OnyxIconSize.medium;
                         icon-color: OnyxTheme.text-muted;
                     }
                 }
@@ -169,7 +169,7 @@ export component PreviewPane inherits Rectangle {
                     alignment: center;
                     OnyxIcon {
                         name: "refresh";
-                        size: 24px;
+                        size: OnyxIconSize.medium;
                         icon-color: OnyxTheme.accent-bright;
                     }
                 }
@@ -307,9 +307,8 @@ export component PreviewPane inherits Rectangle {
                     alignment: center;
                     OnyxIcon {
                         name: root.preview-kind == "directory" ? "folder" : "file";
-                        size: 40px;
+                        size: OnyxIconSize.large;
                         icon-color: root.preview-kind == "directory" ? OnyxTheme.folder-tint : OnyxTheme.file-tint;
-                        stroke-w: 1.4px;
                     }
                 }
 
@@ -353,9 +352,9 @@ export component PreviewPane inherits Rectangle {
 
                         Text {
                             text: "DETAILS";
-                            font-size: 10px;
+                            font-size: OnyxTheme.font-xs;
                             font-weight: 700;
-                            letter-spacing: 0.8px;
+                            letter-spacing: 0.6px;
                             color: OnyxTheme.text-muted;
                         }
 

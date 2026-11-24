@@ -18,7 +18,9 @@ pub use clipboard::{get_clipboard_files, set_clipboard_files};
 pub use com::ComGuard;
 pub use context_menu::show_context_menu;
 pub use drives::{enumerate_drives, free_disk_space};
-pub use dwm::{apply_window_backdrop, set_window_icon_from_exe};
+pub use dwm::{
+    apply_titlebar_colors, apply_window_backdrop, has_system_font_family, set_window_icon_from_exe,
+};
 pub use icons::{RgbaIcon, extract_file_icon_rgba};
 pub use known_folders::enumerate_known_folders;
 pub use shell::{

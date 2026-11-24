@@ -87,7 +87,6 @@ export component CommandPaletteModal inherits Rectangle {
                         alignment: center;
                         OnyxIcon {
                             name: "command";
-                            size: 16px;
                             icon-color: OnyxTheme.accent-bright;
                         }
                     }
@@ -198,7 +197,7 @@ export component CommandPaletteModal inherits Rectangle {
                                         Text {
                                             text: cmd.shortcut;
                                             font-family: OnyxTheme.font-mono;
-                                            font-size: 10px;
+                                            font-size: OnyxTheme.font-xs;
                                             color: OnyxTheme.accent-bright;
                                             vertical-alignment: center;
                                         }
@@ -283,7 +282,6 @@ export component PromptDialogModal inherits Rectangle {
                         alignment: center;
                         OnyxIcon {
                             name: "warning";
-                            size: 18px;
                             icon-color: OnyxTheme.danger;
                         }
                     }

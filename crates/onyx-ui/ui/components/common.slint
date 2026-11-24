@@ -1,5 +1,5 @@
 import { OnyxTheme } from "../tokens.slint";
-import { OnyxIcon } from "icons.slint";
+import { OnyxIcon, OnyxIconSize } from "icons.slint";
 
 // Crisp geometric Onyx emblem in luminous violet-indigo crystal aesthetic
 export component OnyxEmblem inherits Rectangle {
@@ -57,10 +57,10 @@ export component HorizontalDivider inherits Rectangle {
 
 // Fluent / Nocturne toolbar & navigation button with Lucide-style vector icon support
 export component FluentButton inherits Rectangle {
-    in property <string> icon: "";
     in property <string> icon-name: "";
+    in property <string> trailing-icon: "";
     in property <string> label: "";
-    in property <string> a11y-label: label != "" ? label : (icon-name != "" ? icon-name : icon);
+    in property <string> a11y-label: label != "" ? label : icon-name;
     in property <bool> active: false;
     in property <bool> enabled: true;
     in property <bool> danger: false;
@@ -109,27 +109,16 @@ export component FluentButton inherits Rectangle {
     HorizontalLayout {
         padding-left: root.label != "" ? (root.compact ? 8px : 10px) : 6px;
         padding-right: root.label != "" ? (root.compact ? 8px : 10px) : 6px;
-        spacing: ((root.icon != "" || root.icon-name != "") && root.label != "") ? 5px : 0px;
+        spacing: 5px;
         alignment: center;
 
         if root.icon-name != "" : VerticalLayout {
             alignment: center;
             OnyxIcon {
                 name: root.icon-name;
-                size: root.compact ? 14px : 15px;
                 icon-color: root.fg-color;
                 opacity: root.enabled ? 1.0 : 0.38;
             }
-        }
-
-        if root.icon-name == "" && root.icon != "" : Text {
-            text: root.icon;
-            font-size: root.compact ? 12px : 13px;
-            font-weight: 500;
-            vertical-alignment: center;
-            horizontal-alignment: center;
-            color: root.fg-color;
-            opacity: root.enabled ? 1.0 : 0.38;
         }
 
         if root.label != "" : Text {
@@ -139,6 +128,16 @@ export component FluentButton inherits Rectangle {
             vertical-alignment: center;
             color: root.fg-color;
             opacity: root.enabled ? 1.0 : 0.38;
+        }
+
+        if root.trailing-icon != "" : VerticalLayout {
+            alignment: center;
+            OnyxIcon {
+                name: root.trailing-icon;
+                size: OnyxIconSize.small;
+                icon-color: root.fg-color;
+                opacity: root.enabled ? 1.0 : 0.38;
+            }
         }
     }
 
