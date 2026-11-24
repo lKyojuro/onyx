@@ -42,14 +42,15 @@ pub fn show_context_menu(hwnd: isize, paths: &[PathBuf]) -> OnyxResult<()> {
         return Err(invalid_path("Too many paths for one shell menu"));
     }
     let owner = own_window(hwnd)?;
-    let mut cursor = POINT::default();
-    // SAFETY: The cursor result is written into a live POINT.
-    unsafe { GetCursorPos(&raw mut cursor) }.map_err(|err| platform("GetCursorPos", err))?;
-
+    // Validate the selection first so input errors are deterministic and do not
+    // depend on the interactive desktop state (cursor access can fail when locked).
     let resolved = resolve_paths(paths)?;
     let parent = resolved[0]
         .parent()
         .ok_or_else(|| invalid_path("The shell menu requires items with a parent folder"))?;
+    let mut cursor = POINT::default();
+    // SAFETY: The cursor result is written into a live POINT.
+    unsafe { GetCursorPos(&raw mut cursor) }.map_err(|err| platform("GetCursorPos", err))?;
 
     let com = ComGuard::init_sta()?;
     if !com.owns_initialization() {
@@ -418,10 +419,11 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let missing = temp.path().join("missing.txt");
         let window = MenuOwner::new(HWND::default())?;
-        assert!(matches!(
-            show_context_menu(window.hwnd.0 as isize, std::slice::from_ref(&missing)),
-            Err(OnyxError::NotFound { path }) if path == missing
-        ));
+        let result = show_context_menu(window.hwnd.0 as isize, std::slice::from_ref(&missing));
+        assert!(
+            matches!(&result, Err(OnyxError::NotFound { path }) if *path == missing),
+            "unexpected result: {result:?}"
+        );
         Ok(())
     }
 
