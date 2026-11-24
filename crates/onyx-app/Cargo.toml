@@ -35,6 +35,9 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[build-dependencies]
+winresource.workspace = true
+
 [dev-dependencies]
 criterion.workspace = true
 image.workspace = true

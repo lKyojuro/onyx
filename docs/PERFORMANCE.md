@@ -11,6 +11,21 @@
 | Executable size | < 20 MB | Release profile with thin LTO and symbol stripping |
 | Idle CPU usage | Near zero | Event-driven UI + debounced OS directory watchers |
 
+## Measured Baseline (Windows 11 x64)
+
+Real Criterion run on Windows 11 `10.0.26300.0`, Rust `1.96.1`, Release profile:
+
+| Benchmark | Result |
+|---|---|
+| `natural_sort/1000` | 1.02 ms |
+| `natural_sort/10000` | 18.53 ms |
+| `natural_sort/50000` | 114.45 ms |
+| `directory_enumeration_1000` | 41.03 ms |
+| `lru_directory_cache_put_get` | 5.32 µs |
+| `sqlite_fts5_search_1000` | 707.45 µs |
+
+Initial release binary before optimization: **23.64 MB** (24,793,088 bytes).
+
 ## Reproducible Benchmarking
 
 Run Criterion micro-benchmarks in release mode:

@@ -3,14 +3,94 @@
 use onyx_core::{OnyxError, OnyxResult};
 use std::ffi::c_void;
 use std::mem::size_of;
-use windows::Win32::Foundation::HWND;
+use std::sync::Mutex;
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE, DWMSBT_MAINWINDOW, DWMSBT_NONE,
     DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
     DWMWCP_ROUND, DwmSetWindowAttribute,
 };
-use windows::Win32::UI::WindowsAndMessaging::IsWindow;
-use windows::core::BOOL;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    DestroyIcon, GetSystemMetrics, HICON, ICON_BIG, ICON_SMALL, IMAGE_ICON, IsWindow,
+    LR_DEFAULTCOLOR, LoadImageW, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SMTO_ABORTIFHUNG,
+    SMTO_ERRORONEXIT, SendMessageTimeoutW, WM_SETICON,
+};
+use windows::core::{BOOL, PCWSTR};
+
+// WM_SETICON borrows the HICONs. Hold both handles for the lifetime of the executable.
+static EXE_ICONS: Mutex<Option<[OwnedIcon; 2]>> = Mutex::new(None);
+const EXE_ICON_RESOURCE_ID: usize = 1;
+
+// Windows icon handles can be sent to other threads in the process as message values.
+struct OwnedIcon(isize);
+
+impl Drop for OwnedIcon {
+    fn drop(&mut self) {
+        // SAFETY: This is the owned, non-shared handle returned by LoadImageW.
+        let _ = unsafe { DestroyIcon(HICON(self.0 as _)) };
+    }
+}
+
+/// Sets the small and large window icons from the main executable's Onyx icon resource.
+pub fn set_window_icon_from_exe(hwnd: isize) -> OnyxResult<()> {
+    let window = crate::own_window(hwnd)?;
+    let [small, big] = {
+        let mut icons = EXE_ICONS.lock().map_err(|error| OnyxError::Platform {
+            message: format!("Could not access the executable icon cache: {error}"),
+        })?;
+        let [small, big] = match icons.as_ref() {
+            Some(pair) => pair,
+            None => icons.insert(load_exe_icons().map_err(|error| OnyxError::Platform {
+                message: format!("Could not load the executable icon: {error}"),
+            })?),
+        };
+        [small.0, big.0]
+    };
+
+    for (kind, icon) in [(ICON_SMALL, small), (ICON_BIG, big)] {
+        // SAFETY: WM_SETICON takes an icon handle retained in EXE_ICONS and does not
+        // transfer ownership. No lock is held during the window procedure call.
+        let sent = unsafe {
+            SendMessageTimeoutW(
+                window,
+                WM_SETICON,
+                WPARAM(kind as usize),
+                LPARAM(icon),
+                SMTO_ABORTIFHUNG | SMTO_ERRORONEXIT,
+                1000,
+                None,
+            )
+        };
+        if sent.0 == 0 {
+            return Err(OnyxError::Platform {
+                message: format!("Could not set icon type {kind} on HWND 0x{hwnd:X}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn load_exe_icons() -> windows::core::Result<[OwnedIcon; 2]> {
+    // SAFETY: A null name queries the current executable, whose module remains loaded.
+    let module = unsafe { GetModuleHandleW(PCWSTR::null()) }?;
+    let load = |width, height| {
+        // SAFETY: The module is valid and this integer resource ID is encoded as
+        // MAKEINTRESOURCEW. The returned non-shared icon is owned by OwnedIcon.
+        unsafe {
+            LoadImageW(
+                Some(HINSTANCE(module.0)),
+                PCWSTR(EXE_ICON_RESOURCE_ID as *const u16),
+                IMAGE_ICON,
+                GetSystemMetrics(width),
+                GetSystemMetrics(height),
+                LR_DEFAULTCOLOR,
+            )
+        }
+        .map(|handle| OwnedIcon(handle.0 as isize))
+    };
+    Ok([load(SM_CXSMICON, SM_CYSMICON)?, load(SM_CXICON, SM_CYICON)?])
+}
 
 /// Applies Windows 11 DWM visual attributes to a top-level window handle:
 /// - `DWMWA_USE_IMMERSIVE_DARK_MODE` based on `dark_mode`

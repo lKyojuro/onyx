@@ -6,9 +6,11 @@ use crate::to_wide_null;
 use onyx_core::{OnyxError, OnyxResult, normalize_display_path};
 use std::ffi::OsStr;
 use std::mem::size_of;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
+use windows::Win32::System::Threading::CREATE_NEW_CONSOLE;
 use windows::Win32::UI::Shell::{
     FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOFX_RECYCLEONDELETE,
     FileOperation, IFileOperation, IShellItem, SEE_MASK_INVOKEIDLIST, SHCreateItemFromParsingName,
@@ -111,36 +113,61 @@ pub fn show_properties_dialog(path: &Path) -> OnyxResult<()> {
 /// Launches Windows Terminal (`wt.exe -d <dir>`), falling back to `powershell.exe` in `dir`
 /// if Windows Terminal is not installed.
 pub fn launch_terminal(dir: &Path) -> OnyxResult<()> {
+    launch_terminal_with_profile(dir, TerminalProfile::WindowsTerminal)
+}
+
+/// Terminal application to open for a file or directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalProfile {
+    WindowsTerminal,
+    PowerShell,
+    Cmd,
+}
+
+/// Opens the selected terminal profile in `dir` or in the containing directory of a file.
+/// The Windows Terminal profile falls back to Windows PowerShell if its launcher fails.
+pub fn launch_terminal_with_profile(dir: &Path, profile: TerminalProfile) -> OnyxResult<()> {
     if !dir.exists() {
         return Err(OnyxError::NotFound {
             path: dir.to_path_buf(),
         });
     }
 
-    let target_dir = if dir.is_dir() {
-        dir
+    let absolute = std::path::absolute(dir)?;
+    let target_dir = if absolute.is_dir() {
+        absolute.as_path()
     } else {
-        dir.parent().unwrap_or(dir)
+        absolute.parent().unwrap_or(&absolute)
     };
-    let dir_display = normalize_display_path(target_dir);
 
-    match Command::new("wt.exe").arg("-d").arg(&dir_display).spawn() {
-        Ok(_) => Ok(()),
-        Err(wt_err) => {
-            tracing::debug!(
-                ?wt_err,
-                "wt.exe unavailable; falling back to powershell.exe"
-            );
-            Command::new("powershell.exe")
-                .current_dir(target_dir)
-                .spawn()
-                .map(|_| ())
-                .map_err(|ps_err| OnyxError::Platform {
-                    message: format!(
-                        "Failed to launch terminal in '{}' (wt.exe: {wt_err}; powershell.exe: {ps_err})",
-                        target_dir.display()
-                    ),
-                })
+    let launch_console = |program| {
+        Command::new(program)
+            .current_dir(target_dir)
+            .creation_flags(CREATE_NEW_CONSOLE.0)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| OnyxError::Platform {
+                message: format!(
+                    "Failed to launch {program} in '{}': {error}",
+                    target_dir.display()
+                ),
+            })
+    };
+    match profile {
+        TerminalProfile::PowerShell => launch_console("powershell.exe"),
+        TerminalProfile::Cmd => launch_console("cmd.exe"),
+        TerminalProfile::WindowsTerminal => {
+            let terminal = Command::new("wt.exe")
+                .arg("-d")
+                .arg(normalize_display_path(target_dir))
+                .spawn();
+            if let Err(error) = terminal {
+                tracing::debug!(%error, "wt.exe unavailable; falling back to powershell.exe");
+                return launch_console("powershell.exe").map_err(|fallback| OnyxError::Platform {
+                    message: format!("Could not launch wt.exe: {error}. {fallback}"),
+                });
+            }
+            Ok(())
         }
     }
 }

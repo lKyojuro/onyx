@@ -35,9 +35,17 @@ onyx-preview = { path = "crates/onyx-preview" }
 onyx-ui = { path = "crates/onyx-ui" }
 
 # UI
-slint = { version = "1.19", features = ["raw-window-handle-06"] }
+slint = { version = "1.19", default-features = false, features = [
+    "std",
+    "backend-default",
+    "renderer-femtovg",
+    "accessibility",
+    "compat-1-2",
+    "raw-window-handle-06",
+] }
 slint-build = "1.19"
 raw-window-handle = "0.6"
+winresource = "0.1"
 
 # Async & Parallelism
 tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time", "fs", "macros"] }
@@ -101,8 +109,8 @@ unwrap_used = "warn"
 expect_used = "warn"
 
 [profile.release]
-opt-level = 3
-lto = "thin"
+opt-level = "s"
+lto = "fat"
 codegen-units = 1
 strip = "symbols"
 panic = "unwind"
