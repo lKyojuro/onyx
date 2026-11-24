@@ -34,13 +34,16 @@ pub(crate) fn accent_color(hex: &str) -> Option<slint::Color> {
     ))
 }
 
-pub(crate) fn apply_backdrop(ui: &OnyxWindow) {
+pub(crate) fn window_hwnd(ui: &OnyxWindow) -> Option<isize> {
     let window_handle = ui.window().window_handle();
-    if let Ok(handle) = window_handle.window_handle()
-        && let RawWindowHandle::Win32(handle) = handle.as_raw()
-        && let Err(error) =
-            onyx_windows::apply_window_backdrop(handle.hwnd.get(), ui.get_dark_mode(), true)
-    {
+    match window_handle.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
+        _ => None,
+    }
+}
+
+pub(crate) fn apply_backdrop(hwnd: isize, dark: bool) {
+    if let Err(error) = onyx_windows::apply_window_backdrop(hwnd, dark, true) {
         tracing::debug!(%error, "could not apply the Windows backdrop");
     }
 }

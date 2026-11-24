@@ -103,6 +103,7 @@ export component FilePane inherits Rectangle {
 
     callback select-entry(int, int);
     callback activate-entry(int, int);
+    callback context-menu-requested(int, int);
     callback set-active-pane(int);
     callback sort-by(int, int);
 
@@ -403,6 +404,11 @@ export component FilePane inherits Rectangle {
                             root.set-active-pane(root.pane-index);
                             root.activate-entry(root.pane-index, idx);
                         }
+                        pointer-event(event) => {
+                            if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
+                                root.context-menu-requested(root.pane-index, idx);
+                            }
+                        }
                     }
 
                     HorizontalLayout {
@@ -523,6 +529,11 @@ export component FilePane inherits Rectangle {
                             double-clicked => {
                                 root.set-active-pane(root.pane-index);
                                 root.activate-entry(root.pane-index, item-idx);
+                            }
+                            pointer-event(event) => {
+                                if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
+                                    root.context-menu-requested(root.pane-index, item-idx);
+                                }
                             }
                         }
 

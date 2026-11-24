@@ -1,9 +1,10 @@
-use onyx_core::{OnyxError, OnyxResult};
+use onyx_core::{OnyxError, OnyxResult, PaneId};
 use onyx_operations::{
     ConflictPolicy, FileOperationsEngine, OperationProgress, OperationReport,
     PermanentDeleteRequest, UndoAction,
 };
 use onyx_ui::{OnyxWindow, UiOperationProgress};
+use onyx_windows::TerminalProfile;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -461,12 +462,81 @@ impl Controller {
         }
     }
 
+    pub(crate) fn context_menu(&self, ui: &OnyxWindow, pane: PaneId, index: i32) {
+        let (clicked, selection, pane_path) = {
+            let state = self.state.borrow();
+            let Some(entry) = usize::try_from(index)
+                .ok()
+                .and_then(|index| state.pane(pane).entries.get(index))
+            else {
+                return;
+            };
+            let selection = state
+                .tab(pane)
+                .filter(|tab| tab.selected_paths.contains(&entry.path))
+                .map(|tab| tab.selected_paths.clone());
+            (
+                entry.path.clone(),
+                selection,
+                state.path(pane).to_path_buf(),
+            )
+        };
+        if selection.is_some() {
+            self.activate_pane(ui, pane);
+        } else {
+            self.select(ui, pane, index);
+        }
+        let Some(hwnd) = ui_sync::window_hwnd(ui) else {
+            ui.set_status_message("The Windows context menu requires a window handle.".into());
+            return;
+        };
+        let parent = clicked.parent();
+        let changed_parent = parent
+            .filter(|parent| *parent != pane_path)
+            .map(Path::to_path_buf);
+        let mut affected = vec![pane_path];
+        affected.extend(changed_parent);
+        let paths = selection
+            .filter(|paths| paths.iter().all(|path| path.parent() == parent))
+            .unwrap_or_else(|| vec![clicked]);
+
+        let weak = self.ui.clone();
+        // The native menu initializes COM as STA and blocks until dismissal.
+        if let Err(error) = std::thread::Builder::new()
+            .name("onyx-shell-menu".into())
+            .spawn(move || {
+                let result = onyx_windows::show_context_menu(hwnd, &paths);
+                post(&weak, move |app, ui| {
+                    app.refresh_paths(ui, &affected);
+                    if let Err(error) = result {
+                        ui.set_status_message(error.to_string().into());
+                    }
+                });
+            })
+        {
+            ui.set_status_message(
+                format!("Could not start the Windows context menu: {error}").into(),
+            );
+        }
+    }
+
     pub(crate) fn terminal(&self, _: &OnyxWindow) {
         let path = self.state.borrow().path(self.active()).to_path_buf();
         self.shell_task(path, onyx_windows::launch_terminal);
     }
 
-    pub(crate) fn shell_task(&self, path: PathBuf, action: fn(&Path) -> OnyxResult<()>) {
+    pub(crate) fn terminal_with_profile(&self, profile: TerminalProfile) {
+        let path = self.state.borrow().path(self.active()).to_path_buf();
+        self.shell_task(path, move |path| {
+            onyx_windows::launch_terminal_with_profile(path, profile)
+        });
+    }
+
+    pub(crate) fn shell_task(
+        &self,
+        path: PathBuf,
+        action: impl FnOnce(&Path) -> OnyxResult<()> + Send + 'static,
+    ) {
         let weak = self.ui.clone();
         self.runtime.spawn_blocking(move || {
             if let Err(error) = action(&path) {

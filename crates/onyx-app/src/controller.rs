@@ -105,7 +105,14 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
         }
     });
     ui.show()?;
-    ui_sync::apply_backdrop(&ui);
+    if let Some(hwnd) = ui_sync::window_hwnd(&ui) {
+        ui_sync::apply_backdrop(hwnd, ui.get_dark_mode());
+        controller.runtime.spawn_blocking(move || {
+            if let Err(error) = onyx_windows::set_window_icon_from_exe(hwnd) {
+                tracing::warn!(%error, "could not set the Windows window icon");
+            }
+        });
+    }
     controller.sync_chrome(&ui);
     controller.update_watcher();
     let visible: Vec<_> = controller.state.borrow().visible_panes().collect();
@@ -219,6 +226,8 @@ impl Controller {
             pane_id(pane),
             index
         ));
+        bind!(on_context_menu_requested, |app, ui, pane, index| app
+            .context_menu(&ui, pane_id(pane), index));
         bind!(on_set_active_pane, |app, ui, pane| app
             .activate_pane(&ui, pane_id(pane)));
         bind!(on_sort_by, |app, ui, pane, column| app.sort_by(
@@ -413,6 +422,8 @@ impl Controller {
             ThemeMode::Light
         };
         ui.set_dark_mode(dark);
-        ui_sync::apply_backdrop(ui);
+        if let Some(hwnd) = ui_sync::window_hwnd(ui) {
+            ui_sync::apply_backdrop(hwnd, dark);
+        }
     }
 }

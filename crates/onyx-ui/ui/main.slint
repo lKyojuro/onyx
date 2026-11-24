@@ -151,6 +151,7 @@ export component OnyxWindow inherits Window {
     callback toggle-indexed-search();
     callback select-entry(int, int);
     callback activate-entry(int, int);
+    callback context-menu-requested(int, int);
     callback set-active-pane(int);
     callback sort-by(int, int);
     callback toggle-view-mode();
@@ -286,6 +287,13 @@ export component OnyxWindow inherits Window {
             // Ctrl+F: Focus Search Bar
             if event.modifiers.control && (event.text == "f" || event.text == "F") {
                 nav-bar.focus-search-bar();
+                return accept;
+            }
+
+            // Ctrl+` or Alt+T: Open Terminal
+            if (event.modifiers.control && event.text == "`")
+                || (event.modifiers.alt && (event.text == "t" || event.text == "T")) {
+                root.action-open-terminal();
                 return accept;
             }
 
@@ -484,6 +492,10 @@ export component OnyxWindow inherits Window {
                         key-handler.focus();
                         root.activate-entry(pane, idx);
                     }
+                    context-menu-requested(pane, idx) => {
+                        key-handler.focus();
+                        root.context-menu-requested(pane, idx);
+                    }
                     set-active-pane(pane) => {
                         key-handler.focus();
                         root.set-active-pane(pane);
@@ -518,6 +530,10 @@ export component OnyxWindow inherits Window {
                     activate-entry(pane, idx) => {
                         key-handler.focus();
                         root.activate-entry(pane, idx);
+                    }
+                    context-menu-requested(pane, idx) => {
+                        key-handler.focus();
+                        root.context-menu-requested(pane, idx);
                     }
                     set-active-pane(pane) => {
                         key-handler.focus();

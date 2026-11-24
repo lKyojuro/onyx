@@ -134,9 +134,23 @@ const COMMANDS: &[Command] = &[
     Command {
         id: "terminal",
         title: "Open Terminal",
-        shortcut: "",
+        shortcut: "Ctrl+` / Alt+T",
         category: "Tools",
         run: Controller::terminal,
+    },
+    Command {
+        id: "powershell",
+        title: "Open PowerShell here",
+        shortcut: "",
+        category: "Tools",
+        run: |app, _| app.terminal_with_profile(onyx_windows::TerminalProfile::PowerShell),
+    },
+    Command {
+        id: "command-prompt",
+        title: "Open Command Prompt here",
+        shortcut: "",
+        category: "Tools",
+        run: |app, _| app.terminal_with_profile(onyx_windows::TerminalProfile::Cmd),
     },
     Command {
         id: "index",
