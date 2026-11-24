@@ -1,0 +1,1850 @@
+//! Async file operations engine with recursion guards, symlink safety, disk space preflight,
+//! cancellation, streaming progress, conflict resolution, partial failure reporting, and undo.
+
+use crate::path_guard::{
+    ConflictResolution, generate_auto_rename_path, is_dir_reparse, is_reparse_or_symlink,
+    is_same_normalized_path, is_same_or_descendant, is_same_volume, path_exists_any,
+    resolve_conflict, validate_item_name,
+};
+use crate::recycler::{Recycler, SpaceChecker, WindowsRecycler, WindowsSpaceChecker};
+use crate::types::{
+    ConflictPolicy, OperationKind, OperationProgress, OperationReport, PermanentDeleteRequest,
+};
+use crate::undo::{UndoAction, UndoJournal};
+use onyx_core::{OnyxError, OnyxResult};
+use std::collections::HashSet;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{Mutex, mpsc};
+use tokio_util::sync::CancellationToken;
+
+const COPY_CHUNK_BYTES: usize = 256 * 1024;
+
+/// Centralized async file operations engine for Onyx.
+///
+/// All filesystem I/O runs inside `tokio::task::spawn_blocking` so UI and async executor threads
+/// are never blocked.
+#[derive(Debug, Clone)]
+pub struct FileOperationsEngine {
+    recycler: Arc<dyn Recycler>,
+    space_checker: Arc<dyn SpaceChecker>,
+    next_op_id: Arc<AtomicU64>,
+    undo_journal: Arc<Mutex<UndoJournal>>,
+}
+
+impl Default for FileOperationsEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FileOperationsEngine {
+    /// Creates an engine wired to the real Windows Recycle Bin and Win32 disk-space APIs.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_providers(Arc::new(WindowsRecycler), Arc::new(WindowsSpaceChecker))
+    }
+
+    /// Creates an engine with a custom [`Recycler`] (recommended for isolated tests).
+    #[must_use]
+    pub fn with_recycler(recycler: Arc<dyn Recycler>) -> Self {
+        Self::with_providers(recycler, Arc::new(WindowsSpaceChecker))
+    }
+
+    /// Creates an engine with custom [`Recycler`] and [`SpaceChecker`] providers.
+    #[must_use]
+    pub fn with_providers(
+        recycler: Arc<dyn Recycler>,
+        space_checker: Arc<dyn SpaceChecker>,
+    ) -> Self {
+        Self {
+            recycler,
+            space_checker,
+            next_op_id: Arc::new(AtomicU64::new(1)),
+            undo_journal: Arc::new(Mutex::new(UndoJournal::new())),
+        }
+    }
+
+    fn alloc_op_id(&self) -> u64 {
+        self.next_op_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Returns `true` if there is at least one action in the undo journal.
+    pub async fn can_undo(&self) -> bool {
+        self.undo_journal.lock().await.can_undo()
+    }
+
+    /// Returns the number of undo entries currently recorded.
+    pub async fn undo_len(&self) -> usize {
+        self.undo_journal.lock().await.len()
+    }
+
+    async fn record_undo(&self, action: Option<UndoAction>) {
+        if let Some(act) = action {
+            self.undo_journal.lock().await.push(act);
+        }
+    }
+
+    /// Copies `sources` into `destination_dir` with recursion protection, disk-space preflight,
+    /// symlink safety, chunked cancellable copy, progress streaming, and conflict handling.
+    pub async fn copy_items(
+        &self,
+        sources: &[PathBuf],
+        destination_dir: &Path,
+        conflict: ConflictPolicy,
+        cancel: CancellationToken,
+        progress: Option<mpsc::Sender<OperationProgress>>,
+    ) -> OnyxResult<OperationReport> {
+        let op_id = self.alloc_op_id();
+        let sources = sources.to_vec();
+        let destination_dir = destination_dir.to_path_buf();
+        let space_checker = Arc::clone(&self.space_checker);
+
+        let report = tokio::task::spawn_blocking(move || {
+            copy_items_blocking(
+                op_id,
+                OperationKind::Copy,
+                &sources,
+                &destination_dir,
+                conflict,
+                &cancel,
+                progress.as_ref(),
+                space_checker.as_ref(),
+            )
+        })
+        .await
+        .map_err(|err| OnyxError::OperationFailed {
+            message: format!("Copy task join failed: {err}"),
+        })??;
+
+        self.record_undo(report.undo_action.clone()).await;
+        Ok(report)
+    }
+
+    /// Moves `sources` into `destination_dir`, using fast same-volume renames when possible
+    /// and falling back to safe copy-then-remove across volumes.
+    pub async fn move_items(
+        &self,
+        sources: &[PathBuf],
+        destination_dir: &Path,
+        conflict: ConflictPolicy,
+        cancel: CancellationToken,
+        progress: Option<mpsc::Sender<OperationProgress>>,
+    ) -> OnyxResult<OperationReport> {
+        let op_id = self.alloc_op_id();
+        let sources = sources.to_vec();
+        let destination_dir = destination_dir.to_path_buf();
+        let space_checker = Arc::clone(&self.space_checker);
+
+        let report = tokio::task::spawn_blocking(move || {
+            move_items_blocking(
+                op_id,
+                &sources,
+                &destination_dir,
+                conflict,
+                &cancel,
+                progress.as_ref(),
+                space_checker.as_ref(),
+            )
+        })
+        .await
+        .map_err(|err| OnyxError::OperationFailed {
+            message: format!("Move task join failed: {err}"),
+        })??;
+
+        self.record_undo(report.undo_action.clone()).await;
+        Ok(report)
+    }
+
+    /// Renames a single file or directory within its parent folder.
+    pub async fn rename_item(
+        &self,
+        source: &Path,
+        new_name: &str,
+        conflict: ConflictPolicy,
+    ) -> OnyxResult<OperationReport> {
+        validate_item_name(new_name)?;
+        let source = source.to_path_buf();
+        let new_name = new_name.to_string();
+
+        let report =
+            tokio::task::spawn_blocking(move || rename_item_blocking(&source, &new_name, conflict))
+                .await
+                .map_err(|err| OnyxError::OperationFailed {
+                    message: format!("Rename task join failed: {err}"),
+                })??;
+
+        self.record_undo(report.undo_action.clone()).await;
+        Ok(report)
+    }
+
+    /// Creates a new directory named `name` inside `parent_dir`.
+    pub async fn create_dir(&self, parent_dir: &Path, name: &str) -> OnyxResult<OperationReport> {
+        validate_item_name(name)?;
+        let parent_dir = parent_dir.to_path_buf();
+        let name = name.to_string();
+
+        let report = tokio::task::spawn_blocking(move || create_dir_blocking(&parent_dir, &name))
+            .await
+            .map_err(|err| OnyxError::OperationFailed {
+                message: format!("Create directory task join failed: {err}"),
+            })??;
+
+        self.record_undo(report.undo_action.clone()).await;
+        Ok(report)
+    }
+
+    /// Duplicates `source` in its parent directory using auto-rename naming (`"name (2).ext"`).
+    pub async fn duplicate_item(
+        &self,
+        source: &Path,
+        cancel: CancellationToken,
+        progress: Option<mpsc::Sender<OperationProgress>>,
+    ) -> OnyxResult<OperationReport> {
+        let parent_dir = source
+            .parent()
+            .ok_or_else(|| OnyxError::InvalidPath {
+                message: format!(
+                    "Cannot determine parent directory of '{}'",
+                    source.display()
+                ),
+            })?
+            .to_path_buf();
+
+        let op_id = self.alloc_op_id();
+        let sources = vec![source.to_path_buf()];
+        let space_checker = Arc::clone(&self.space_checker);
+
+        let report = tokio::task::spawn_blocking(move || {
+            copy_items_blocking(
+                op_id,
+                OperationKind::Duplicate,
+                &sources,
+                &parent_dir,
+                ConflictPolicy::AutoRename,
+                &cancel,
+                progress.as_ref(),
+                space_checker.as_ref(),
+            )
+        })
+        .await
+        .map_err(|err| OnyxError::OperationFailed {
+            message: format!("Duplicate task join failed: {err}"),
+        })??;
+
+        self.record_undo(report.undo_action.clone()).await;
+        Ok(report)
+    }
+
+    /// Sends `paths` safely to the Recycle Bin via the configured [`Recycler`].
+    pub async fn recycle_items(
+        &self,
+        paths: &[PathBuf],
+        cancel: CancellationToken,
+        progress: Option<mpsc::Sender<OperationProgress>>,
+    ) -> OnyxResult<OperationReport> {
+        let op_id = self.alloc_op_id();
+        let paths = paths.to_vec();
+        let recycler = Arc::clone(&self.recycler);
+
+        tokio::task::spawn_blocking(move || {
+            recycle_items_blocking(op_id, &paths, &cancel, progress.as_ref(), recycler.as_ref())
+        })
+        .await
+        .map_err(|err| OnyxError::OperationFailed {
+            message: format!("Recycle task join failed: {err}"),
+        })?
+    }
+
+    /// Permanently deletes `request.paths` ONLY when `request.confirm_permanent == true`.
+    ///
+    /// Refuses immediately with [`OnyxError::OperationFailed`] if `confirm_permanent` is `false`.
+    pub async fn permanent_delete(
+        &self,
+        request: PermanentDeleteRequest,
+        cancel: CancellationToken,
+        progress: Option<mpsc::Sender<OperationProgress>>,
+    ) -> OnyxResult<OperationReport> {
+        if !request.confirm_permanent {
+            return Err(OnyxError::OperationFailed {
+                message: "Permanent deletion refused: explicit confirmation (`confirm_permanent = true`) is required".to_string(),
+            });
+        }
+
+        let op_id = self.alloc_op_id();
+        let paths = request.paths;
+
+        tokio::task::spawn_blocking(move || {
+            permanent_delete_blocking(op_id, &paths, &cancel, progress.as_ref())
+        })
+        .await
+        .map_err(|err| OnyxError::OperationFailed {
+            message: format!("Permanent delete task join failed: {err}"),
+        })?
+    }
+
+    /// Pops and executes the most recent action from the undo journal.
+    ///
+    /// Returns `Ok(None)` when there is nothing to undo.
+    pub async fn undo_last(&self) -> OnyxResult<Option<OperationReport>> {
+        let action = self.undo_journal.lock().await.pop();
+        let Some(action) = action else {
+            return Ok(None);
+        };
+
+        let recycler = Arc::clone(&self.recycler);
+        let report =
+            tokio::task::spawn_blocking(move || execute_undo_blocking(action, recycler.as_ref()))
+                .await
+                .map_err(|err| OnyxError::OperationFailed {
+                    message: format!("Undo task join failed: {err}"),
+                })??;
+
+        Ok(Some(report))
+    }
+}
+
+fn send_progress(tx: Option<&mpsc::Sender<OperationProgress>>, snapshot: OperationProgress) {
+    if let Some(sender) = tx {
+        if snapshot.finished || snapshot.cancelled || snapshot.error.is_some() {
+            let _ = sender.blocking_send(snapshot);
+        } else {
+            let _ = sender.try_send(snapshot);
+        }
+    }
+}
+
+/// Safely computes total bytes across `sources`, never descending into symlinks/reparse points
+/// and guarding against directory cycles via a visited canonical-path set.
+fn measure_total_bytes(sources: &[PathBuf]) -> u64 {
+    let mut total = 0u64;
+    let mut visited = HashSet::new();
+    for src in sources {
+        measure_path_bytes(src, &mut visited, &mut total);
+    }
+    total
+}
+
+fn measure_path_bytes(path: &Path, visited: &mut HashSet<PathBuf>, total: &mut u64) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if is_reparse_or_symlink(&meta) {
+        return;
+    }
+    if meta.is_file() {
+        *total = total.saturating_add(meta.len());
+    } else if meta.is_dir() {
+        if let Ok(canon) = fs::canonicalize(path)
+            && !visited.insert(canon)
+        {
+            return;
+        }
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                measure_path_bytes(&entry.path(), visited, total);
+            }
+        }
+    }
+}
+
+fn check_disk_space(
+    space_checker: &dyn SpaceChecker,
+    destination_dir: &Path,
+    required_bytes: u64,
+) -> OnyxResult<()> {
+    if required_bytes == 0 {
+        return Ok(());
+    }
+    if let Some(available) = space_checker.free_space(destination_dir)
+        && required_bytes > available
+    {
+        return Err(OnyxError::InsufficientSpace {
+            required: required_bytes,
+            available,
+        });
+    }
+    Ok(())
+}
+
+fn ensure_not_recursive(sources: &[PathBuf], destination_dir: &Path) -> OnyxResult<()> {
+    for src in sources {
+        if let Ok(meta) = fs::symlink_metadata(src)
+            && meta.is_dir()
+            && !is_reparse_or_symlink(&meta)
+            && is_same_or_descendant(src, destination_dir)
+        {
+            return Err(OnyxError::RecursiveOperation {
+                source_path: src.clone(),
+                target_path: destination_dir.to_path_buf(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_items_blocking(
+    op_id: u64,
+    kind: OperationKind,
+    sources: &[PathBuf],
+    destination_dir: &Path,
+    conflict: ConflictPolicy,
+    cancel: &CancellationToken,
+    progress: Option<&mpsc::Sender<OperationProgress>>,
+    space_checker: &dyn SpaceChecker,
+) -> OnyxResult<OperationReport> {
+    if !destination_dir.is_dir() {
+        return Err(OnyxError::NotFound {
+            path: destination_dir.to_path_buf(),
+        });
+    }
+
+    ensure_not_recursive(sources, destination_dir)?;
+
+    let total_bytes = measure_total_bytes(sources);
+    check_disk_space(space_checker, destination_dir, total_bytes)?;
+
+    let total_items = sources.len();
+    let mut report = OperationReport::default();
+    let mut bytes_copied = 0u64;
+    let mut completed_items = 0usize;
+
+    for src in sources {
+        if cancel.is_cancelled() {
+            send_progress(
+                progress,
+                OperationProgress {
+                    op_id,
+                    kind,
+                    current_item: src.display().to_string(),
+                    completed_items,
+                    total_items,
+                    bytes_copied,
+                    total_bytes,
+                    finished: true,
+                    cancelled: true,
+                    error: None,
+                },
+            );
+            return Err(OnyxError::Cancelled);
+        }
+
+        let item_name = match src.file_name() {
+            Some(name) => name.to_os_string(),
+            None => {
+                report
+                    .failed
+                    .push((src.clone(), "Source path has no file name".to_string()));
+                completed_items += 1;
+                continue;
+            }
+        };
+
+        let meta = match fs::symlink_metadata(src) {
+            Ok(m) => m,
+            Err(err) => {
+                report.failed.push((src.clone(), err.to_string()));
+                completed_items += 1;
+                continue;
+            }
+        };
+
+        let desired_target = destination_dir.join(&item_name);
+        let target = match resolve_conflict(src, &desired_target, conflict, false) {
+            Ok(ConflictResolution::Skip) => {
+                report.skipped.push(src.clone());
+                completed_items += 1;
+                continue;
+            }
+            Ok(ConflictResolution::Proceed(path)) => path,
+            Ok(ConflictResolution::Overwrite(path)) => {
+                if let Err(err) = remove_existing_for_overwrite(&path) {
+                    report.failed.push((src.clone(), err.to_string()));
+                    completed_items += 1;
+                    continue;
+                }
+                path
+            }
+            Err(err) => {
+                report.failed.push((src.clone(), err.to_string()));
+                completed_items += 1;
+                continue;
+            }
+        };
+
+        let mut visited = HashSet::new();
+        let copy_res = copy_entry_recursive(
+            src,
+            &target,
+            &meta,
+            &mut visited,
+            cancel,
+            op_id,
+            kind,
+            completed_items,
+            total_items,
+            &mut bytes_copied,
+            total_bytes,
+            progress,
+        );
+
+        match copy_res {
+            Ok(CopyOutcome::Copied) => {
+                report.succeeded.push(target);
+            }
+            Ok(CopyOutcome::Skipped) => {
+                report.skipped.push(src.clone());
+            }
+            Err(OnyxError::Cancelled) => {
+                send_progress(
+                    progress,
+                    OperationProgress {
+                        op_id,
+                        kind,
+                        current_item: src.display().to_string(),
+                        completed_items,
+                        total_items,
+                        bytes_copied,
+                        total_bytes,
+                        finished: true,
+                        cancelled: true,
+                        error: None,
+                    },
+                );
+                return Err(OnyxError::Cancelled);
+            }
+            Err(err) => {
+                report.failed.push((src.clone(), err.to_string()));
+            }
+        }
+
+        completed_items += 1;
+        send_progress(
+            progress,
+            OperationProgress {
+                op_id,
+                kind,
+                current_item: item_name.to_string_lossy().into_owned(),
+                completed_items,
+                total_items,
+                bytes_copied,
+                total_bytes,
+                finished: false,
+                cancelled: false,
+                error: None,
+            },
+        );
+    }
+
+    if !report.succeeded.is_empty() {
+        report.undo_action = Some(UndoAction::RecycleCreatedCopies(report.succeeded.clone()));
+    }
+
+    send_progress(
+        progress,
+        OperationProgress {
+            op_id,
+            kind,
+            current_item: String::new(),
+            completed_items,
+            total_items,
+            bytes_copied,
+            total_bytes,
+            finished: true,
+            cancelled: false,
+            error: None,
+        },
+    );
+
+    Ok(report)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyOutcome {
+    Copied,
+    Skipped,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_entry_recursive(
+    src: &Path,
+    dst: &Path,
+    meta: &fs::Metadata,
+    visited: &mut HashSet<PathBuf>,
+    cancel: &CancellationToken,
+    op_id: u64,
+    kind: OperationKind,
+    completed_items: usize,
+    total_items: usize,
+    bytes_copied: &mut u64,
+    total_bytes: u64,
+    progress: Option<&mpsc::Sender<OperationProgress>>,
+) -> OnyxResult<CopyOutcome> {
+    if cancel.is_cancelled() {
+        return Err(OnyxError::Cancelled);
+    }
+
+    if is_reparse_or_symlink(meta) {
+        return copy_symlink_safe(src, dst, meta);
+    }
+
+    if meta.is_file() {
+        copy_file_chunked(
+            src,
+            dst,
+            cancel,
+            op_id,
+            kind,
+            completed_items,
+            total_items,
+            bytes_copied,
+            total_bytes,
+            progress,
+        )?;
+        return Ok(CopyOutcome::Copied);
+    }
+
+    if meta.is_dir() {
+        if let Ok(canon) = fs::canonicalize(src)
+            && !visited.insert(canon)
+        {
+            // Cycle detected; skip safely without infinite recursion.
+            return Ok(CopyOutcome::Skipped);
+        }
+
+        fs::create_dir_all(dst)?;
+        for entry_res in fs::read_dir(src)? {
+            if cancel.is_cancelled() {
+                return Err(OnyxError::Cancelled);
+            }
+            let entry = entry_res?;
+            let child_src = entry.path();
+            let child_dst = dst.join(entry.file_name());
+            let child_meta = fs::symlink_metadata(&child_src)?;
+            let _ = copy_entry_recursive(
+                &child_src,
+                &child_dst,
+                &child_meta,
+                visited,
+                cancel,
+                op_id,
+                kind,
+                completed_items,
+                total_items,
+                bytes_copied,
+                total_bytes,
+                progress,
+            )?;
+        }
+        return Ok(CopyOutcome::Copied);
+    }
+
+    Ok(CopyOutcome::Skipped)
+}
+
+fn copy_symlink_safe(src: &Path, dst: &Path, meta: &fs::Metadata) -> OnyxResult<CopyOutcome> {
+    let Ok(target) = fs::read_link(src) else {
+        // Reparse point that isn't a readable symlink (e.g., unsupported junction/cloud stub): skip safely.
+        tracing::debug!(path = %src.display(), "Skipping unreadable reparse point during copy");
+        return Ok(CopyOutcome::Skipped);
+    };
+
+    #[cfg(windows)]
+    let link_res = {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+        if is_dir_reparse(meta) {
+            symlink_dir(&target, dst)
+        } else {
+            symlink_file(&target, dst)
+        }
+    };
+
+    #[cfg(not(windows))]
+    let link_res = {
+        let _ = meta;
+        std::os::unix::fs::symlink(&target, dst)
+    };
+
+    match link_res {
+        Ok(()) => Ok(CopyOutcome::Copied),
+        Err(err)
+            if err.kind() == std::io::ErrorKind::PermissionDenied
+                || err.raw_os_error() == Some(1314) =>
+        {
+            // Unprivileged Windows users without Developer Mode cannot create symlinks;
+            // safely skip rather than following a potential cycle or failing the whole batch.
+            tracing::warn!(
+                src = %src.display(),
+                dst = %dst.display(),
+                "Skipping symlink copy due to missing symlink creation privilege"
+            );
+            Ok(CopyOutcome::Skipped)
+        }
+        Err(err) => Err(OnyxError::Io(err)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_file_chunked(
+    src: &Path,
+    dst: &Path,
+    cancel: &CancellationToken,
+    op_id: u64,
+    kind: OperationKind,
+    completed_items: usize,
+    total_items: usize,
+    bytes_copied: &mut u64,
+    total_bytes: u64,
+    progress: Option<&mpsc::Sender<OperationProgress>>,
+) -> OnyxResult<()> {
+    let mut reader = File::open(src)?;
+    let mut writer = File::create(dst)?;
+    let mut buf = vec![0u8; COPY_CHUNK_BYTES];
+    let item_label = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| src.display().to_string());
+
+    loop {
+        if cancel.is_cancelled() {
+            drop(writer);
+            let _ = fs::remove_file(dst);
+            return Err(OnyxError::Cancelled);
+        }
+
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        writer.write_all(&buf[..n])?;
+        *bytes_copied = bytes_copied.saturating_add(n as u64);
+
+        send_progress(
+            progress,
+            OperationProgress {
+                op_id,
+                kind,
+                current_item: item_label.clone(),
+                completed_items,
+                total_items,
+                bytes_copied: *bytes_copied,
+                total_bytes,
+                finished: false,
+                cancelled: false,
+                error: None,
+            },
+        );
+    }
+
+    writer.flush()?;
+
+    // Best-effort preserve modified timestamp.
+    if let Ok(meta) = fs::metadata(src)
+        && let Ok(modified) = meta.modified()
+    {
+        let _ = writer.set_modified(modified);
+    }
+
+    Ok(())
+}
+
+fn remove_existing_for_overwrite(path: &Path) -> OnyxResult<()> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(OnyxError::Io(err)),
+    };
+
+    if is_reparse_or_symlink(&meta) {
+        if is_dir_reparse(&meta) {
+            fs::remove_dir(path)?;
+        } else {
+            fs::remove_file(path)?;
+        }
+    } else if meta.is_dir() {
+        remove_dir_safe_no_follow(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+/// Removes a directory tree safely without ever following symlinks or junctions into external trees.
+fn remove_dir_safe_no_follow(dir: &Path) -> OnyxResult<()> {
+    for entry_res in fs::read_dir(dir)? {
+        let entry = entry_res?;
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)?;
+        if is_reparse_or_symlink(&meta) {
+            if is_dir_reparse(&meta) {
+                fs::remove_dir(&path)?;
+            } else {
+                fs::remove_file(&path)?;
+            }
+        } else if meta.is_dir() {
+            remove_dir_safe_no_follow(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    fs::remove_dir(dir)?;
+    Ok(())
+}
+
+fn move_items_blocking(
+    op_id: u64,
+    sources: &[PathBuf],
+    destination_dir: &Path,
+    conflict: ConflictPolicy,
+    cancel: &CancellationToken,
+    progress: Option<&mpsc::Sender<OperationProgress>>,
+    space_checker: &dyn SpaceChecker,
+) -> OnyxResult<OperationReport> {
+    if !destination_dir.is_dir() {
+        return Err(OnyxError::NotFound {
+            path: destination_dir.to_path_buf(),
+        });
+    }
+
+    ensure_not_recursive(sources, destination_dir)?;
+
+    // Check space for sources that appear to be on a different volume.
+    let cross_vol_sources: Vec<PathBuf> = sources
+        .iter()
+        .filter(|src| !is_same_volume(src, destination_dir))
+        .cloned()
+        .collect();
+    let total_bytes = measure_total_bytes(&cross_vol_sources);
+    check_disk_space(space_checker, destination_dir, total_bytes)?;
+
+    let total_items = sources.len();
+    let mut report = OperationReport::default();
+    let mut reverse_moves: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut bytes_copied = 0u64;
+    let mut completed_items = 0usize;
+
+    for src in sources {
+        if cancel.is_cancelled() {
+            send_progress(
+                progress,
+                OperationProgress {
+                    op_id,
+                    kind: OperationKind::Move,
+                    current_item: src.display().to_string(),
+                    completed_items,
+                    total_items,
+                    bytes_copied,
+                    total_bytes,
+                    finished: true,
+                    cancelled: true,
+                    error: None,
+                },
+            );
+            return Err(OnyxError::Cancelled);
+        }
+
+        let item_name = match src.file_name() {
+            Some(name) => name.to_os_string(),
+            None => {
+                report
+                    .failed
+                    .push((src.clone(), "Source path has no file name".to_string()));
+                completed_items += 1;
+                continue;
+            }
+        };
+
+        let meta = match fs::symlink_metadata(src) {
+            Ok(m) => m,
+            Err(err) => {
+                report.failed.push((src.clone(), err.to_string()));
+                completed_items += 1;
+                continue;
+            }
+        };
+
+        let desired_target = destination_dir.join(&item_name);
+        if is_same_normalized_path(src, &desired_target) {
+            report.skipped.push(src.clone());
+            completed_items += 1;
+            continue;
+        }
+
+        let target = match resolve_conflict(src, &desired_target, conflict, false) {
+            Ok(ConflictResolution::Skip) => {
+                report.skipped.push(src.clone());
+                completed_items += 1;
+                continue;
+            }
+            Ok(ConflictResolution::Proceed(path)) => path,
+            Ok(ConflictResolution::Overwrite(path)) => {
+                if let Err(err) = remove_existing_for_overwrite(&path) {
+                    report.failed.push((src.clone(), err.to_string()));
+                    completed_items += 1;
+                    continue;
+                }
+                path
+            }
+            Err(err) => {
+                report.failed.push((src.clone(), err.to_string()));
+                completed_items += 1;
+                continue;
+            }
+        };
+
+        let move_res = match fs::rename(src, &target) {
+            Ok(()) => Ok(()),
+            Err(err) if is_cross_device_error(&err) => {
+                // Cross-volume move: copy completely, then delete source.
+                let mut visited = HashSet::new();
+                copy_entry_recursive(
+                    src,
+                    &target,
+                    &meta,
+                    &mut visited,
+                    cancel,
+                    op_id,
+                    OperationKind::Move,
+                    completed_items,
+                    total_items,
+                    &mut bytes_copied,
+                    total_bytes,
+                    progress,
+                )?;
+                remove_existing_for_overwrite(src)
+            }
+            Err(err) => Err(OnyxError::Io(err)),
+        };
+
+        match move_res {
+            Ok(()) => {
+                reverse_moves.push((target.clone(), src.clone()));
+                report.succeeded.push(target);
+            }
+            Err(OnyxError::Cancelled) => {
+                send_progress(
+                    progress,
+                    OperationProgress {
+                        op_id,
+                        kind: OperationKind::Move,
+                        current_item: src.display().to_string(),
+                        completed_items,
+                        total_items,
+                        bytes_copied,
+                        total_bytes,
+                        finished: true,
+                        cancelled: true,
+                        error: None,
+                    },
+                );
+                return Err(OnyxError::Cancelled);
+            }
+            Err(err) => {
+                report.failed.push((src.clone(), err.to_string()));
+            }
+        }
+
+        completed_items += 1;
+        send_progress(
+            progress,
+            OperationProgress {
+                op_id,
+                kind: OperationKind::Move,
+                current_item: item_name.to_string_lossy().into_owned(),
+                completed_items,
+                total_items,
+                bytes_copied,
+                total_bytes,
+                finished: false,
+                cancelled: false,
+                error: None,
+            },
+        );
+    }
+
+    if !reverse_moves.is_empty() {
+        report.undo_action = Some(UndoAction::ReverseMoves(reverse_moves));
+    }
+
+    send_progress(
+        progress,
+        OperationProgress {
+            op_id,
+            kind: OperationKind::Move,
+            current_item: String::new(),
+            completed_items,
+            total_items,
+            bytes_copied,
+            total_bytes,
+            finished: true,
+            cancelled: false,
+            error: None,
+        },
+    );
+
+    Ok(report)
+}
+
+fn is_cross_device_error(err: &std::io::Error) -> bool {
+    // Win32 ERROR_NOT_SAME_DEVICE = 17
+    err.kind() == std::io::ErrorKind::CrossesDevices || err.raw_os_error() == Some(17)
+}
+
+fn rename_item_blocking(
+    source: &Path,
+    new_name: &str,
+    conflict: ConflictPolicy,
+) -> OnyxResult<OperationReport> {
+    if !path_exists_any(source) {
+        return Err(OnyxError::NotFound {
+            path: source.to_path_buf(),
+        });
+    }
+
+    let parent = source.parent().ok_or_else(|| OnyxError::InvalidPath {
+        message: format!("Cannot rename root path '{}'", source.display()),
+    })?;
+    let desired = parent.join(new_name);
+
+    let mut report = OperationReport::default();
+    let target = match resolve_conflict(source, &desired, conflict, true)? {
+        ConflictResolution::Skip => {
+            report.skipped.push(source.to_path_buf());
+            return Ok(report);
+        }
+        ConflictResolution::Proceed(path) => path,
+        ConflictResolution::Overwrite(path) => {
+            remove_existing_for_overwrite(&path)?;
+            path
+        }
+    };
+
+    fs::rename(source, &target)?;
+    report.succeeded.push(target.clone());
+    report.undo_action = Some(UndoAction::ReverseRename {
+        from: target,
+        to: source.to_path_buf(),
+    });
+    Ok(report)
+}
+
+fn create_dir_blocking(parent_dir: &Path, name: &str) -> OnyxResult<OperationReport> {
+    if !parent_dir.is_dir() {
+        return Err(OnyxError::NotFound {
+            path: parent_dir.to_path_buf(),
+        });
+    }
+
+    let target = parent_dir.join(name);
+    if path_exists_any(&target) {
+        return Err(OnyxError::AlreadyExists { path: target });
+    }
+
+    fs::create_dir(&target)?;
+    let mut report = OperationReport::default();
+    report.succeeded.push(target.clone());
+    report.undo_action = Some(UndoAction::RemoveCreatedDir(target));
+    Ok(report)
+}
+
+fn recycle_items_blocking(
+    op_id: u64,
+    paths: &[PathBuf],
+    cancel: &CancellationToken,
+    progress: Option<&mpsc::Sender<OperationProgress>>,
+    recycler: &dyn Recycler,
+) -> OnyxResult<OperationReport> {
+    let total_items = paths.len();
+    let mut report = OperationReport::default();
+    let mut completed_items = 0usize;
+
+    for path in paths {
+        if cancel.is_cancelled() {
+            send_progress(
+                progress,
+                OperationProgress {
+                    op_id,
+                    kind: OperationKind::Recycle,
+                    current_item: path.display().to_string(),
+                    completed_items,
+                    total_items,
+                    bytes_copied: 0,
+                    total_bytes: 0,
+                    finished: true,
+                    cancelled: true,
+                    error: None,
+                },
+            );
+            return Err(OnyxError::Cancelled);
+        }
+
+        if !path_exists_any(path) {
+            report.failed.push((
+                path.clone(),
+                OnyxError::NotFound { path: path.clone() }.to_string(),
+            ));
+            completed_items += 1;
+            continue;
+        }
+
+        match recycler.recycle(std::slice::from_ref(path)) {
+            Ok(()) => report.succeeded.push(path.clone()),
+            Err(err) => report.failed.push((path.clone(), err.to_string())),
+        }
+
+        completed_items += 1;
+        send_progress(
+            progress,
+            OperationProgress {
+                op_id,
+                kind: OperationKind::Recycle,
+                current_item: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string()),
+                completed_items,
+                total_items,
+                bytes_copied: 0,
+                total_bytes: 0,
+                finished: false,
+                cancelled: false,
+                error: None,
+            },
+        );
+    }
+
+    send_progress(
+        progress,
+        OperationProgress {
+            op_id,
+            kind: OperationKind::Recycle,
+            current_item: String::new(),
+            completed_items,
+            total_items,
+            bytes_copied: 0,
+            total_bytes: 0,
+            finished: true,
+            cancelled: false,
+            error: None,
+        },
+    );
+
+    Ok(report)
+}
+
+fn permanent_delete_blocking(
+    op_id: u64,
+    paths: &[PathBuf],
+    cancel: &CancellationToken,
+    progress: Option<&mpsc::Sender<OperationProgress>>,
+) -> OnyxResult<OperationReport> {
+    let total_items = paths.len();
+    let mut report = OperationReport::default();
+    let mut completed_items = 0usize;
+
+    for path in paths {
+        if cancel.is_cancelled() {
+            send_progress(
+                progress,
+                OperationProgress {
+                    op_id,
+                    kind: OperationKind::PermanentDelete,
+                    current_item: path.display().to_string(),
+                    completed_items,
+                    total_items,
+                    bytes_copied: 0,
+                    total_bytes: 0,
+                    finished: true,
+                    cancelled: true,
+                    error: None,
+                },
+            );
+            return Err(OnyxError::Cancelled);
+        }
+
+        let meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(err) => {
+                report.failed.push((path.clone(), err.to_string()));
+                completed_items += 1;
+                continue;
+            }
+        };
+
+        let del_res = if is_reparse_or_symlink(&meta) {
+            if is_dir_reparse(&meta) {
+                fs::remove_dir(path).map_err(OnyxError::Io)
+            } else {
+                fs::remove_file(path).map_err(OnyxError::Io)
+            }
+        } else if meta.is_dir() {
+            remove_dir_safe_no_follow(path)
+        } else {
+            fs::remove_file(path).map_err(OnyxError::Io)
+        };
+
+        match del_res {
+            Ok(()) => report.succeeded.push(path.clone()),
+            Err(err) => report.failed.push((path.clone(), err.to_string())),
+        }
+
+        completed_items += 1;
+        send_progress(
+            progress,
+            OperationProgress {
+                op_id,
+                kind: OperationKind::PermanentDelete,
+                current_item: path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string()),
+                completed_items,
+                total_items,
+                bytes_copied: 0,
+                total_bytes: 0,
+                finished: false,
+                cancelled: false,
+                error: None,
+            },
+        );
+    }
+
+    send_progress(
+        progress,
+        OperationProgress {
+            op_id,
+            kind: OperationKind::PermanentDelete,
+            current_item: String::new(),
+            completed_items,
+            total_items,
+            bytes_copied: 0,
+            total_bytes: 0,
+            finished: true,
+            cancelled: false,
+            error: None,
+        },
+    );
+
+    Ok(report)
+}
+
+fn execute_undo_blocking(
+    action: UndoAction,
+    recycler: &dyn Recycler,
+) -> OnyxResult<OperationReport> {
+    let mut report = OperationReport::default();
+
+    match action {
+        UndoAction::ReverseRename { from, to } => {
+            if !path_exists_any(&from) {
+                return Err(OnyxError::NotFound { path: from });
+            }
+            let target = if path_exists_any(&to) && !is_same_normalized_path(&from, &to) {
+                generate_auto_rename_path(&to)?
+            } else {
+                to
+            };
+            fs::rename(&from, &target)?;
+            report.succeeded.push(target);
+        }
+        UndoAction::RemoveCreatedDir(dir) => {
+            if !path_exists_any(&dir) {
+                return Err(OnyxError::NotFound { path: dir });
+            }
+            // Intentionally uses `remove_dir` (not `remove_dir_all`) so undo never destroys
+            // files added by the user after the directory was created.
+            fs::remove_dir(&dir)?;
+            report.succeeded.push(dir);
+        }
+        UndoAction::ReverseMoves(moves) => {
+            for (from, to) in moves.into_iter().rev() {
+                if !path_exists_any(&from) {
+                    report
+                        .failed
+                        .push((from.clone(), OnyxError::NotFound { path: from }.to_string()));
+                    continue;
+                }
+                let target = if path_exists_any(&to) && !is_same_normalized_path(&from, &to) {
+                    match generate_auto_rename_path(&to) {
+                        Ok(p) => p,
+                        Err(err) => {
+                            report.failed.push((from, err.to_string()));
+                            continue;
+                        }
+                    }
+                } else {
+                    to
+                };
+                match fs::rename(&from, &target) {
+                    Ok(()) => report.succeeded.push(target),
+                    Err(err) => report.failed.push((from, err.to_string())),
+                }
+            }
+        }
+        UndoAction::RecycleCreatedCopies(paths) => {
+            for path in paths {
+                if !path_exists_any(&path) {
+                    report.skipped.push(path);
+                    continue;
+                }
+                match recycler.recycle(std::slice::from_ref(&path)) {
+                    Ok(()) => report.succeeded.push(path),
+                    Err(err) => report.failed.push((path, err.to_string())),
+                }
+            }
+        }
+    }
+
+    Ok(report)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use tempfile::TempDir;
+
+    /// Mock recycler that moves files into an isolated temporary trash folder instead of
+    /// touching the real Windows Recycle Bin.
+    #[derive(Debug)]
+    struct MockRecycler {
+        trash_dir: PathBuf,
+        recycled: StdMutex<Vec<PathBuf>>,
+        fail_on: StdMutex<Option<PathBuf>>,
+    }
+
+    impl MockRecycler {
+        fn new(trash_dir: PathBuf) -> Self {
+            Self {
+                trash_dir,
+                recycled: StdMutex::new(Vec::new()),
+                fail_on: StdMutex::new(None),
+            }
+        }
+
+        fn set_fail_on(&self, path: PathBuf) {
+            *self.fail_on.lock().unwrap() = Some(path);
+        }
+
+        fn recycled_paths(&self) -> Vec<PathBuf> {
+            self.recycled.lock().unwrap().clone()
+        }
+    }
+
+    impl Recycler for MockRecycler {
+        fn recycle(&self, paths: &[PathBuf]) -> OnyxResult<()> {
+            for path in paths {
+                if self
+                    .fail_on
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|p| p == path)
+                {
+                    return Err(OnyxError::PermissionDenied { path: path.clone() });
+                }
+                let name = path.file_name().unwrap().to_os_string();
+                let mut dst = self.trash_dir.join(&name);
+                if dst.exists() {
+                    dst = generate_auto_rename_path(&dst)?;
+                }
+                fs::rename(path, &dst)?;
+                self.recycled.lock().unwrap().push(path.clone());
+            }
+            Ok(())
+        }
+    }
+
+    /// Mock space checker for deterministic `InsufficientSpace` fault-injection tests.
+    #[derive(Debug)]
+    struct FixedSpaceChecker(Option<u64>);
+
+    impl SpaceChecker for FixedSpaceChecker {
+        fn free_space(&self, _path: &Path) -> Option<u64> {
+            self.0
+        }
+    }
+
+    fn test_engine(trash: &TempDir) -> (FileOperationsEngine, Arc<MockRecycler>) {
+        let recycler = Arc::new(MockRecycler::new(trash.path().to_path_buf()));
+        let engine =
+            FileOperationsEngine::with_recycler(Arc::clone(&recycler) as Arc<dyn Recycler>);
+        (engine, recycler)
+    }
+
+    #[tokio::test]
+    async fn copy_move_rename_create_dir_duplicate_and_undo() {
+        let work = TempDir::new().unwrap();
+        let trash = TempDir::new().unwrap();
+        let (engine, recycler) = test_engine(&trash);
+
+        // 1. Create directory + undo
+        let create_rep = engine.create_dir(work.path(), "Alpha").await.unwrap();
+        let alpha_dir = work.path().join("Alpha");
+        assert!(alpha_dir.is_dir());
+        assert_eq!(create_rep.succeeded, vec![alpha_dir.clone()]);
+        assert!(engine.can_undo().await);
+
+        let undo_create = engine.undo_last().await.unwrap().unwrap();
+        assert!(!alpha_dir.exists());
+        assert_eq!(undo_create.succeeded, vec![alpha_dir.clone()]);
+
+        // Recreate Alpha and Beta
+        engine.create_dir(work.path(), "Alpha").await.unwrap();
+        engine.create_dir(work.path(), "Beta").await.unwrap();
+        let beta_dir = work.path().join("Beta");
+
+        // 2. Copy file with progress streaming
+        let src_file = alpha_dir.join("doc.txt");
+        fs::write(&src_file, b"hello onyx world").unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+
+        let copy_rep = engine
+            .copy_items(
+                std::slice::from_ref(&src_file),
+                &beta_dir,
+                ConflictPolicy::Fail,
+                CancellationToken::new(),
+                Some(tx),
+            )
+            .await
+            .unwrap();
+
+        let copied_file = beta_dir.join("doc.txt");
+        assert!(copied_file.exists());
+        assert_eq!(fs::read(&copied_file).unwrap(), b"hello onyx world");
+        assert_eq!(copy_rep.succeeded, vec![copied_file.clone()]);
+
+        let mut events = Vec::new();
+        while let Some(ev) = rx.recv().await {
+            events.push(ev);
+        }
+        assert!(events.last().is_some_and(|e| e.finished && !e.cancelled));
+
+        // Undo copy -> recycles the copy via MockRecycler (not real Recycle Bin)
+        let _ = engine.undo_last().await.unwrap().unwrap();
+        assert!(!copied_file.exists());
+        assert!(recycler.recycled_paths().contains(&copied_file));
+
+        // 3. Duplicate file -> produces "doc (2).txt"
+        let dup_rep = engine
+            .duplicate_item(&src_file, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let dup_file = alpha_dir.join("doc (2).txt");
+        assert!(dup_file.exists());
+        assert_eq!(dup_rep.succeeded, vec![dup_file.clone()]);
+
+        // 4. Rename file + undo
+        let rename_rep = engine
+            .rename_item(&dup_file, "renamed.txt", ConflictPolicy::Fail)
+            .await
+            .unwrap();
+        let renamed_file = alpha_dir.join("renamed.txt");
+        assert!(renamed_file.exists());
+        assert!(!dup_file.exists());
+        assert_eq!(rename_rep.succeeded, vec![renamed_file.clone()]);
+
+        let _ = engine.undo_last().await.unwrap().unwrap();
+        assert!(dup_file.exists());
+        assert!(!renamed_file.exists());
+
+        // 5. Move file + undo
+        let move_rep = engine
+            .move_items(
+                std::slice::from_ref(&dup_file),
+                &beta_dir,
+                ConflictPolicy::Fail,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let moved_file = beta_dir.join("doc (2).txt");
+        assert!(moved_file.exists());
+        assert!(!dup_file.exists());
+        assert_eq!(move_rep.succeeded, vec![moved_file.clone()]);
+
+        let _ = engine.undo_last().await.unwrap().unwrap();
+        assert!(dup_file.exists());
+        assert!(!moved_file.exists());
+    }
+
+    #[tokio::test]
+    async fn conflict_policies_skip_overwrite_autorename_fail() {
+        let work = TempDir::new().unwrap();
+        let trash = TempDir::new().unwrap();
+        let (engine, _) = test_engine(&trash);
+
+        let src_dir = work.path().join("src");
+        let dst_dir = work.path().join("dst");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dst_dir).unwrap();
+
+        let src = src_dir.join("data.txt");
+        let existing = dst_dir.join("data.txt");
+        fs::write(&src, b"new-content").unwrap();
+        fs::write(&existing, b"old-content").unwrap();
+
+        // Skip
+        let skip_rep = engine
+            .copy_items(
+                std::slice::from_ref(&src),
+                &dst_dir,
+                ConflictPolicy::Skip,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(skip_rep.skipped, vec![src.clone()]);
+        assert_eq!(fs::read(&existing).unwrap(), b"old-content");
+
+        // Fail (collected into report.failed)
+        let fail_rep = engine
+            .copy_items(
+                std::slice::from_ref(&src),
+                &dst_dir,
+                ConflictPolicy::Fail,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fail_rep.failed.len(), 1);
+        assert_eq!(fs::read(&existing).unwrap(), b"old-content");
+
+        // AutoRename -> "data (2).txt"
+        let auto_rep = engine
+            .copy_items(
+                std::slice::from_ref(&src),
+                &dst_dir,
+                ConflictPolicy::AutoRename,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(auto_rep.succeeded, vec![dst_dir.join("data (2).txt")]);
+        assert_eq!(
+            fs::read(dst_dir.join("data (2).txt")).unwrap(),
+            b"new-content"
+        );
+
+        // Overwrite
+        let over_rep = engine
+            .copy_items(
+                std::slice::from_ref(&src),
+                &dst_dir,
+                ConflictPolicy::Overwrite,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(over_rep.succeeded, vec![existing.clone()]);
+        assert_eq!(fs::read(&existing).unwrap(), b"new-content");
+    }
+
+    #[tokio::test]
+    async fn recursion_guard_refuses_copy_and_move_into_self_or_child() {
+        let work = TempDir::new().unwrap();
+        let trash = TempDir::new().unwrap();
+        let (engine, _) = test_engine(&trash);
+
+        let folder = work.path().join("Folder");
+        let nested = folder.join("Nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        let copy_self = engine
+            .copy_items(
+                std::slice::from_ref(&folder),
+                &folder,
+                ConflictPolicy::AutoRename,
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+        assert!(matches!(
+            copy_self,
+            Err(OnyxError::RecursiveOperation { .. })
+        ));
+
+        let copy_child = engine
+            .copy_items(
+                std::slice::from_ref(&folder),
+                &nested,
+                ConflictPolicy::AutoRename,
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+        assert!(matches!(
+            copy_child,
+            Err(OnyxError::RecursiveOperation { .. })
+        ));
+
+        let move_child = engine
+            .move_items(
+                std::slice::from_ref(&folder),
+                &nested,
+                ConflictPolicy::AutoRename,
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+        assert!(matches!(
+            move_child,
+            Err(OnyxError::RecursiveOperation { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn permanent_delete_requires_explicit_confirmation() {
+        let work = TempDir::new().unwrap();
+        let trash = TempDir::new().unwrap();
+        let (engine, _) = test_engine(&trash);
+
+        let file = work.path().join("secret.txt");
+        fs::write(&file, b"important").unwrap();
+
+        let refused = engine
+            .permanent_delete(
+                PermanentDeleteRequest::unconfirmed(vec![file.clone()]),
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+        assert!(refused.is_err());
+        assert!(
+            file.exists(),
+            "Unconfirmed permanent delete must never delete files"
+        );
+
+        let deleted = engine
+            .permanent_delete(
+                PermanentDeleteRequest::confirmed(vec![file.clone()]),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.succeeded, vec![file.clone()]);
+        assert!(!file.exists());
+    }
+
+    #[tokio::test]
+    async fn fault_injection_insufficient_disk_space() {
+        let work = TempDir::new().unwrap();
+        let trash = TempDir::new().unwrap();
+        let recycler = Arc::new(MockRecycler::new(trash.path().to_path_buf()));
+        let tiny_disk = Arc::new(FixedSpaceChecker(Some(10))); // only 10 bytes free
+        let engine = FileOperationsEngine::with_providers(recycler, tiny_disk);
+
+        let src_dir = work.path().join("src");
+        let dst_dir = work.path().join("dst");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dst_dir).unwrap();
+
+        let big_file = src_dir.join("payload.bin");
+        fs::write(&big_file, vec![0xAB; 1024]).unwrap();
+
+        let result = engine
+            .copy_items(
+                std::slice::from_ref(&big_file),
+                &dst_dir,
+                ConflictPolicy::Fail,
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(OnyxError::InsufficientSpace {
+                required: 1024,
+                available: 10
+            })
+        ));
+        assert!(!dst_dir.join("payload.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn fault_injection_cancellation_and_partial_failure_collection() {
+        let work = TempDir::new().unwrap();
+        let trash = TempDir::new().unwrap();
+        let (engine, recycler) = test_engine(&trash);
+
+        // Pre-cancelled token immediately cancels copy
+        let f1 = work.path().join("a.txt");
+        let dst_dir = work.path().join("dst");
+        fs::create_dir_all(&dst_dir).unwrap();
+        fs::write(&f1, b"abc").unwrap();
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let cancelled = engine
+            .copy_items(
+                std::slice::from_ref(&f1),
+                &dst_dir,
+                ConflictPolicy::AutoRename,
+                cancel,
+                None,
+            )
+            .await;
+        assert!(matches!(cancelled, Err(OnyxError::Cancelled)));
+
+        // Partial failure collection during recycle (one succeeds, one fails via injected error, one missing)
+        let f2 = work.path().join("b.txt");
+        let missing = work.path().join("missing.txt");
+        fs::write(&f2, b"def").unwrap();
+        recycler.set_fail_on(f2.clone());
+
+        let rep = engine
+            .recycle_items(
+                &[f1.clone(), f2.clone(), missing.clone()],
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rep.succeeded, vec![f1.clone()]);
+        assert_eq!(rep.failed.len(), 2);
+        assert!(!f1.exists());
+        assert!(f2.exists());
+    }
+
+    #[tokio::test]
+    async fn undo_remove_created_dir_refuses_non_empty_directory() {
+        let work = TempDir::new().unwrap();
+        let trash = TempDir::new().unwrap();
+        let (engine, _) = test_engine(&trash);
+
+        engine.create_dir(work.path(), "UserFolder").await.unwrap();
+        let created = work.path().join("UserFolder");
+        fs::write(created.join("precious.txt"), b"keep me").unwrap();
+
+        let undo_res = engine.undo_last().await;
+        assert!(
+            undo_res.is_err(),
+            "Undo must refuse to delete a non-empty created dir"
+        );
+        assert!(created.join("precious.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn case_only_rename_succeeds_without_conflict() {
+        let work = TempDir::new().unwrap();
+        let trash = TempDir::new().unwrap();
+        let (engine, _) = test_engine(&trash);
+
+        let lower = work.path().join("readme.txt");
+        fs::write(&lower, b"hello").unwrap();
+
+        let rep = engine
+            .rename_item(&lower, "README.txt", ConflictPolicy::Fail)
+            .await
+            .unwrap();
+        assert_eq!(rep.succeeded, vec![work.path().join("README.txt")]);
+        assert_eq!(fs::read(work.path().join("README.txt")).unwrap(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn recursive_directory_copy_preserves_nested_tree() {
+        let work = TempDir::new().unwrap();
+        let trash = TempDir::new().unwrap();
+        let (engine, _) = test_engine(&trash);
+
+        let src_tree = work.path().join("Tree");
+        let dst_root = work.path().join("Dest");
+        fs::create_dir_all(src_tree.join("sub").join("deep")).unwrap();
+        fs::create_dir_all(&dst_root).unwrap();
+        fs::write(src_tree.join("root.txt"), b"r").unwrap();
+        fs::write(src_tree.join("sub").join("deep").join("leaf.txt"), b"leaf").unwrap();
+
+        let rep = engine
+            .copy_items(
+                std::slice::from_ref(&src_tree),
+                &dst_root,
+                ConflictPolicy::Fail,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rep.succeeded, vec![dst_root.join("Tree")]);
+        assert_eq!(
+            fs::read(
+                dst_root
+                    .join("Tree")
+                    .join("sub")
+                    .join("deep")
+                    .join("leaf.txt")
+            )
+            .unwrap(),
+            b"leaf"
+        );
+    }
+
+    #[tokio::test]
+    async fn junction_cycle_does_not_recurse_infinitely_on_copy_or_delete() {
+        let work = TempDir::new().unwrap();
+        let trash = TempDir::new().unwrap();
+        let (engine, _) = test_engine(&trash);
+
+        let tree = work.path().join("CycleRoot");
+        let dst = work.path().join("Dest");
+        fs::create_dir_all(&tree).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(tree.join("hello.txt"), b"ok").unwrap();
+
+        // Create a self-referential NTFS directory junction (`CycleRoot\loop -> CycleRoot`)
+        // using `cmd /C mklink /J`, which works without Administrator elevation on NTFS.
+        let loop_junction = tree.join("loop");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&loop_junction)
+            .arg(&tree)
+            .output();
+
+        if let Ok(out) = status
+            && out.status.success()
+        {
+            // Copying `CycleRoot` must terminate cleanly and copy `hello.txt` without infinite recursion.
+            let rep = engine
+                .copy_items(
+                    std::slice::from_ref(&tree),
+                    &dst,
+                    ConflictPolicy::Fail,
+                    CancellationToken::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(rep.succeeded, vec![dst.join("CycleRoot")]);
+            assert_eq!(
+                fs::read(dst.join("CycleRoot").join("hello.txt")).unwrap(),
+                b"ok"
+            );
+
+            // Permanent delete must unlink the junction safely without looping or escaping.
+            let del = engine
+                .permanent_delete(
+                    PermanentDeleteRequest::confirmed(vec![tree.clone()]),
+                    CancellationToken::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(del.succeeded, vec![tree.clone()]);
+            assert!(!tree.exists());
+        }
+    }
+}

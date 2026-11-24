@@ -1,0 +1,70 @@
+# Onyx Nocturne (Nyx-Inspired) — Dark Theme Design Tokens
+[meta]
+id = "onyx-dark"
+name = "Onyx Nocturne"
+appearance = "dark"
+version = "1.1.0"
+background_image = "onyx-aurora.png"
+
+[colors]
+accent = "#8a7fe8"
+accent_effective = "#8a7fe8"
+accent_bright = "#b4aaff"
+accent_subtle = "#8a7fe829"
+accent_border = "#b4aaff48"
+
+bg_base = "#000000"
+bg_chrome = "#080817eb"
+bg_sidebar = "#090913e8"
+bg_surface = "#0d0c20ee"
+bg_surface_alt = "#0b0a1cd6"
+bg_elevated = "#101024f5"
+bg_hover = "#1a1840a8"
+bg_pressed = "#242152cc"
+bg_selected = "#1e1b48cc"
+bg_input = "#12102ae0"
+bg_code = "#08071ae6"
+bg_badge = "#17152ee0"
+bg_backdrop = "#020208b8"
+
+border_subtle = "#1f1f2d"
+border_sidebar = "#161622"
+border_strong = "#343062"
+border_specular = "#ffffff12"
+border_focus = "#8a7fe8"
+
+text_primary = "#f1f0ff"
+text_secondary = "#a6a3c0"
+text_muted = "#7c789c"
+text_on_accent = "#06061a"
+
+folder_tint = "#b4aaff"
+file_tint = "#8d89b3"
+symlink_tint = "#7cc8ff"
+success = "#6ccb5f"
+warning = "#f4c95d"
+warning_bg = "#332714d8"
+warning_text = "#fde68a"
+danger = "#f06e96"
+danger_bg = "#351626d8"
+danger_hover = "#e05382"
+
+[radii]
+sm = 5
+md = 8
+lg = 12
+
+[spacing]
+xs = 4
+sm = 8
+md = 12
+lg = 16
+
+[typography]
+font_family = "Segoe UI"
+font_mono = "Consolas"
+size_xs = 11
+size_sm = 12
+size_md = 13
+size_lg = 15
+size_xl = 18

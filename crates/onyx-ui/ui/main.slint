@@ -1,0 +1,633 @@
+import { Palette } from "std-widgets.slint";
+import { OnyxTheme } from "tokens.slint";
+import {
+    UiTabItem,
+    UiBreadcrumb,
+    UiSidebarItem,
+    UiDriveItem,
+    UiFileEntry,
+    UiMetadataRow,
+    UiCommandItem,
+    UiOperationProgress,
+} from "types.slint";
+import { TabBar } from "components/tab_bar.slint";
+import { NavBar } from "components/nav_bar.slint";
+import { Toolbar } from "components/toolbar.slint";
+import { Sidebar } from "components/sidebar.slint";
+import { FilePane } from "components/file_pane.slint";
+import { PreviewPane } from "components/preview_pane.slint";
+import {
+    CommandPaletteModal,
+    PromptDialogModal,
+    QuickLookModal,
+    OperationProgressCard,
+} from "components/overlays.slint";
+import { StatusBar } from "components/status_bar.slint";
+
+export {
+    OnyxTheme,
+    UiTabItem,
+    UiBreadcrumb,
+    UiSidebarItem,
+    UiDriveItem,
+    UiFileEntry,
+    UiMetadataRow,
+    UiCommandItem,
+    UiOperationProgress,
+}
+
+export component OnyxWindow inherits Window {
+    title: "Onyx";
+    min-width: 960px;
+    min-height: 620px;
+    preferred-width: 1320px;
+    preferred-height: 820px;
+    default-font-family: OnyxTheme.font-family;
+    background: OnyxTheme.bg-base;
+
+    // Theme properties synced with OnyxTheme global and Slint Palette
+    in-out property <bool> dark-mode <=> OnyxTheme.dark-mode;
+    in-out property <color> accent-color <=> OnyxTheme.accent-color;
+
+    // Tab bar state
+    in property <[UiTabItem]> tabs;
+
+    // Navigation, breadcrumbs & address bar state
+    in property <[UiBreadcrumb]> breadcrumbs;
+    in-out property <string> address-text: "";
+    in-out property <bool> address-editing: false;
+    in property <bool> can-go-back: false;
+    in property <bool> can-go-forward: false;
+    in property <bool> is-current-favorite: false;
+    in property <string> home-path: "";
+
+    // Search state
+    in-out property <string> search-text: "";
+    in property <bool> indexed-search: false;
+
+    // Sidebar state
+    in property <[UiSidebarItem]> favorites;
+    in property <[UiSidebarItem]> known-folders;
+    in property <[UiDriveItem]> drives;
+
+    // Primary pane (pane 0) state
+    in property <[UiFileEntry]> primary-entries;
+    in property <string> primary-path: "";
+    in property <int> primary-sort-column: 0;
+    in property <bool> primary-sort-ascending: true;
+    in property <bool> primary-loading: false;
+    in property <string> primary-error: "";
+    in-out property <int> primary-selected-index: -1;
+
+    // Secondary pane (pane 1) state
+    in property <[UiFileEntry]> secondary-entries;
+    in property <string> secondary-path: "";
+    in property <int> secondary-sort-column: 0;
+    in property <bool> secondary-sort-ascending: true;
+    in property <bool> secondary-loading: false;
+    in property <string> secondary-error: "";
+    in-out property <int> secondary-selected-index: -1;
+
+    // Active pane, layout & toolbar flags
+    in property <int> active-pane: 0;
+    in property <int> view-mode: 0; // 0 = Details, 1 = Grid
+    in property <bool> dual-pane: false;
+    in property <bool> preview-pane: true;
+    in property <bool> quick-look-open: false;
+    in property <bool> show-hidden: false;
+    in property <bool> can-undo: false;
+    in property <bool> can-paste: false;
+    in property <bool> has-selection: false;
+
+    // Preview & Quick Look state
+    in property <string> preview-title: "";
+    in property <string> preview-subtitle: "";
+    in property <string> preview-kind: "none";
+    in property <image> preview-image;
+    in property <bool> has-preview-image: false;
+    in property <string> preview-text: "";
+    in property <string> preview-language: "";
+    in property <bool> preview-truncated: false;
+    in property <string> preview-summary: "";
+    in property <string> preview-error: "";
+    in property <[UiMetadataRow]> preview-metadata;
+
+    // Command Palette modal state
+    in-out property <bool> command-palette-open: false;
+    in-out property <string> command-query: "";
+    in property <[UiCommandItem]> command-items;
+
+    // Prompt Dialog modal state (New Folder, Rename, Permanent Delete)
+    in-out property <bool> modal-open: false;
+    in property <string> modal-title: "";
+    in property <string> modal-message: "";
+    in-out property <string> modal-input: "";
+    in property <bool> modal-show-input: true;
+    in property <string> modal-confirm-label: "Confirm";
+    in property <bool> modal-danger: false;
+
+    // Background Operation Progress toast state
+    in property <UiOperationProgress> operation-progress;
+
+    // Status bar state
+    in property <string> status-items-text: "0 items";
+    in property <string> status-selection-text: "";
+    in property <string> status-message: "";
+    in property <string> status-search-text: "";
+
+    // Callbacks
+    callback new-tab();
+    callback close-tab(int);
+    callback switch-tab(int);
+    callback reorder-tab(int, int);
+    callback nav-back();
+    callback nav-forward();
+    callback nav-up();
+    callback nav-refresh();
+    callback navigate-to(int, string);
+    callback submit-address(string);
+    callback search-changed(string);
+    callback search-submitted(string);
+    callback toggle-indexed-search();
+    callback select-entry(int, int);
+    callback activate-entry(int, int);
+    callback set-active-pane(int);
+    callback sort-by(int, int);
+    callback toggle-view-mode();
+    callback toggle-dual-pane();
+    callback toggle-preview-pane();
+    callback toggle-quick-look();
+    callback toggle-theme();
+    callback toggle-hidden();
+    callback toggle-favorite();
+    callback unpin-favorite(string);
+    callback action-new-folder();
+    callback action-rename();
+    callback action-duplicate();
+    callback action-cut();
+    callback action-copy();
+    callback action-paste();
+    callback action-recycle();
+    callback action-permanent-delete();
+    callback action-undo();
+    callback action-properties();
+    callback action-open-with();
+    callback action-open-terminal();
+    callback cancel-operation();
+    callback toggle-command-palette();
+    callback command-query-changed(string);
+    callback execute-command(string);
+    callback modal-confirm(string);
+    callback modal-cancel();
+    callback move-selection(int);
+
+    // Helper properties for active pane
+    property <string> active-path: root.active-pane == 0 ? root.primary-path : root.secondary-path;
+    property <int> active-sort-column: root.active-pane == 0 ? root.primary-sort-column : root.secondary-sort-column;
+    property <bool> active-sort-ascending: root.active-pane == 0 ? root.primary-sort-ascending : root.secondary-sort-ascending;
+    property <int> active-selected-index: root.active-pane == 0 ? root.primary-selected-index : root.secondary-selected-index;
+
+    init => {
+        Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light;
+        key-handler.focus();
+    }
+
+    changed dark-mode => {
+        Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light;
+    }
+
+    changed command-palette-open => {
+        if root.command-palette-open {
+            palette-modal.focus-input();
+        } else {
+            key-handler.focus();
+        }
+    }
+
+    changed modal-open => {
+        if root.modal-open {
+            prompt-modal.focus-input();
+        } else {
+            key-handler.focus();
+        }
+    }
+
+    // Atmospheric pixel-dithered cosmic aurora backdrop in Dark Mode (Nyx-inspired)
+    if root.dark-mode : Image {
+        width: parent.width;
+        height: parent.height;
+        source: @image-url("../../../assets/themes/onyx-aurora.png");
+        image-fit: cover;
+        image-rendering: pixelated;
+    }
+
+    if root.dark-mode : Rectangle {
+        width: parent.width;
+        height: parent.height;
+        background: @linear-gradient(180deg, #02020896 0%, #05041278 48%, #020208aa 100%);
+    }
+
+    key-handler := FocusScope {
+        width: parent.width;
+        height: parent.height;
+
+        // Global shortcuts that work regardless of child focus
+        capture-key-pressed(event) => {
+            // Escape closes active overlays or address editing
+            if event.text == Key.Escape {
+                if root.modal-open {
+                    root.modal-cancel();
+                    return accept;
+                }
+                if root.command-palette-open {
+                    root.toggle-command-palette();
+                    return accept;
+                }
+                if root.quick-look-open {
+                    root.toggle-quick-look();
+                    return accept;
+                }
+                if root.address-editing {
+                    root.address-editing = false;
+                    key-handler.focus();
+                    return accept;
+                }
+            }
+
+            // Ctrl+K: Toggle Command Palette
+            if event.modifiers.control && (event.text == "k" || event.text == "K") {
+                root.toggle-command-palette();
+                return accept;
+            }
+
+            // Block other global shortcuts while a modal prompt or command palette is open
+            if root.modal-open || root.command-palette-open {
+                return reject;
+            }
+
+            // Ctrl+T: New Tab
+            if event.modifiers.control && (event.text == "t" || event.text == "T") {
+                root.new-tab();
+                return accept;
+            }
+
+            // Ctrl+W: Close active tab (-1 tells backend to close active tab)
+            if event.modifiers.control && (event.text == "w" || event.text == "W") {
+                root.close-tab(-1);
+                return accept;
+            }
+
+            // Ctrl+L: Focus Address Bar
+            if event.modifiers.control && (event.text == "l" || event.text == "L") {
+                nav-bar.focus-address-bar();
+                return accept;
+            }
+
+            // Ctrl+F: Focus Search Bar
+            if event.modifiers.control && (event.text == "f" || event.text == "F") {
+                nav-bar.focus-search-bar();
+                return accept;
+            }
+
+            // F5: Refresh
+            if event.text == Key.F5 {
+                root.nav-refresh();
+                return accept;
+            }
+
+            // Alt+Left / Alt+Right / Alt+Up: History & Parent navigation
+            if event.modifiers.alt && event.text == Key.LeftArrow {
+                root.nav-back();
+                return accept;
+            }
+            if event.modifiers.alt && event.text == Key.RightArrow {
+                root.nav-forward();
+                return accept;
+            }
+            if event.modifiers.alt && event.text == Key.UpArrow {
+                root.nav-up();
+                return accept;
+            }
+
+            return reject;
+        }
+
+        // File-pane shortcuts (only when no text input consumed the event)
+        key-pressed(event) => {
+            if root.modal-open || root.command-palette-open {
+                return reject;
+            }
+
+            // Space: Toggle Quick Look
+            if event.text == " " {
+                root.toggle-quick-look();
+                return accept;
+            }
+
+            // If Quick Look is open, allow Up/Down to step through items and Enter to open
+            if event.text == Key.UpArrow {
+                root.move-selection(-1);
+                return accept;
+            }
+            if event.text == Key.DownArrow {
+                root.move-selection(1);
+                return accept;
+            }
+            if event.text == Key.Return {
+                root.activate-entry(root.active-pane, root.active-selected-index);
+                return accept;
+            }
+            if event.text == Key.Backspace {
+                root.nav-up();
+                return accept;
+            }
+            if event.text == Key.F2 {
+                root.action-rename();
+                return accept;
+            }
+            if event.text == Key.Delete {
+                if event.modifiers.shift {
+                    root.action-permanent-delete();
+                } else {
+                    root.action-recycle();
+                }
+                return accept;
+            }
+            if event.modifiers.control && (event.text == "c" || event.text == "C") {
+                root.action-copy();
+                return accept;
+            }
+            if event.modifiers.control && (event.text == "x" || event.text == "X") {
+                root.action-cut();
+                return accept;
+            }
+            if event.modifiers.control && (event.text == "v" || event.text == "V") {
+                root.action-paste();
+                return accept;
+            }
+            if event.modifiers.control && (event.text == "z" || event.text == "Z") {
+                root.action-undo();
+                return accept;
+            }
+
+            return reject;
+        }
+
+        // Main Chrome Layout
+        VerticalLayout {
+            spacing: 0px;
+
+            TabBar {
+                tabs: root.tabs;
+                dual-pane: root.dual-pane;
+                new-tab => { root.new-tab(); }
+                close-tab(id) => { root.close-tab(id); }
+                switch-tab(id) => { root.switch-tab(id); }
+                reorder-tab(from, to) => { root.reorder-tab(from, to); }
+            }
+
+            nav-bar := NavBar {
+                active-pane: root.active-pane;
+                breadcrumbs: root.breadcrumbs;
+                address-text <=> root.address-text;
+                address-editing <=> root.address-editing;
+                can-go-back: root.can-go-back;
+                can-go-forward: root.can-go-forward;
+                is-current-favorite: root.is-current-favorite;
+                search-text <=> root.search-text;
+                indexed-search: root.indexed-search;
+                nav-back => { root.nav-back(); }
+                nav-forward => { root.nav-forward(); }
+                nav-up => { root.nav-up(); }
+                nav-refresh => { root.nav-refresh(); }
+                navigate-to(pane, path) => {
+                    key-handler.focus();
+                    root.navigate-to(pane, path);
+                }
+                submit-address(path) => { root.submit-address(path); }
+                search-changed(query) => { root.search-changed(query); }
+                search-submitted(query) => { root.search-submitted(query); }
+                toggle-indexed-search => { root.toggle-indexed-search(); }
+                toggle-favorite => { root.toggle-favorite(); }
+                focus-main => { key-handler.focus(); }
+            }
+
+            Toolbar {
+                active-pane: root.active-pane;
+                sort-column: root.active-sort-column;
+                sort-ascending: root.active-sort-ascending;
+                view-mode: root.view-mode;
+                show-hidden: root.show-hidden;
+                dual-pane: root.dual-pane;
+                preview-pane: root.preview-pane;
+                dark-mode: root.dark-mode;
+                can-undo: root.can-undo;
+                can-paste: root.can-paste;
+                has-selection: root.has-selection;
+                action-new-folder => { root.action-new-folder(); }
+                action-cut => { root.action-cut(); }
+                action-copy => { root.action-copy(); }
+                action-paste => { root.action-paste(); }
+                action-rename => { root.action-rename(); }
+                action-duplicate => { root.action-duplicate(); }
+                action-recycle => { root.action-recycle(); }
+                action-undo => { root.action-undo(); }
+                sort-by(pane, col) => { root.sort-by(pane, col); }
+                toggle-view-mode => { root.toggle-view-mode(); }
+                toggle-hidden => { root.toggle-hidden(); }
+                toggle-dual-pane => { root.toggle-dual-pane(); }
+                toggle-preview-pane => { root.toggle-preview-pane(); }
+                action-open-terminal => { root.action-open-terminal(); }
+                action-properties => { root.action-properties(); }
+                toggle-theme => { root.toggle-theme(); }
+                toggle-command-palette => { root.toggle-command-palette(); }
+            }
+
+            // Center Workspace: Sidebar + Primary/Secondary File Panes + Docked Preview Pane
+            HorizontalLayout {
+                vertical-stretch: 1;
+                spacing: 0px;
+
+                Sidebar {
+                    active-pane: root.active-pane;
+                    current-path: root.active-path;
+                    home-path: root.home-path;
+                    favorites: root.favorites;
+                    known-folders: root.known-folders;
+                    drives: root.drives;
+                    navigate-to(pane, path) => {
+                        key-handler.focus();
+                        root.navigate-to(pane, path);
+                    }
+                    unpin-favorite(path) => { root.unpin-favorite(path); }
+                }
+
+                // Primary File Pane (pane 0)
+                FilePane {
+                    horizontal-stretch: 1;
+                    pane-index: 0;
+                    is-active: root.active-pane == 0;
+                    show-active-indicator: root.dual-pane;
+                    current-path: root.primary-path;
+                    entries: root.primary-entries;
+                    sort-column: root.primary-sort-column;
+                    sort-ascending: root.primary-sort-ascending;
+                    view-mode: root.view-mode;
+                    is-loading: root.primary-loading;
+                    error-message: root.primary-error;
+                    select-entry(pane, idx) => {
+                        root.primary-selected-index = idx;
+                        key-handler.focus();
+                        root.select-entry(pane, idx);
+                    }
+                    activate-entry(pane, idx) => {
+                        key-handler.focus();
+                        root.activate-entry(pane, idx);
+                    }
+                    set-active-pane(pane) => {
+                        key-handler.focus();
+                        root.set-active-pane(pane);
+                    }
+                    sort-by(pane, col) => { root.sort-by(pane, col); }
+                }
+
+                // Pane divider in Dual-Pane mode
+                if root.dual-pane : Rectangle {
+                    width: 1px;
+                    background: OnyxTheme.border-subtle;
+                }
+
+                // Secondary File Pane (pane 1)
+                if root.dual-pane : FilePane {
+                    horizontal-stretch: 1;
+                    pane-index: 1;
+                    is-active: root.active-pane == 1;
+                    show-active-indicator: true;
+                    current-path: root.secondary-path;
+                    entries: root.secondary-entries;
+                    sort-column: root.secondary-sort-column;
+                    sort-ascending: root.secondary-sort-ascending;
+                    view-mode: root.view-mode;
+                    is-loading: root.secondary-loading;
+                    error-message: root.secondary-error;
+                    select-entry(pane, idx) => {
+                        root.secondary-selected-index = idx;
+                        key-handler.focus();
+                        root.select-entry(pane, idx);
+                    }
+                    activate-entry(pane, idx) => {
+                        key-handler.focus();
+                        root.activate-entry(pane, idx);
+                    }
+                    set-active-pane(pane) => {
+                        key-handler.focus();
+                        root.set-active-pane(pane);
+                    }
+                    sort-by(pane, col) => { root.sort-by(pane, col); }
+                }
+
+                // Docked Preview Pane
+                if root.preview-pane : PreviewPane {
+                    width: root.dual-pane ? 264px : 310px;
+                    horizontal-stretch: 0;
+                    is-quick-look: false;
+                    preview-title: root.preview-title;
+                    preview-subtitle: root.preview-subtitle;
+                    preview-kind: root.preview-kind;
+                    preview-image: root.preview-image;
+                    has-preview-image: root.has-preview-image;
+                    preview-text: root.preview-text;
+                    preview-language: root.preview-language;
+                    preview-truncated: root.preview-truncated;
+                    preview-summary: root.preview-summary;
+                    preview-error: root.preview-error;
+                    preview-metadata: root.preview-metadata;
+                    close-preview => { root.toggle-preview-pane(); }
+                    open-item => { root.activate-entry(root.active-pane, root.active-selected-index); }
+                }
+            }
+
+            StatusBar {
+                items-text: root.status-items-text;
+                selection-text: root.status-selection-text;
+                current-path: root.active-path;
+                status-message: root.status-message;
+                search-status: root.status-search-text;
+                dual-pane: root.dual-pane;
+                view-mode: root.view-mode;
+            }
+        }
+
+        // Bottom-Right Operation Progress Card
+        if root.operation-progress.active : OperationProgressCard {
+            x: parent.width - self.width - 16px;
+            y: parent.height - self.height - 42px;
+            operation: root.operation-progress;
+            cancel-operation => { root.cancel-operation(); }
+        }
+
+        // Spacebar Quick Look Overlay Modal
+        if root.quick-look-open : QuickLookModal {
+            width: parent.width;
+            height: parent.height;
+            preview-title: root.preview-title;
+            preview-subtitle: root.preview-subtitle;
+            preview-kind: root.preview-kind;
+            preview-image: root.preview-image;
+            has-preview-image: root.has-preview-image;
+            preview-text: root.preview-text;
+            preview-language: root.preview-language;
+            preview-truncated: root.preview-truncated;
+            preview-summary: root.preview-summary;
+            preview-error: root.preview-error;
+            preview-metadata: root.preview-metadata;
+            close => {
+                root.toggle-quick-look();
+                key-handler.focus();
+            }
+            open-item => {
+                root.toggle-quick-look();
+                root.activate-entry(root.active-pane, root.active-selected-index);
+            }
+        }
+
+        // Command Palette Overlay Modal (Ctrl+K)
+        palette-modal := CommandPaletteModal {
+            visible: root.command-palette-open;
+            width: parent.width;
+            height: parent.height;
+            query <=> root.command-query;
+            items: root.command-items;
+            query-changed(q) => { root.command-query-changed(q); }
+            execute-command(id) => {
+                root.execute-command(id);
+                key-handler.focus();
+            }
+            close => {
+                root.toggle-command-palette();
+                key-handler.focus();
+            }
+        }
+
+        // Prompt Dialog Overlay Modal (New Folder, Rename, Permanent Delete)
+        prompt-modal := PromptDialogModal {
+            visible: root.modal-open;
+            width: parent.width;
+            height: parent.height;
+            title: root.modal-title;
+            message: root.modal-message;
+            input-text <=> root.modal-input;
+            show-input: root.modal-show-input;
+            confirm-label: root.modal-confirm-label;
+            is-danger: root.modal-danger;
+            confirm(val) => {
+                root.modal-confirm(val);
+                key-handler.focus();
+            }
+            cancel => {
+                root.modal-cancel();
+                key-handler.focus();
+            }
+        }
+    }
+}

@@ -1,0 +1,96 @@
+import { OnyxTheme } from "../tokens.slint";
+import { FluentChip, VerticalDivider } from "common.slint";
+
+export component StatusBar inherits Rectangle {
+    in property <string> items-text: "0 items";
+    in property <string> selection-text: "";
+    in property <string> current-path: "";
+    in property <string> status-message: "";
+    in property <string> search-status: "";
+    in property <bool> dual-pane: false;
+    in property <int> view-mode: 0;
+
+    height: 28px;
+    background: OnyxTheme.bg-chrome;
+
+    // Top subtle hairline
+    Rectangle {
+        y: 0px;
+        width: parent.width;
+        height: 1px;
+        background: OnyxTheme.border-subtle;
+    }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 10px;
+        spacing: 8px;
+        alignment: space-between;
+
+        // Left: Counts, selection, active path / message
+        HorizontalLayout {
+            spacing: 8px;
+            horizontal-stretch: 1;
+
+            Text {
+                text: root.items-text;
+                font-size: OnyxTheme.font-xs;
+                color: OnyxTheme.text-secondary;
+                vertical-alignment: center;
+            }
+
+            if root.selection-text != "" : VerticalDivider {
+                height: 12px;
+                y: 8px;
+            }
+
+            if root.selection-text != "" : Text {
+                text: root.selection-text;
+                font-size: OnyxTheme.font-xs;
+                font-weight: 600;
+                color: OnyxTheme.accent-bright;
+                vertical-alignment: center;
+            }
+
+            if root.status-message != "" || root.current-path != "" : VerticalDivider {
+                height: 12px;
+                y: 8px;
+            }
+
+            Text {
+                text: root.status-message != "" ? root.status-message : root.current-path;
+                font-size: OnyxTheme.font-xs;
+                color: OnyxTheme.text-muted;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+        }
+
+        // Right: Search/index status & layout badges
+        HorizontalLayout {
+            spacing: 6px;
+            horizontal-stretch: 0;
+
+            if root.search-status != "" : Text {
+                text: root.search-status;
+                font-size: OnyxTheme.font-xs;
+                color: OnyxTheme.text-secondary;
+                vertical-alignment: center;
+            }
+
+            if root.dual-pane : FluentChip {
+                y: 3px;
+                label: "Dual-Pane";
+                active: true;
+                interactive: false;
+            }
+
+            FluentChip {
+                y: 3px;
+                label: root.view-mode == 0 ? "Details" : "Grid";
+                interactive: false;
+            }
+        }
+    }
+}

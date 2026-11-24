@@ -1,0 +1,108 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/onyx-core",
+    "crates/onyx-config",
+    "crates/onyx-cache",
+    "crates/onyx-windows",
+    "crates/onyx-fs",
+    "crates/onyx-operations",
+    "crates/onyx-search",
+    "crates/onyx-preview",
+    "crates/onyx-ui",
+    "crates/onyx-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+authors = ["Onyx Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/onyx-explorer/onyx"
+description = "Onyx — Next-generation native Windows 11 file explorer built with Rust"
+
+[workspace.dependencies]
+# Internal crates
+onyx-core = { path = "crates/onyx-core" }
+onyx-config = { path = "crates/onyx-config" }
+onyx-cache = { path = "crates/onyx-cache" }
+onyx-windows = { path = "crates/onyx-windows" }
+onyx-fs = { path = "crates/onyx-fs" }
+onyx-operations = { path = "crates/onyx-operations" }
+onyx-search = { path = "crates/onyx-search" }
+onyx-preview = { path = "crates/onyx-preview" }
+onyx-ui = { path = "crates/onyx-ui" }
+
+# UI
+slint = { version = "1.19", features = ["raw-window-handle-06"] }
+slint-build = "1.19"
+raw-window-handle = "0.6"
+
+# Async & Parallelism
+tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time", "fs", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+rayon = "1.12"
+
+# Filesystem & Persistence
+notify = "9.0"
+rusqlite = { version = "0.43", features = ["bundled"] }
+lru = "0.19"
+dirs = "7.0"
+
+# Serialization & Time
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.2"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Imaging & Previews
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico", "tiff"] }
+
+# Logging & Errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+thiserror = "2.0"
+
+# Windows Native APIs
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Testing & Benchmarking
+tempfile = "3.27"
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+unwrap_used = "warn"
+expect_used = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"

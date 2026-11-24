@@ -1,0 +1,387 @@
+import { ScrollView } from "std-widgets.slint";
+import { OnyxTheme } from "../tokens.slint";
+import { UiMetadataRow } from "../types.slint";
+import { FluentButton, FluentChip, HorizontalDivider } from "common.slint";
+import { OnyxIcon } from "icons.slint";
+
+export component PreviewPane inherits Rectangle {
+    in property <string> preview-title: "";
+    in property <string> preview-subtitle: "";
+    in property <string> preview-kind: "none"; // "none" | "loading" | "image" | "text" | "directory" | "binary" | "error"
+    in property <image> preview-image;
+    in property <bool> has-preview-image: false;
+    in property <string> preview-text: "";
+    in property <string> preview-language: "";
+    in property <bool> preview-truncated: false;
+    in property <string> preview-summary: "";
+    in property <string> preview-error: "";
+    in property <[UiMetadataRow]> preview-metadata;
+    in property <bool> is-quick-look: false;
+
+    callback close-preview();
+    callback open-item();
+
+    background: root.is-quick-look ? OnyxTheme.bg-elevated : OnyxTheme.bg-chrome;
+    border-radius: root.is-quick-look ? OnyxTheme.radius-lg : 0px;
+    border-width: root.is-quick-look ? 1px : 0px;
+    border-color: OnyxTheme.border-strong;
+    clip: true;
+
+    // Subtle specular top edge when displayed as Quick Look modal
+    if root.is-quick-look : Rectangle {
+        x: 10px;
+        y: 1px;
+        width: parent.width - 20px;
+        height: 1px;
+        background: OnyxTheme.border-specular;
+    }
+
+    // Left divider when docked
+    if !root.is-quick-look : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 1px;
+        height: parent.height;
+        background: OnyxTheme.border-subtle;
+    }
+
+    VerticalLayout {
+        padding-left: root.is-quick-look ? 0px : 1px;
+        spacing: 0px;
+
+        // Preview Header
+        Rectangle {
+            height: 48px;
+            background: OnyxTheme.bg-surface-alt;
+
+            Rectangle {
+                y: parent.height - 1px;
+                width: parent.width;
+                height: 1px;
+                background: OnyxTheme.border-subtle;
+            }
+
+            HorizontalLayout {
+                padding-left: 14px;
+                padding-right: 10px;
+                spacing: 8px;
+                alignment: stretch;
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 2px;
+                    horizontal-stretch: 1;
+
+                    Text {
+                        text: root.preview-title != "" ? root.preview-title : (root.is-quick-look ? "Quick Look" : "Preview");
+                        font-size: OnyxTheme.font-md;
+                        font-weight: 600;
+                        color: OnyxTheme.text-primary;
+                        overflow: elide;
+                    }
+
+                    if root.preview-subtitle != "" : Text {
+                        text: root.preview-subtitle;
+                        font-size: OnyxTheme.font-xs;
+                        color: OnyxTheme.text-muted;
+                        overflow: elide;
+                    }
+                }
+
+                if root.preview-language != "" : HorizontalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    FluentChip {
+                        label: root.preview-language;
+                        interactive: false;
+                        active: true;
+                    }
+                }
+
+                if root.is-quick-look && root.preview-kind != "none" : HorizontalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    FluentButton {
+                        label: "Open";
+                        a11y-label: "Open selected item";
+                        compact: true;
+                        primary: true;
+                        clicked => { root.open-item(); }
+                    }
+                }
+
+                HorizontalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    FluentButton {
+                        icon-name: "close";
+                        a11y-label: root.is-quick-look ? "Close Quick Look" : "Close preview pane";
+                        compact: true;
+                        clicked => { root.close-preview(); }
+                    }
+                }
+            }
+        }
+
+        // Main Preview Body
+        Rectangle {
+            vertical-stretch: 1;
+            background: transparent;
+
+            // Empty State
+            if root.preview-kind == "none" : VerticalLayout {
+                alignment: center;
+                spacing: 8px;
+                padding: 20px;
+
+                HorizontalLayout {
+                    alignment: center;
+                    OnyxIcon {
+                        name: "panel-right";
+                        size: 28px;
+                        icon-color: OnyxTheme.text-muted;
+                    }
+                }
+
+                Text {
+                    text: "No preview available";
+                    font-size: OnyxTheme.font-md;
+                    font-weight: 500;
+                    color: OnyxTheme.text-secondary;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: "Select a file or press Space for Quick Look.";
+                    font-size: OnyxTheme.font-xs;
+                    color: OnyxTheme.text-muted;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+
+            // Loading State
+            if root.preview-kind == "loading" : VerticalLayout {
+                alignment: center;
+                spacing: 8px;
+
+                HorizontalLayout {
+                    alignment: center;
+                    OnyxIcon {
+                        name: "refresh";
+                        size: 24px;
+                        icon-color: OnyxTheme.accent-bright;
+                    }
+                }
+
+                Text {
+                    text: "Loading preview...";
+                    font-size: OnyxTheme.font-sm;
+                    color: OnyxTheme.text-secondary;
+                    horizontal-alignment: center;
+                }
+            }
+
+            // Error State
+            if root.preview-kind == "error" : VerticalLayout {
+                alignment: center;
+                padding: 16px;
+
+                Rectangle {
+                    border-radius: OnyxTheme.radius-md;
+                    border-width: 1px;
+                    border-color: OnyxTheme.danger;
+                    background: OnyxTheme.danger-bg;
+
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 4px;
+
+                        Text {
+                            text: "Preview failed";
+                            font-size: OnyxTheme.font-sm;
+                            font-weight: 600;
+                            color: OnyxTheme.danger;
+                        }
+
+                        Text {
+                            text: root.preview-error;
+                            font-size: OnyxTheme.font-xs;
+                            color: OnyxTheme.text-primary;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+
+            // Image Preview
+            if root.preview-kind == "image" : VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: OnyxTheme.radius-md;
+                    border-width: 1px;
+                    border-color: OnyxTheme.border-subtle;
+                    background: OnyxTheme.bg-code;
+                    clip: true;
+
+                    if root.has-preview-image : Image {
+                        x: 8px;
+                        y: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height - 16px;
+                        source: root.preview-image;
+                        image-fit: contain;
+                    }
+
+                    if !root.has-preview-image : Text {
+                        text: "Decoding image...";
+                        font-size: OnyxTheme.font-sm;
+                        color: OnyxTheme.text-muted;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            // Text / Code Preview
+            if root.preview-kind == "text" : VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+
+                if root.preview-truncated : Rectangle {
+                    height: 28px;
+                    border-radius: OnyxTheme.radius-sm;
+                    background: OnyxTheme.warning-bg;
+
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+
+                        Text {
+                            text: "Preview truncated for performance — open file to view full contents.";
+                            font-size: OnyxTheme.font-xs;
+                            color: OnyxTheme.warning-text;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    vertical-stretch: 1;
+                    border-radius: OnyxTheme.radius-md;
+                    border-width: 1px;
+                    border-color: OnyxTheme.border-subtle;
+                    background: OnyxTheme.bg-code;
+                    clip: true;
+
+                    ScrollView {
+                        width: parent.width;
+                        height: parent.height;
+
+                        VerticalLayout {
+                            padding: 12px;
+
+                            Text {
+                                text: root.preview-text;
+                                font-family: OnyxTheme.font-mono;
+                                font-size: OnyxTheme.font-sm;
+                                color: OnyxTheme.text-primary;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Directory / Binary Summary Preview
+            if root.preview-kind == "directory" || root.preview-kind == "binary" : VerticalLayout {
+                alignment: center;
+                padding: 18px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    alignment: center;
+                    OnyxIcon {
+                        name: root.preview-kind == "directory" ? "folder" : "file";
+                        size: 40px;
+                        icon-color: root.preview-kind == "directory" ? OnyxTheme.folder-tint : OnyxTheme.file-tint;
+                        stroke-w: 1.4px;
+                    }
+                }
+
+                Text {
+                    text: root.preview-title;
+                    font-size: OnyxTheme.font-md;
+                    font-weight: 600;
+                    color: OnyxTheme.text-primary;
+                    horizontal-alignment: center;
+                    overflow: elide;
+                }
+
+                if root.preview-summary != "" : Text {
+                    text: root.preview-summary;
+                    font-size: OnyxTheme.font-sm;
+                    color: OnyxTheme.text-secondary;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        // Metadata Key-Value Inspector
+        if root.preview-metadata.length > 0 : VerticalLayout {
+            vertical-stretch: 0;
+            spacing: 0px;
+
+            HorizontalDivider { }
+
+            Rectangle {
+                background: OnyxTheme.bg-surface-alt;
+                max-height: root.is-quick-look ? 180px : 220px;
+
+                ScrollView {
+                    width: parent.width;
+                    height: Math.min(root.is-quick-look ? 180px : 220px, 34px + root.preview-metadata.length * 24px);
+
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 6px;
+
+                        Text {
+                            text: "DETAILS";
+                            font-size: 10px;
+                            font-weight: 700;
+                            letter-spacing: 0.8px;
+                            color: OnyxTheme.text-muted;
+                        }
+
+                        for row in root.preview-metadata : HorizontalLayout {
+                            spacing: 8px;
+
+                            Text {
+                                text: row.key;
+                                font-size: OnyxTheme.font-xs;
+                                color: OnyxTheme.text-muted;
+                                width: 92px;
+                                horizontal-stretch: 0;
+                                overflow: elide;
+                            }
+
+                            Text {
+                                text: row.value;
+                                font-size: OnyxTheme.font-xs;
+                                color: OnyxTheme.text-primary;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,241 @@
+import { OnyxTheme } from "../tokens.slint";
+import { FluentButton, VerticalDivider } from "common.slint";
+
+export component Toolbar inherits Rectangle {
+    in property <int> active-pane: 0;
+    in property <int> sort-column: 0;
+    in property <bool> sort-ascending: true;
+    in property <int> view-mode: 0;
+    in property <bool> show-hidden: false;
+    in property <bool> dual-pane: false;
+    in property <bool> preview-pane: true;
+    in property <bool> dark-mode: true;
+    in property <bool> can-undo: false;
+    in property <bool> can-paste: false;
+    in property <bool> has-selection: false;
+
+    callback action-new-folder();
+    callback action-cut();
+    callback action-copy();
+    callback action-paste();
+    callback action-rename();
+    callback action-duplicate();
+    callback action-recycle();
+    callback action-undo();
+    callback sort-by(int, int);
+    callback toggle-view-mode();
+    callback toggle-hidden();
+    callback toggle-dual-pane();
+    callback toggle-preview-pane();
+    callback action-open-terminal();
+    callback action-properties();
+    callback toggle-theme();
+    callback toggle-command-palette();
+
+    pure function sort-label(base: string, col: int) -> string {
+        if root.sort-column == col {
+            return base + (root.sort-ascending ? " ▲" : " ▼");
+        }
+        return base;
+    }
+
+    height: 40px;
+    background: OnyxTheme.bg-surface-alt;
+
+    // Subtle bottom hairline
+    Rectangle {
+        y: parent.height - 1px;
+        width: parent.width;
+        height: 1px;
+        background: OnyxTheme.border-subtle;
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 4px;
+        alignment: space-between;
+
+        // Left: File operations & Sort controls
+        HorizontalLayout {
+            spacing: 3px;
+            alignment: start;
+
+            FluentButton {
+                icon-name: "folder-plus";
+                label: "New";
+                a11y-label: "New folder";
+                compact: true;
+                clicked => { root.action-new-folder(); }
+            }
+
+            VerticalDivider { y: 5px; }
+
+            FluentButton {
+                icon-name: "cut";
+                a11y-label: "Cut";
+                compact: true;
+                enabled: root.has-selection;
+                clicked => { root.action-cut(); }
+            }
+
+            FluentButton {
+                icon-name: "copy";
+                a11y-label: "Copy";
+                compact: true;
+                enabled: root.has-selection;
+                clicked => { root.action-copy(); }
+            }
+
+            FluentButton {
+                icon-name: "paste";
+                a11y-label: "Paste";
+                compact: true;
+                enabled: root.can-paste;
+                clicked => { root.action-paste(); }
+            }
+
+            FluentButton {
+                icon-name: "rename";
+                a11y-label: "Rename";
+                compact: true;
+                enabled: root.has-selection;
+                clicked => { root.action-rename(); }
+            }
+
+            FluentButton {
+                icon-name: "duplicate";
+                a11y-label: "Duplicate";
+                compact: true;
+                enabled: root.has-selection;
+                clicked => { root.action-duplicate(); }
+            }
+
+            FluentButton {
+                icon-name: "trash";
+                a11y-label: "Move to Recycle Bin";
+                compact: true;
+                danger: true;
+                enabled: root.has-selection;
+                clicked => { root.action-recycle(); }
+            }
+
+            FluentButton {
+                icon-name: "undo";
+                a11y-label: "Undo";
+                compact: true;
+                enabled: root.can-undo;
+                clicked => { root.action-undo(); }
+            }
+
+            VerticalDivider { y: 5px; }
+
+            // Sort column controls
+            FluentButton {
+                label: root.sort-label("Name", 0);
+                a11y-label: "Sort by name";
+                compact: true;
+                active: root.sort-column == 0;
+                clicked => { root.sort-by(root.active-pane, 0); }
+            }
+
+            FluentButton {
+                label: root.sort-label("Date", 1);
+                a11y-label: "Sort by date modified";
+                compact: true;
+                active: root.sort-column == 1;
+                clicked => { root.sort-by(root.active-pane, 1); }
+            }
+
+            FluentButton {
+                label: root.sort-label("Type", 2);
+                a11y-label: "Sort by type";
+                compact: true;
+                active: root.sort-column == 2;
+                clicked => { root.sort-by(root.active-pane, 2); }
+            }
+
+            FluentButton {
+                label: root.sort-label("Size", 3);
+                a11y-label: "Sort by size";
+                compact: true;
+                active: root.sort-column == 3;
+                clicked => { root.sort-by(root.active-pane, 3); }
+            }
+        }
+
+        // Right: View, Layout, Tools & Theme controls
+        HorizontalLayout {
+            spacing: 3px;
+            alignment: end;
+
+            FluentButton {
+                icon-name: root.view-mode == 0 ? "list" : "grid";
+                label: root.view-mode == 0 ? "Details" : "Grid";
+                a11y-label: "Toggle view mode";
+                compact: true;
+                clicked => { root.toggle-view-mode(); }
+            }
+
+            FluentButton {
+                icon-name: "eye";
+                label: "Hidden";
+                a11y-label: "Toggle hidden files";
+                compact: true;
+                active: root.show-hidden;
+                clicked => { root.toggle-hidden(); }
+            }
+
+            FluentButton {
+                icon-name: "columns";
+                label: "Dual";
+                a11y-label: "Toggle dual-pane layout";
+                compact: true;
+                active: root.dual-pane;
+                clicked => { root.toggle-dual-pane(); }
+            }
+
+            FluentButton {
+                icon-name: "panel-right";
+                label: "Preview";
+                a11y-label: "Toggle preview pane";
+                compact: true;
+                active: root.preview-pane;
+                clicked => { root.toggle-preview-pane(); }
+            }
+
+            VerticalDivider { y: 5px; }
+
+            FluentButton {
+                icon-name: "terminal";
+                a11y-label: "Open terminal here";
+                compact: true;
+                clicked => { root.action-open-terminal(); }
+            }
+
+            FluentButton {
+                icon-name: "info";
+                a11y-label: "Properties";
+                compact: true;
+                enabled: root.has-selection;
+                clicked => { root.action-properties(); }
+            }
+
+            FluentButton {
+                icon-name: "command";
+                a11y-label: "Command palette";
+                compact: true;
+                clicked => { root.toggle-command-palette(); }
+            }
+
+            FluentButton {
+                icon-name: root.dark-mode ? "sun" : "moon";
+                a11y-label: root.dark-mode ? "Switch to light theme" : "Switch to dark theme";
+                compact: true;
+                clicked => { root.toggle-theme(); }
+            }
+        }
+    }
+}

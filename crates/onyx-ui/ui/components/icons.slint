@@ -1,0 +1,424 @@
+import { OnyxTheme } from "../tokens.slint";
+
+// Crisp Lucide-style 24x24 vector icons for Onyx UI
+export component OnyxIcon inherits Rectangle {
+    in property <string> name: "";
+    in property <length> size: 15px;
+    in property <color> icon-color: OnyxTheme.text-primary;
+    in property <length> stroke-w: 1.6px;
+
+    width: size;
+    height: size;
+    background: transparent;
+
+    // Back arrow
+    if name == "back" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 19; y: 12; } LineTo { x: 5; y: 12; }
+        MoveTo { x: 12; y: 19; } LineTo { x: 5; y: 12; } LineTo { x: 12; y: 5; }
+    }
+
+    // Forward arrow
+    if name == "forward" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 5; y: 12; } LineTo { x: 19; y: 12; }
+        MoveTo { x: 12; y: 5; } LineTo { x: 19; y: 12; } LineTo { x: 12; y: 19; }
+    }
+
+    // Up arrow
+    if name == "up" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 12; y: 19; } LineTo { x: 12; y: 5; }
+        MoveTo { x: 5; y: 12; } LineTo { x: 12; y: 5; } LineTo { x: 19; y: 12; }
+    }
+
+    // Refresh
+    if name == "refresh" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 21; y: 12; }
+        ArcTo { x: 12; y: 3; radius-x: 9; radius-y: 9; sweep: false; large-arc: false; }
+        ArcTo { x: 5.6; y: 5.6; radius-x: 9; radius-y: 9; sweep: false; large-arc: false; }
+        MoveTo { x: 3; y: 12; }
+        ArcTo { x: 12; y: 21; radius-x: 9; radius-y: 9; sweep: false; large-arc: false; }
+        ArcTo { x: 18.4; y: 18.4; radius-x: 9; radius-y: 9; sweep: false; large-arc: false; }
+        MoveTo { x: 21; y: 5; } LineTo { x: 21; y: 11; } LineTo { x: 15; y: 11; }
+    }
+
+    // Plus
+    if name == "plus" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 12; y: 5; } LineTo { x: 12; y: 19; }
+        MoveTo { x: 5; y: 12; } LineTo { x: 19; y: 12; }
+    }
+
+    // Close X
+    if name == "close" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 18; y: 6; } LineTo { x: 6; y: 18; }
+        MoveTo { x: 6; y: 6; } LineTo { x: 18; y: 18; }
+    }
+
+    // Search magnifier
+    if name == "search" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 18; y: 11; }
+        ArcTo { x: 4; y: 11; radius-x: 7; radius-y: 7; sweep: true; large-arc: false; }
+        ArcTo { x: 18; y: 11; radius-x: 7; radius-y: 7; sweep: true; large-arc: false; }
+        MoveTo { x: 20.5; y: 20.5; } LineTo { x: 16; y: 16; }
+    }
+
+    // Folder (outlined + subtle fill)
+    if name == "folder" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        fill: root.icon-color.transparentize(0.76);
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 3; y: 6; }
+        LineTo { x: 9.5; y: 6; }
+        LineTo { x: 11.5; y: 8.5; }
+        LineTo { x: 21; y: 8.5; }
+        LineTo { x: 21; y: 19; }
+        LineTo { x: 3; y: 19; }
+        Close { }
+    }
+
+    // Folder + Plus (New Folder)
+    if name == "folder-plus" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 3; y: 6; } LineTo { x: 9.5; y: 6; } LineTo { x: 11.5; y: 8.5; }
+        LineTo { x: 21; y: 8.5; } LineTo { x: 21; y: 19; } LineTo { x: 3; y: 19; } Close { }
+        MoveTo { x: 12; y: 11.5; } LineTo { x: 12; y: 16.5; }
+        MoveTo { x: 9.5; y: 14; } LineTo { x: 14.5; y: 14; }
+    }
+
+    // File document
+    if name == "file" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        fill: root.icon-color.transparentize(0.84);
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 6; y: 3; } LineTo { x: 14; y: 3; } LineTo { x: 19; y: 8; }
+        LineTo { x: 19; y: 21; } LineTo { x: 6; y: 21; } Close { }
+        MoveTo { x: 14; y: 3; } LineTo { x: 14; y: 8; } LineTo { x: 19; y: 8; }
+    }
+
+    // Home
+    if name == "home" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 3; y: 10.5; } LineTo { x: 12; y: 3; } LineTo { x: 21; y: 10.5; }
+        MoveTo { x: 5; y: 9.5; } LineTo { x: 5; y: 20; } LineTo { x: 19; y: 20; } LineTo { x: 19; y: 9.5; }
+        MoveTo { x: 9.5; y: 20; } LineTo { x: 9.5; y: 14; } LineTo { x: 14.5; y: 14; } LineTo { x: 14.5; y: 20; }
+    }
+
+    // Star (outline)
+    if name == "star" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 12; y: 3; } LineTo { x: 14.9; y: 8.8; } LineTo { x: 21.2; y: 9.7; }
+        LineTo { x: 16.6; y: 14.2; } LineTo { x: 17.7; y: 20.5; } LineTo { x: 12; y: 17.5; }
+        LineTo { x: 6.3; y: 20.5; } LineTo { x: 7.4; y: 14.2; } LineTo { x: 2.8; y: 9.7; }
+        LineTo { x: 9.1; y: 8.8; } Close { }
+    }
+
+    // Star (filled)
+    if name == "star-filled" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        fill: root.icon-color;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 12; y: 3; } LineTo { x: 14.9; y: 8.8; } LineTo { x: 21.2; y: 9.7; }
+        LineTo { x: 16.6; y: 14.2; } LineTo { x: 17.7; y: 20.5; } LineTo { x: 12; y: 17.5; }
+        LineTo { x: 6.3; y: 20.5; } LineTo { x: 7.4; y: 14.2; } LineTo { x: 2.8; y: 9.7; }
+        LineTo { x: 9.1; y: 8.8; } Close { }
+    }
+
+    // Hard Drive
+    if name == "drive" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 3; y: 14; } LineTo { x: 21; y: 14; } LineTo { x: 21; y: 19; } LineTo { x: 3; y: 19; } Close { }
+        MoveTo { x: 3; y: 14; } LineTo { x: 6; y: 6; } LineTo { x: 18; y: 6; } LineTo { x: 21; y: 14; }
+        MoveTo { x: 16.5; y: 16.5; } LineTo { x: 17.5; y: 16.5; }
+    }
+
+    // Cut (scissors)
+    if name == "cut" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 20; y: 4; } LineTo { x: 8.5; y: 15.5; }
+        MoveTo { x: 20; y: 20; } LineTo { x: 8.5; y: 8.5; }
+        MoveTo { x: 9; y: 6.5; } ArcTo { x: 4; y: 6.5; radius-x: 2.5; radius-y: 2.5; sweep: true; large-arc: false; }
+        ArcTo { x: 9; y: 6.5; radius-x: 2.5; radius-y: 2.5; sweep: true; large-arc: false; }
+        MoveTo { x: 9; y: 17.5; } ArcTo { x: 4; y: 17.5; radius-x: 2.5; radius-y: 2.5; sweep: true; large-arc: false; }
+        ArcTo { x: 9; y: 17.5; radius-x: 2.5; radius-y: 2.5; sweep: true; large-arc: false; }
+    }
+
+    // Copy
+    if name == "copy" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 9; y: 9; } LineTo { x: 20; y: 9; } LineTo { x: 20; y: 20; } LineTo { x: 9; y: 20; } Close { }
+        MoveTo { x: 6; y: 15; } LineTo { x: 4; y: 15; } LineTo { x: 4; y: 4; } LineTo { x: 15; y: 4; } LineTo { x: 15; y: 6; }
+    }
+
+    // Paste (clipboard)
+    if name == "paste" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 9; y: 4; } LineTo { x: 15; y: 4; } LineTo { x: 15; y: 7; } LineTo { x: 9; y: 7; } Close { }
+        MoveTo { x: 9; y: 5.5; } LineTo { x: 5; y: 5.5; } LineTo { x: 5; y: 20; } LineTo { x: 19; y: 20; } LineTo { x: 19; y: 5.5; } LineTo { x: 15; y: 5.5; }
+    }
+
+    // Rename (pencil)
+    if name == "rename" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 16.5; y: 3.5; } LineTo { x: 20.5; y: 7.5; } LineTo { x: 8; y: 20; }
+        LineTo { x: 4; y: 20; } LineTo { x: 4; y: 16; } Close { }
+    }
+
+    // Duplicate (layers)
+    if name == "duplicate" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 12; y: 3; } LineTo { x: 21; y: 8; } LineTo { x: 12; y: 13; } LineTo { x: 3; y: 8; } Close { }
+        MoveTo { x: 3; y: 13; } LineTo { x: 12; y: 18; } LineTo { x: 21; y: 13; }
+        MoveTo { x: 3; y: 17; } LineTo { x: 12; y: 22; } LineTo { x: 21; y: 17; }
+    }
+
+    // Trash / Recycle
+    if name == "trash" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 4; y: 7; } LineTo { x: 20; y: 7; }
+        MoveTo { x: 9; y: 7; } LineTo { x: 9; y: 4; } LineTo { x: 15; y: 4; } LineTo { x: 15; y: 7; }
+        MoveTo { x: 6; y: 7; } LineTo { x: 7; y: 20; } LineTo { x: 17; y: 20; } LineTo { x: 18; y: 7; }
+        MoveTo { x: 10; y: 11; } LineTo { x: 10; y: 16; }
+        MoveTo { x: 14; y: 11; } LineTo { x: 14; y: 16; }
+    }
+
+    // Undo
+    if name == "undo" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 9; y: 14; } LineTo { x: 4; y: 9; } LineTo { x: 9; y: 4; }
+        MoveTo { x: 4; y: 9; } LineTo { x: 15; y: 9; }
+        ArcTo { x: 15; y: 20; radius-x: 5.5; radius-y: 5.5; sweep: true; large-arc: false; }
+        LineTo { x: 11; y: 20; }
+    }
+
+    // Details list view
+    if name == "list" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 4; y: 6; } LineTo { x: 20; y: 6; }
+        MoveTo { x: 4; y: 12; } LineTo { x: 20; y: 12; }
+        MoveTo { x: 4; y: 18; } LineTo { x: 20; y: 18; }
+    }
+
+    // Grid view
+    if name == "grid" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 4; y: 4; } LineTo { x: 10; y: 4; } LineTo { x: 10; y: 10; } LineTo { x: 4; y: 10; } Close { }
+        MoveTo { x: 14; y: 4; } LineTo { x: 20; y: 4; } LineTo { x: 20; y: 10; } LineTo { x: 14; y: 10; } Close { }
+        MoveTo { x: 4; y: 14; } LineTo { x: 10; y: 14; } LineTo { x: 10; y: 20; } LineTo { x: 4; y: 20; } Close { }
+        MoveTo { x: 14; y: 14; } LineTo { x: 20; y: 14; } LineTo { x: 20; y: 20; } LineTo { x: 14; y: 20; } Close { }
+    }
+
+    // Eye (Hidden files)
+    if name == "eye" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 2; y: 12; }
+        QuadraticTo { control-x: 12; control-y: 4; x: 22; y: 12; }
+        QuadraticTo { control-x: 12; control-y: 20; x: 2; y: 12; }
+        MoveTo { x: 15; y: 12; }
+        ArcTo { x: 9; y: 12; radius-x: 3; radius-y: 3; sweep: true; large-arc: false; }
+        ArcTo { x: 15; y: 12; radius-x: 3; radius-y: 3; sweep: true; large-arc: false; }
+    }
+
+    // Dual-pane columns
+    if name == "columns" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 3; y: 4; } LineTo { x: 21; y: 4; } LineTo { x: 21; y: 20; } LineTo { x: 3; y: 20; } Close { }
+        MoveTo { x: 12; y: 4; } LineTo { x: 12; y: 20; }
+    }
+
+    // Preview panel right
+    if name == "panel-right" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 3; y: 4; } LineTo { x: 21; y: 4; } LineTo { x: 21; y: 20; } LineTo { x: 3; y: 20; } Close { }
+        MoveTo { x: 15; y: 4; } LineTo { x: 15; y: 20; }
+    }
+
+    // Terminal
+    if name == "terminal" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 4; y: 17; } LineTo { x: 10; y: 11; } LineTo { x: 4; y: 5; }
+        MoveTo { x: 12; y: 19; } LineTo { x: 20; y: 19; }
+    }
+
+    // Info / Properties
+    if name == "info" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 21; y: 12; }
+        ArcTo { x: 3; y: 12; radius-x: 9; radius-y: 9; sweep: true; large-arc: false; }
+        ArcTo { x: 21; y: 12; radius-x: 9; radius-y: 9; sweep: true; large-arc: false; }
+        MoveTo { x: 12; y: 16; } LineTo { x: 12; y: 11.5; }
+        MoveTo { x: 12; y: 8; } LineTo { x: 12.1; y: 8; }
+    }
+
+    // Command palette
+    if name == "command" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 9; y: 9; } LineTo { x: 15; y: 9; } LineTo { x: 15; y: 15; } LineTo { x: 9; y: 15; } Close { }
+        MoveTo { x: 9; y: 9; } LineTo { x: 9; y: 5; } LineTo { x: 5; y: 5; } LineTo { x: 5; y: 9; } Close { }
+        MoveTo { x: 15; y: 9; } LineTo { x: 19; y: 9; } LineTo { x: 19; y: 5; } LineTo { x: 15; y: 5; } Close { }
+        MoveTo { x: 9; y: 15; } LineTo { x: 5; y: 15; } LineTo { x: 5; y: 19; } LineTo { x: 9; y: 19; } Close { }
+        MoveTo { x: 15; y: 15; } LineTo { x: 15; y: 19; } LineTo { x: 19; y: 19; } LineTo { x: 19; y: 15; } Close { }
+    }
+
+    // Sun (Light mode)
+    if name == "sun" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 16; y: 12; }
+        ArcTo { x: 8; y: 12; radius-x: 4; radius-y: 4; sweep: true; large-arc: false; }
+        ArcTo { x: 16; y: 12; radius-x: 4; radius-y: 4; sweep: true; large-arc: false; }
+        MoveTo { x: 12; y: 2; } LineTo { x: 12; y: 4.5; }
+        MoveTo { x: 12; y: 19.5; } LineTo { x: 12; y: 22; }
+        MoveTo { x: 2; y: 12; } LineTo { x: 4.5; y: 12; }
+        MoveTo { x: 19.5; y: 12; } LineTo { x: 22; y: 12; }
+        MoveTo { x: 4.9; y: 4.9; } LineTo { x: 6.7; y: 6.7; }
+        MoveTo { x: 17.3; y: 17.3; } LineTo { x: 19.1; y: 19.1; }
+        MoveTo { x: 19.1; y: 4.9; } LineTo { x: 17.3; y: 6.7; }
+        MoveTo { x: 6.7; y: 17.3; } LineTo { x: 4.9; y: 19.1; }
+    }
+
+    // Moon (Dark mode)
+    if name == "moon" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 20; y: 14.5; }
+        ArcTo { x: 9.5; y: 4; radius-x: 8.5; radius-y: 8.5; sweep: true; large-arc: true; }
+        ArcTo { x: 20; y: 14.5; radius-x: 6.5; radius-y: 6.5; sweep: false; large-arc: false; }
+    }
+
+    // Desktop monitor
+    if name == "desktop" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 3; y: 4; } LineTo { x: 21; y: 4; } LineTo { x: 21; y: 16; } LineTo { x: 3; y: 16; } Close { }
+        MoveTo { x: 8; y: 20; } LineTo { x: 16; y: 20; }
+        MoveTo { x: 12; y: 16; } LineTo { x: 12; y: 20; }
+    }
+
+    // Downloads
+    if name == "download" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 12; y: 3; } LineTo { x: 12; y: 15; }
+        MoveTo { x: 7; y: 10; } LineTo { x: 12; y: 15; } LineTo { x: 17; y: 10; }
+        MoveTo { x: 4; y: 17; } LineTo { x: 4; y: 20; } LineTo { x: 20; y: 20; } LineTo { x: 20; y: 17; }
+    }
+
+    // Pictures / Image
+    if name == "image" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 3; y: 4; } LineTo { x: 21; y: 4; } LineTo { x: 21; y: 20; } LineTo { x: 3; y: 20; } Close { }
+        MoveTo { x: 4; y: 17; } LineTo { x: 9.5; y: 11.5; } LineTo { x: 14; y: 16; } LineTo { x: 16.5; y: 13.5; } LineTo { x: 20.5; y: 17.5; }
+        MoveTo { x: 9.5; y: 8.5; } LineTo { x: 9.6; y: 8.5; }
+    }
+
+    // Warning triangle
+    if name == "warning" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 12; y: 3; } LineTo { x: 21.5; y: 20; } LineTo { x: 2.5; y: 20; } Close { }
+        MoveTo { x: 12; y: 9.5; } LineTo { x: 12; y: 14; }
+        MoveTo { x: 12; y: 17; } LineTo { x: 12.1; y: 17; }
+    }
+}

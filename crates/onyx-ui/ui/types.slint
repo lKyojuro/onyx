@@ -1,0 +1,62 @@
+// Shared Slint data transfer structs for Onyx UI
+
+export struct UiTabItem {
+    id: int,
+    title: string,
+    path: string,
+    active: bool,
+}
+
+export struct UiBreadcrumb {
+    label: string,
+    path: string,
+}
+
+export struct UiSidebarItem {
+    label: string,
+    path: string,
+    icon_glyph: string,
+    is_favorite: bool,
+}
+
+export struct UiDriveItem {
+    label: string,
+    root: string,
+    filesystem: string,
+    free_label: string,
+    usage_ratio: float,
+}
+
+export struct UiFileEntry {
+    path: string,
+    name: string,
+    modified: string,
+    type_label: string,
+    size_label: string,
+    is_dir: bool,
+    is_hidden: bool,
+    is_symlink: bool,
+    selected: bool,
+    icon: image,
+    has_icon: bool,
+}
+
+export struct UiMetadataRow {
+    key: string,
+    value: string,
+}
+
+export struct UiCommandItem {
+    id: string,
+    title: string,
+    shortcut: string,
+    category: string,
+}
+
+export struct UiOperationProgress {
+    active: bool,
+    title: string,
+    current_item: string,
+    progress: float,
+    detail: string,
+}

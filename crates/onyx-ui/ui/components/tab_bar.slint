@@ -1,0 +1,224 @@
+import { OnyxTheme } from "../tokens.slint";
+import { UiTabItem } from "../types.slint";
+import { OnyxEmblem, FluentButton } from "common.slint";
+import { OnyxIcon } from "icons.slint";
+
+export component TabBar inherits Rectangle {
+    in property <[UiTabItem]> tabs;
+    in property <bool> dual-pane: false;
+
+    callback new-tab();
+    callback close-tab(int);
+    callback switch-tab(int);
+    callback reorder-tab(int, int);
+
+    height: 40px;
+    background: OnyxTheme.bg-chrome;
+
+    // Bottom subtle hairline
+    Rectangle {
+        y: parent.height - 1px;
+        width: parent.width;
+        height: 1px;
+        background: OnyxTheme.border-subtle;
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 5px;
+        padding-bottom: 5px;
+        spacing: 8px;
+        alignment: start;
+
+        // Onyx brand badge
+        HorizontalLayout {
+            spacing: 7px;
+            alignment: center;
+            horizontal-stretch: 0;
+
+            OnyxEmblem { }
+
+            Text {
+                text: "Onyx";
+                font-size: OnyxTheme.font-md;
+                font-weight: 700;
+                letter-spacing: 0.3px;
+                color: OnyxTheme.text-primary;
+                vertical-alignment: center;
+            }
+        }
+
+        // Vertical separator
+        Rectangle {
+            width: 1px;
+            height: 18px;
+            y: 6px;
+            background: OnyxTheme.border-subtle;
+        }
+
+        // Tab strip
+        HorizontalLayout {
+            spacing: 5px;
+            horizontal-stretch: 1;
+            accessible-role: tab-list;
+            accessible-label: "Open tabs";
+
+            for tab[idx] in root.tabs : Rectangle {
+                min-width: 112px;
+                max-width: 224px;
+                horizontal-stretch: 1;
+                height: 30px;
+                border-radius: OnyxTheme.radius-md;
+                border-width: 1px;
+                border-color: tab.active ? OnyxTheme.accent-border : transparent;
+                background: tab.active
+                    ? OnyxTheme.bg-surface
+                    : (tab-ta.has-hover ? OnyxTheme.bg-hover : transparent);
+
+                animate background { duration: 110ms; easing: ease-out; }
+
+                accessible-role: AccessibleRole.tab;
+                accessible-label: tab.title;
+
+                // Subtle specular top edge on active tab
+                if tab.active : Rectangle {
+                    x: 8px;
+                    y: 1px;
+                    width: parent.width - 16px;
+                    height: 1px;
+                    background: OnyxTheme.border-specular;
+                }
+
+                // Active bottom luminous violet indicator pill
+                if tab.active : Rectangle {
+                    x: (parent.width - 30px) / 2;
+                    y: parent.height - 2px;
+                    width: 30px;
+                    height: 2px;
+                    border-radius: 1px;
+                    background: OnyxTheme.accent-bright;
+                }
+
+                // Background click area for tab switching
+                tab-ta := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.switch-tab(tab.id); }
+                }
+
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 6px;
+                    spacing: 5px;
+
+                    // Subtle active dot
+                    if tab.active : Rectangle {
+                        width: 6px;
+                        height: 6px;
+                        y: 12px;
+                        border-radius: 3px;
+                        background: OnyxTheme.accent-bright;
+                    }
+
+                    Text {
+                        text: tab.title != "" ? tab.title : "New Tab";
+                        font-size: OnyxTheme.font-sm;
+                        font-weight: tab.active ? 600 : 400;
+                        color: tab.active ? OnyxTheme.text-primary : OnyxTheme.text-secondary;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+
+                    // Move tab left button
+                    if root.tabs.length > 1 && idx > 0 : Rectangle {
+                        width: (tab.active || tab-ta.has-hover || left-ta.has-hover) ? 18px : 0px;
+                        height: 18px;
+                        y: 6px;
+                        clip: true;
+                        border-radius: OnyxTheme.radius-sm;
+                        background: left-ta.has-hover ? OnyxTheme.bg-pressed : transparent;
+                        accessible-role: button;
+                        accessible-label: "Move tab left";
+
+                        Text {
+                            text: "‹";
+                            font-size: 12px;
+                            color: OnyxTheme.text-muted;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        left-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.reorder-tab(idx, idx - 1); }
+                        }
+                    }
+
+                    // Move tab right button
+                    if root.tabs.length > 1 && idx < root.tabs.length - 1 : Rectangle {
+                        width: (tab.active || tab-ta.has-hover || right-ta.has-hover) ? 18px : 0px;
+                        height: 18px;
+                        y: 6px;
+                        clip: true;
+                        border-radius: OnyxTheme.radius-sm;
+                        background: right-ta.has-hover ? OnyxTheme.bg-pressed : transparent;
+                        accessible-role: button;
+                        accessible-label: "Move tab right";
+
+                        Text {
+                            text: "›";
+                            font-size: 12px;
+                            color: OnyxTheme.text-muted;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        right-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.reorder-tab(idx, idx + 1); }
+                        }
+                    }
+
+                    // Close tab button
+                    Rectangle {
+                        width: 20px;
+                        height: 20px;
+                        y: 5px;
+                        border-radius: OnyxTheme.radius-sm;
+                        background: close-ta.has-hover ? OnyxTheme.bg-pressed : transparent;
+                        accessible-role: button;
+                        accessible-label: "Close tab";
+
+                        OnyxIcon {
+                            x: 4px;
+                            y: 4px;
+                            name: "close";
+                            size: 12px;
+                            icon-color: close-ta.has-hover ? OnyxTheme.text-primary : OnyxTheme.text-muted;
+                        }
+
+                        close-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.close-tab(tab.id); }
+                        }
+                    }
+                }
+            }
+
+            // New tab '+' button
+            FluentButton {
+                icon-name: "plus";
+                a11y-label: "New tab";
+                compact: true;
+                min-btn-width: 28px;
+                clicked => { root.new-tab(); }
+            }
+
+            // Right spacer to push tabs left cleanly
+            Rectangle {
+                horizontal-stretch: 0.2;
+            }
+        }
+    }
+}
