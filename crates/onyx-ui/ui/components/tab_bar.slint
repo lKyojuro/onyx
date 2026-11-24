@@ -1,6 +1,6 @@
 import { OnyxTheme } from "../tokens.slint";
 import { UiTabItem } from "../types.slint";
-import { OnyxEmblem, FluentButton } from "common.slint";
+import { FluentButton } from "common.slint";
 import { OnyxIcon } from "icons.slint";
 
 export component TabBar inherits Rectangle {
@@ -31,19 +31,19 @@ export component TabBar inherits Rectangle {
         spacing: 8px;
         alignment: start;
 
-        // Onyx brand badge
+        // Onyx brand wordmark
         HorizontalLayout {
-            spacing: 7px;
+            padding-left: 4px;
+            padding-right: 4px;
             alignment: center;
             horizontal-stretch: 0;
 
-            OnyxEmblem { }
-
             Text {
-                text: "Onyx";
-                font-size: OnyxTheme.font-md;
-                font-weight: 700;
-                letter-spacing: 0.3px;
+                text: "ONYX";
+                font-family: OnyxTheme.font-brand;
+                font-size: 14px;
+                font-weight: 600;
+                letter-spacing: 2.4px;
                 color: OnyxTheme.text-primary;
                 vertical-alignment: center;
             }
