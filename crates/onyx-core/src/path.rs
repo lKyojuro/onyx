@@ -86,7 +86,7 @@ pub fn expand_env_vars(input: &str) -> String {
 }
 
 /// Splits a typed path into `(parent_directory, prefix)` for autocomplete.
-/// `C:\Users\zk\Doc` splits into `(C:\Users\zk, "Doc")`, a trailing separator
+/// `C:\Users\Alice\Doc` splits into `(C:\Users\Alice, "Doc")`, a trailing separator
 /// such as `C:\Users\` yields an empty prefix. Returns `None` when there is no
 /// usable parent directory (empty input or a bare relative name).
 #[must_use]
@@ -299,10 +299,10 @@ mod tests {
 
     #[test]
     fn split_autocomplete_prefix_splits_parent_and_prefix() {
-        let Some((parent, prefix)) = split_autocomplete_prefix(r"C:\Users\zk\Doc") else {
+        let Some((parent, prefix)) = split_autocomplete_prefix(r"C:\Users\Alice\Doc") else {
             panic!("expected a parent/prefix split");
         };
-        assert_eq!(parent, PathBuf::from(r"C:\Users\zk"));
+        assert_eq!(parent, PathBuf::from(r"C:\Users\Alice"));
         assert_eq!(prefix, "Doc");
 
         let Some((parent, prefix)) = split_autocomplete_prefix(r"C:\Users\") else {
@@ -317,10 +317,10 @@ mod tests {
         assert_eq!(parent, PathBuf::from(r"C:\"));
         assert_eq!(prefix, "");
 
-        let Some((parent, prefix)) = split_autocomplete_prefix(r"C:/Users/zk/Do") else {
+        let Some((parent, prefix)) = split_autocomplete_prefix(r"C:/Users/Alice/Do") else {
             panic!("expected a parent/prefix split");
         };
-        assert_eq!(parent, PathBuf::from(r"C:\Users\zk"));
+        assert_eq!(parent, PathBuf::from(r"C:\Users\Alice"));
         assert_eq!(prefix, "Do");
     }
 

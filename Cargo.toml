@@ -19,7 +19,7 @@ edition = "2024"
 rust-version = "1.95"
 authors = ["Onyx Contributors"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/onyx-explorer/onyx"
+repository = "https://github.com/lKyojuro/onyx"
 description = "Onyx — Next-generation native Windows 11 file explorer built with Rust"
 
 [workspace.dependencies]

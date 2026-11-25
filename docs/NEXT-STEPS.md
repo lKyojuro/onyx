@@ -73,7 +73,9 @@ Nach jedem Meilenstein die Qualitätschecks aus [AGENTS.md](../AGENTS.md) ausfü
   - Auf freier Fläche in der Dateiliste (Details- und Grid-Ansicht) klicken und ein Auswahlrechteck aufziehen, um mehrere Dateien/Ordner gleichzeitig zu markieren (inkl. Live-Highlight während des Ziehens und sauberem Scroll-Verhalten).
   - Ergänzend dazu `Ctrl+Klick` (einzelne Einträge hinzufügen/entfernen), `Shift+Klick` (Bereichsauswahl), `Ctrl+A` (Alles auswählen) und direktes Inline-Umbenennen in der Zeile.
 - [ ] **Konfliktdialog-UI für Kopieren/Verschieben:** Slint-Modal (*Ersetzen / Überspringen / Beide behalten / Für alle anwenden*) an die fertige Engine in `onyx-operations` anbinden.
-- [ ] **UI-Redesign & visuelle Ausrichtung:**
+- [ ] **UI-Redesign & Frontend-Evaluation (`gpui-kit` + `gpui-fast` vs. Slint):**
+  - Vor einem großen Slint-Redesign einen gezielten **`gpui-kit`-Spike mit `features = ["gpui-fast"]`** in einem separaten Prototyp-Crate testen (DirectX 11 + DirectWrite, Retained/Incremental-Caching von `gpui-fast` für minimale CPU-Last & 120–144 FPS, 75+ fertige Desktop-Widgets inkl. Data Tables, Docking/Splits, Inputs, Modals) und direkt mit `measure-perf.ps1` gegen Slint messen (EXE-Größe, Leerlauf-RAM, Kaltstart, Scroll-CPU-Last).
+  - Basierend auf dem Ergebnis entscheiden, ob das UI-Redesign auf **`gpui-kit` (`gpui-fast`)** (bei Erhalt aller 8 UI-freien Core-Crates) oder auf **Slint** umgesetzt wird.
   - Grundlegende gestalterische Überarbeitung der Oberfläche (Farb-/Kontrastsystem, Typografie, Abstände/Dichte, Header-/Tab-/Toolbar-Aufbau, Seitenleiste, Dateiliste und Dark/Light-Theme), um ein wirklich stimmiges, eigenes und vertrautes Design zu finden.
-  - Vor der Slint-Umsetzung gezielt Design-Entwürfe/Varianten abstimmen, statt blind umzubauen.
+  - Vor der Umsetzung gezielt Design-Entwürfe/Varianten abstimmen, statt blind umzubauen.
 - [ ] **Weitere Phase-8-Ideen** siehe [Roadmap](ROADMAP.md) (Inline-Filter & Gruppierung, Baumansicht, anpassbare Spalten, USB/Netzwerk-Hotplug, `.7z`/`.tar.gz`, RAM-Optimierung, USN-Journal, signierte Releases).
