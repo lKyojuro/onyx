@@ -4,14 +4,30 @@
 
 | Metric | Target | Notes |
 |---|---|---|
-| Cold startup | < 300 ms | Measured from `CreateProcess` to first frame on release binary |
-| Idle memory usage | < 50 MB | Working set after opening default Home/Documents directory |
+| Cold startup | < 300 ms | Measured from `CreateProcess` to first frame / main window ready on release binary |
+| Idle memory usage | < 50 MB | Stretch target; working set after opening default Home/Documents directory |
 | UI frame rate | 60–120 FPS | GPU-accelerated FemtoVG renderer on Windows 11 |
 | Directory scalability | 100,000+ entries | Virtualized `ListView`, streaming batches, Rayon sorting |
-| Executable size | < 20 MB | Release profile with thin LTO and symbol stripping |
+| Executable size | < 20 MB | Release profile with `fat` LTO, `opt-level = "s"`, `codegen-units = 1`, and symbol stripping |
 | Idle CPU usage | Near zero | Event-driven UI + debounced OS directory watchers |
 
-## Measured Baseline (Windows 11 x64)
+## Measured Release Binary & Startup Baseline (Windows 11 x64)
+
+Measured directly on the release binary (`onyx.exe` `0.1.0`, `fat` LTO + `opt-level = "s"` + symbol stripping) via `.\scripts\measure-perf.ps1`:
+
+- **Host OS**: Microsoft Windows 11 Home (`10.0.26300`)
+- **CPU**: AMD Ryzen 7 5700X3D 8-Core Processor (`8C/16T`)
+- **RAM**: `31.93 GB`
+
+| Metric | Measured Result | Notes |
+|---|---|---|
+| Release executable size | **16.17 MB** (`16,955,904` bytes) | Down from `23.64 MB` (`24,793,088` bytes) pre-optimization; meets `< 20 MB` target |
+| `--smoke-test` latency (5 runs) | **88.98 ms** min / **91.32 ms** median / **94.62 ms** max | Runs: `94.62`, `88.98`, `89.93`, `91.32`, `91.73` ms |
+| GUI startup (`CreateProcess` -> `MainWindowHandle`) | **50.5 ms** | Meets `< 300 ms` target |
+| Idle working set (`WorkingSet64`, 3 s idle) | **143.98 MB** (`150,974,464` bytes) | Includes Slint FemtoVG/OpenGL GPU context + Tokio runtime (above `< 50 MB` stretch target) |
+| Idle private bytes (`PrivateMemorySize64`, 3 s idle) | **248.03 MB** (`260,075,520` bytes) | Committed private memory after 3 s idle |
+
+## Measured Criterion Baseline (Windows 11 x64)
 
 Real Criterion run on Windows 11 `10.0.26300.0`, Rust `1.96.1`, Release profile:
 
@@ -24,9 +40,26 @@ Real Criterion run on Windows 11 `10.0.26300.0`, Rust `1.96.1`, Release profile:
 | `lru_directory_cache_put_get` | 5.32 µs |
 | `sqlite_fts5_search_1000` | 707.45 µs |
 
-Initial release binary before optimization: **23.64 MB** (24,793,088 bytes).
+## Reproducible Benchmarking & Measurement
 
-## Reproducible Benchmarking
+### Release Binary Startup & Memory (`measure-perf.ps1`)
+
+Measure binary size, `--smoke-test` latency, GUI window-ready startup time, and idle memory usage on a release build:
+
+```powershell
+.\scripts\measure-perf.ps1
+.\scripts\measure-perf.ps1 -BinaryPath D:\Onyx\target\release\onyx.exe -Runs 5 -IdleSeconds 3
+```
+
+Options:
+
+| Flag | Description |
+|---|---|
+| `-BinaryPath <path>` | Path to `onyx.exe` (defaults to `$env:CARGO_TARGET_DIR\release\onyx.exe` or `target\release\onyx.exe`) |
+| `-Runs <n>` | Number of `--smoke-test` iterations for min/median/max calculation (default `5`) |
+| `-IdleSeconds <n>` | Seconds to keep the GUI window open before sampling `WorkingSet64` and `PrivateMemorySize64` (default `3`) |
+
+### Criterion Micro-Benchmarks
 
 Run Criterion micro-benchmarks in release mode:
 

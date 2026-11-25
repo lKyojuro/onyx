@@ -36,3 +36,10 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --bin onyx
+
+      - name: Verify release binary (--version and --smoke-test)
+        run: |
+          .\target\release\onyx.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\target\release\onyx.exe --smoke-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
