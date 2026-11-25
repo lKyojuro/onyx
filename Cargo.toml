@@ -109,9 +109,17 @@ all = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 expect_used = "warn"
 
+[profile.dev.package."*"]
+debug = 0
+
 [profile.release]
 opt-level = "s"
 lto = "fat"
 codegen-units = 1
 strip = "symbols"
 panic = "unwind"
+
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16

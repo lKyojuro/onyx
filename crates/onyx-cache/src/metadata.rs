@@ -9,6 +9,10 @@ use tracing::warn;
 
 const BUSY_TIMEOUT_SECS: u64 = 5;
 
+/// Upper bound for the SQLite page cache, in KiB (negative `cache_size` semantics).
+/// Keeps this long-lived metadata connection's idle RAM footprint small.
+const MAX_PAGE_CACHE_KIB: i64 = -512;
+
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS folder_visits (
     path TEXT PRIMARY KEY,
@@ -311,6 +315,8 @@ fn configure_connection(conn: &Connection, enable_wal: bool) -> OnyxResult<()> {
             .map_err(db_err)?;
     }
 
+    conn.pragma_update(None, "cache_size", MAX_PAGE_CACHE_KIB)
+        .map_err(db_err)?;
     conn.execute_batch(SCHEMA_SQL).map_err(db_err)?;
     Ok(())
 }
@@ -416,5 +422,15 @@ mod tests {
             .unwrap();
         assert_eq!(visit.visit_count, 1);
         assert_eq!(store.recent_visits(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sqlite_page_cache_is_bounded() {
+        let store = MetadataStore::open_in_memory().unwrap();
+        let conn = store.conn.lock().unwrap();
+        let cache_size: i64 = conn
+            .query_row("PRAGMA cache_size;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cache_size, MAX_PAGE_CACHE_KIB);
     }
 }

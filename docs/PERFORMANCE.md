@@ -27,6 +27,14 @@ Measured directly on the release binary (`onyx.exe` `0.1.0`, `fat` LTO + `opt-le
 | Idle working set (`WorkingSet64`, 3 s idle) | **143.98 MB** (`150,974,464` bytes) | Includes Slint FemtoVG/OpenGL GPU context + Tokio runtime (above `< 50 MB` stretch target) |
 | Idle private bytes (`PrivateMemorySize64`, 3 s idle) | **248.03 MB** (`260,075,520` bytes) | Committed private memory after 3 s idle |
 
+### Runtime & Build Tuning Notes (`feat/perf-worker-limits`)
+
+- **Worker-Pool Limits:** Tokio async runtime is clamped to `2..=4` worker threads (`max_blocking_threads(32)`) and the global Rayon pool is capped at `4` threads (instead of spawning `num_cpus` threads each on 16-thread CPUs).
+- **Bounded SQLite Page Caches:** Long-lived SQLite connections cap `PRAGMA cache_size` (`-512` KiB for `MetadataStore` and `FolderSizeStore`; `-2048` KiB for the FTS5 `SearchIndex`).
+- **Zero-Syscall Directory Listing:** `onyx-fs` uses `DirEntry::metadata()` first (reusing `WIN32_FIND_DATA` from `FindNextFileW` without an extra `symlink_metadata()` syscall on Windows) with an extended-length fallback.
+- **Why `panic = "unwind"` is kept:** `panic = "abort"` was evaluated and intentionally rejected because `onyx-windows/src/dnd.rs` uses `std::panic::catch_unwind` at COM/OLE FFI boundaries to prevent undefined behavior from unwinding across Win32 callbacks.
+- **Fast Dev/Test Release Profile (`release-fast`):** Added `[profile.release-fast]` (`lto = "thin"`, `codegen-units = 16`, cold build ~2m 34s vs. ~10–15 min for `fat` LTO) plus `debug = 0` for dev dependencies. Measured on `target/release-fast/onyx.exe`: `21.23 MB` binary, `142.99 ms` startup-to-window-ready, `269.43 MB` working set / `455.86 MB` private bytes in a live Windows session (dominated by Slint FemtoVG/OpenGL driver & active session state — motivating the upcoming `gpui-kit` + `gpui-fast` DirectX 11 spike).
+
 ## Measured Criterion Baseline (Windows 11 x64)
 
 Real Criterion run on Windows 11 `10.0.26300.0`, Rust `1.96.1`, Release profile:

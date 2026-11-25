@@ -227,15 +227,20 @@ fn build_file_entry(
 ) -> Option<FileEntry> {
     let file_name = dir_entry.file_name();
     let entry_path = parent_dir.join(&file_name);
-    let extended_entry_path = to_extended_length_path(&entry_path);
 
-    let meta = match fs::symlink_metadata(&extended_entry_path) {
+    // On Windows `DirEntry::metadata()` reuses the `WIN32_FIND_DATA` already fetched by
+    // `FindNextFileW` (zero extra syscalls) and does not traverse symlinks. Fall back to
+    // `fs::symlink_metadata` with extended-length path handling only if that fails.
+    let meta = match dir_entry
+        .metadata()
+        .or_else(|_| fs::symlink_metadata(to_extended_length_path(&entry_path)))
+    {
         Ok(m) => m,
         Err(err) => {
             warn!(
                 path = %entry_path.display(),
                 error = %err,
-                "Failed to read symlink_metadata; skipping entry"
+                "Failed to read entry metadata; skipping entry"
             );
             return None;
         }
@@ -254,7 +259,7 @@ fn build_file_entry(
     let file_type = meta.file_type();
     let is_symlink = file_type.is_symlink();
     let symlink_target = if is_symlink {
-        fs::read_link(&extended_entry_path).ok()
+        fs::read_link(to_extended_length_path(&entry_path)).ok()
     } else {
         None
     };

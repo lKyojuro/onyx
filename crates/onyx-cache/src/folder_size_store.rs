@@ -9,6 +9,11 @@ use tracing::warn;
 
 const BUSY_TIMEOUT_SECS: u64 = 5;
 
+/// Upper bound for the SQLite page cache, in KiB (negative `cache_size` semantics).
+/// The folder-size table holds one row per folder, so 512 KiB is ample while keeping
+/// this long-lived connection's idle RAM footprint small (SQLite default: 2000 KiB).
+const MAX_PAGE_CACHE_KIB: i64 = -512;
+
 const SCHEMA_SQL: &str = "
 CREATE TABLE IF NOT EXISTS folder_sizes (
     path TEXT PRIMARY KEY,
@@ -219,11 +224,12 @@ fn open_and_initialize_file(path: &Path) -> OnyxResult<Connection> {
 fn configure_and_migrate(conn: &Connection) -> OnyxResult<()> {
     conn.busy_timeout(Duration::from_secs(BUSY_TIMEOUT_SECS))
         .map_err(map_sqlite_err)?;
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
-         PRAGMA temp_store = MEMORY;",
-    )
+         PRAGMA temp_store = MEMORY;
+         PRAGMA cache_size = {MAX_PAGE_CACHE_KIB};"
+    ))
     .map_err(map_sqlite_err)?;
     conn.execute_batch(SCHEMA_SQL).map_err(map_sqlite_err)?;
     Ok(())
