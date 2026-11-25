@@ -23,10 +23,11 @@ use crate::search_index::{
 };
 use crate::theme::OnyxTheme;
 use gpui_kit::{
-    AppContext, ClipboardItem, Context, DispatchPhase, Entity, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, Render, RenderImage, Role, ScrollEvent, ScrollHandle,
-    StatefulInteractiveElement, Styled, Subscription, UniformListScrollHandle, Window, canvas,
+    AppContext, ClipboardItem, Context, DispatchPhase, Entity, FileDropEvent, FocusHandle,
+    Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, NavigationDirection, ParentElement, Pixels, Point, Render,
+    RenderImage, Role, ScrollEvent, ScrollHandle, StatefulInteractiveElement, Styled, Subscription,
+    UniformListScrollHandle, Window, canvas,
     component::input::{InputEvent, InputState},
     div, point, px,
 };
@@ -89,6 +90,13 @@ pub(crate) struct PromptState {
     pub confirm_label: String,
     pub is_danger: bool,
     pub show_input: bool,
+}
+
+/// Files another application drags into the window.
+#[derive(Debug, Clone)]
+struct ExternalDropIn {
+    paths: Vec<PathBuf>,
+    position: (f32, f32),
 }
 
 /// Live state for the bottom-right floating Operation Progress toast.
@@ -511,7 +519,7 @@ pub struct OnyxExplorer {
     pub(crate) build_generation: GenerationId,
     pub(crate) build_cancel: CancellationToken,
     /// Root of a build that waits for the worker to finish opening the index.
-    rebuild_pending: Option<PathBuf>,
+    rebuild_pending: Option<Vec<PathBuf>>,
     /// Hit selected by the command palette, revealed once its folder loaded.
     pending_selection: Option<PathBuf>,
     pub(crate) list_scroll_handle: ScrollHandle,
@@ -519,6 +527,9 @@ pub struct OnyxExplorer {
     /// Set while a frame callback is armed for the scroll glide; render re-arms
     /// it each frame so the easing runs on the display clock.
     pub(crate) scroll_frame_armed: bool,
+    /// Files dragged in from another application, tracked from `Entered` until
+    /// the platform reports `Submit`.
+    external_drop: Option<ExternalDropIn>,
     pub(crate) grid_scroll_handle: UniformListScrollHandle,
     pub(crate) operations: Arc<FileOperationsEngine>,
     clipboard_tx: mpsc::UnboundedSender<ClipboardCommand>,
@@ -747,6 +758,7 @@ impl OnyxExplorer {
             list_scroll_handle: ScrollHandle::new(),
             list_scroll: SmoothScroll::new(),
             scroll_frame_armed: false,
+            external_drop: None,
             grid_scroll_handle: UniformListScrollHandle::new(),
             operations: Arc::new(FileOperationsEngine::new()),
             clipboard_tx,
@@ -1919,7 +1931,9 @@ impl OnyxExplorer {
             self.index_status = IndexStatus::Opening;
             self.index
                 .enable(self.index_roots(), self.config.excluded_index_dirs.clone());
-            self.request_index_build(self.current_path().to_path_buf(), cx);
+            // Index the configured roots, not just the folder that happens to
+            // be open: a search from elsewhere has to find these files too.
+            self.request_index_build(self.index_roots(), cx);
             self.status_message = Some("Indexed search on.".to_string());
         } else {
             self.index.disable();
@@ -1942,9 +1956,17 @@ impl OnyxExplorer {
             self.set_indexed_search(true, cx);
             return;
         }
-        let root = self.current_path().to_path_buf();
-        self.status_message = Some(format!("Rebuilding index for {}…", root.display()));
-        self.request_index_build(root, cx);
+        let roots = self.index_roots();
+        let names = roots
+            .iter()
+            .filter_map(|root| {
+                root.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.status_message = Some(format!("Rebuilding index for {names}…"));
+        self.request_index_build(roots, cx);
         cx.notify();
     }
 
@@ -2001,8 +2023,8 @@ impl OnyxExplorer {
                 if !self.index_status.is_busy() {
                     self.index_status = IndexStatus::Watching { indexed: 0 };
                 }
-                if let Some(root) = self.rebuild_pending.take() {
-                    self.start_index_build(root, cx);
+                if let Some(roots) = self.rebuild_pending.take() {
+                    self.start_index_build(roots, cx);
                 }
                 // Queries that fell back to a live walk get a second chance now.
                 self.restart_list_search_if_active(cx);
@@ -2029,21 +2051,24 @@ impl OnyxExplorer {
     }
 
     /// Walks `root` into the index once it is open.
-    fn request_index_build(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+    fn request_index_build(&mut self, roots: Vec<PathBuf>, cx: &mut Context<Self>) {
         if self.search_index.is_some() {
-            self.start_index_build(root, cx);
+            self.start_index_build(roots, cx);
         } else {
             // The worker still opens the database; build as soon as it is ready.
-            self.rebuild_pending = Some(root);
+            self.rebuild_pending = Some(roots);
             cx.notify();
         }
     }
 
     /// Runs `index_directory` plus a reconcile of `root` on the blocking pool,
     /// never on the UI thread.
-    fn start_index_build(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+    fn start_index_build(&mut self, roots: Vec<PathBuf>, cx: &mut Context<Self>) {
         let Some(shared) = self.search_index.clone() else {
-            self.rebuild_pending = Some(root);
+            self.rebuild_pending = Some(roots);
+            return;
+        };
+        let Some(root) = roots.first().cloned() else {
             return;
         };
         self.rebuild_pending = None;
@@ -2054,7 +2079,7 @@ impl OnyxExplorer {
         let generation = self.build_generation;
         self.index_status = IndexStatus::Building { root: root.clone() };
 
-        let build_root = root.clone();
+        let build_roots = roots.clone();
         let (tx, rx) = oneshot::channel();
         self.runtime.spawn(async move {
             let indexed = tokio::task::spawn_blocking(move || -> OnyxResult<usize> {
@@ -2064,12 +2089,15 @@ impl OnyxExplorer {
                 let guard = shared.lock().map_err(|_| OnyxError::Search {
                     message: "search index mutex was poisoned".to_string(),
                 })?;
-                let count = guard.index_directory(&build_root, &cancel)?;
-                if cancel.is_cancelled() {
-                    return Err(OnyxError::Cancelled);
+                let mut total = 0usize;
+                for root in &build_roots {
+                    if cancel.is_cancelled() {
+                        return Err(OnyxError::Cancelled);
+                    }
+                    total += guard.index_directory(root, &cancel)?;
+                    guard.reconcile_directory_with_cancel(root, &cancel)?;
                 }
-                guard.reconcile_directory_with_cancel(&build_root, &cancel)?;
-                Ok(count)
+                Ok(total)
             })
             .await;
             let result = match indexed {
@@ -4166,6 +4194,62 @@ impl OnyxExplorer {
         self.start_external_drag(drag.source, cx);
     }
 
+    /// Files another application drags into the window: remember them on
+    /// `Entered`, follow the pointer on `Pending` and run the operation on
+    /// `Submit`.
+    pub(crate) fn handle_file_drop(&mut self, event: &FileDropEvent, cx: &mut Context<Self>) {
+        match event {
+            FileDropEvent::Entered { position, paths } => {
+                let paths = paths.paths().to_vec();
+                if paths.is_empty() {
+                    return;
+                }
+                self.external_drop = Some(ExternalDropIn {
+                    paths,
+                    position: (f32::from(position.x), f32::from(position.y)),
+                });
+                self.status_message = Some("Drop the files to add them here.".to_string());
+                cx.notify();
+            }
+            FileDropEvent::Pending { position } => {
+                if let Some(drop) = self.external_drop.as_mut() {
+                    drop.position = (f32::from(position.x), f32::from(position.y));
+                    cx.notify();
+                }
+            }
+            FileDropEvent::Submit { .. } => {
+                let Some(drop) = self.external_drop.take() else {
+                    return;
+                };
+                let destination = self.active_directory();
+                // Same volume moves, another volume copies - the Windows rule the
+                // shell applies for `CF_HDROP` drops.
+                let same_volume = drop
+                    .paths
+                    .iter()
+                    .all(|path| path.components().next() == destination.components().next());
+                let operation = if same_volume {
+                    FileOperation::MoveItems {
+                        sources: drop.paths,
+                        destination,
+                    }
+                } else {
+                    FileOperation::CopyItems {
+                        sources: drop.paths,
+                        destination,
+                    }
+                };
+                self.start_operation(operation, cx);
+            }
+            FileDropEvent::Exited | FileDropEvent::Ended => {
+                if self.external_drop.take().is_some() {
+                    self.status_message = None;
+                    cx.notify();
+                }
+            }
+        }
+    }
+
     /// Runs the synchronous OLE `DoDragDrop` loop for one dragged item.
     ///
     /// It blocks until the drop target answers, which is exactly how a native
@@ -4629,7 +4713,7 @@ impl OnyxExplorer {
         self.index_status = IndexStatus::Opening;
         self.index
             .enable(self.index_roots(), self.config.excluded_index_dirs.clone());
-        self.request_index_build(self.current_path().to_path_buf(), cx);
+        self.request_index_build(self.index_roots(), cx);
         cx.notify();
     }
 
@@ -5068,6 +5152,14 @@ impl Render for OnyxExplorer {
             .on_key_down(cx.listener(|explorer, ev: &KeyDownEvent, window, cx| {
                 explorer.handle_key_down(ev, window, cx);
             }))
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|explorer, _: &MouseDownEvent, _, cx| explorer.go_back(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|explorer, _: &MouseDownEvent, _, cx| explorer.go_forward(cx)),
+            )
             .on_mouse_move(cx.listener(|explorer, ev: &MouseMoveEvent, _, cx| {
                 let pointer = (f32::from(ev.position.x), f32::from(ev.position.y));
                 if explorer.splitter_drag.is_some() {
@@ -5217,13 +5309,20 @@ fn external_drag_watcher(cx: &mut Context<OnyxExplorer>) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |_, (), window, _cx| {
-            let view = view.clone();
+            let drag_view = view.clone();
             window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
                 let pointer = (f32::from(event.position.x), f32::from(event.position.y));
-                let _ = view.update(cx, |explorer, cx| explorer.hand_drag_to_shell(pointer, cx));
+                let _ =
+                    drag_view.update(cx, |explorer, cx| explorer.hand_drag_to_shell(pointer, cx));
+            });
+            window.on_mouse_event(move |event: &FileDropEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let _ = view.update(cx, |explorer, cx| explorer.handle_file_drop(event, cx));
             });
         },
     )
