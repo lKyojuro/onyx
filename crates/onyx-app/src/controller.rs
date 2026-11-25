@@ -496,10 +496,16 @@ impl Controller {
     }
 
     pub(crate) fn toggle_settings(&self, ui: &OnyxWindow) {
+        if ui.get_modal_open() {
+            return;
+        }
         let open = !ui.get_settings_open();
         if open {
             ui.set_command_palette_open(false);
-            let state = self.state.borrow();
+            ui.set_archive_open(false);
+            ui.set_quick_look_open(false);
+            let mut state = self.state.borrow_mut();
+            state.quick_look = false;
             ui_sync::settings(ui, &state.config);
         }
         ui.set_settings_open(open);
@@ -686,7 +692,15 @@ impl Controller {
     }
 
     pub(crate) fn toggle_quick_look(&self, ui: &OnyxWindow) {
+        if ui.get_modal_open() {
+            return;
+        }
         let enabled = !self.state.borrow().quick_look && self.selected().is_some();
+        if enabled {
+            ui.set_command_palette_open(false);
+            ui.set_settings_open(false);
+            ui.set_archive_open(false);
+        }
         self.state.borrow_mut().quick_look = enabled;
         ui.set_quick_look_open(enabled);
         self.update_preview(ui);

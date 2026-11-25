@@ -390,20 +390,20 @@ export component OnyxWindow inherits Window {
                 }
             }
 
-            // Ctrl+,: Toggle Settings
-            if event.modifiers.control && event.text == "," {
+            // Ctrl+,: Toggle Settings (never stack over a confirmation/prompt dialog)
+            if !root.modal-open && event.modifiers.control && event.text == "," {
                 root.toggle-settings();
                 return accept;
             }
 
-            // Ctrl+K: Toggle Command Palette
-            if event.modifiers.control && (event.text == "k" || event.text == "K") {
+            // Ctrl+K: Toggle Command Palette (never stack over a confirmation/prompt dialog)
+            if !root.modal-open && event.modifiers.control && (event.text == "k" || event.text == "K") {
                 root.toggle-command-palette();
                 return accept;
             }
 
-            // Block other global shortcuts while an overlay modal is open
-            if root.modal-open || root.command-palette-open || root.settings-open || root.archive-open {
+            // Block other global shortcuts while an overlay modal or Quick Look is open
+            if root.modal-open || root.command-palette-open || root.settings-open || root.archive-open || root.quick-look-open {
                 return reject;
             }
 
@@ -473,7 +473,44 @@ export component OnyxWindow inherits Window {
                 return accept;
             }
 
-            // If Quick Look is open, allow Up/Down to step through items and Enter to open
+            // While Quick Look is open, allow stepping through items and opening,
+            // but block destructive/navigation shortcuts behind the modal.
+            if root.quick-look-open {
+                if event.text == Key.UpArrow || event.text == Key.LeftArrow {
+                    root.move-selection(-1);
+                    return accept;
+                }
+                if event.text == Key.DownArrow || event.text == Key.RightArrow {
+                    root.move-selection(1);
+                    return accept;
+                }
+                if event.text == Key.Return {
+                    root.activate-entry(root.active-pane, root.active-selected-index);
+                    return accept;
+                }
+                return reject;
+            }
+
+            // Grid view supports Left/Right item stepping and Up/Down row stepping
+            if root.view-mode == 1 {
+                if event.text == Key.LeftArrow {
+                    root.move-selection(-1);
+                    return accept;
+                }
+                if event.text == Key.RightArrow {
+                    root.move-selection(1);
+                    return accept;
+                }
+                if event.text == Key.UpArrow {
+                    root.move-selection(-primary-pane.grid-columns);
+                    return accept;
+                }
+                if event.text == Key.DownArrow {
+                    root.move-selection(primary-pane.grid-columns);
+                    return accept;
+                }
+            }
+
             if event.text == Key.UpArrow {
                 root.move-selection(-1);
                 return accept;
@@ -567,6 +604,7 @@ export component OnyxWindow inherits Window {
             }
 
             Toolbar {
+                compact-labels: root.width < 1120px;
                 active-pane: root.active-pane;
                 sort-column: root.active-sort-column;
                 sort-ascending: root.active-sort-ascending;
@@ -622,7 +660,7 @@ export component OnyxWindow inherits Window {
                 }
 
                 // Primary File Pane (pane 0)
-                FilePane {
+                primary-pane := FilePane {
                     horizontal-stretch: 1;
                     pane-index: 0;
                     is-active: root.active-pane == 0;
@@ -634,6 +672,7 @@ export component OnyxWindow inherits Window {
                     sort-ascending: root.primary-sort-ascending;
                     view-mode: root.view-mode;
                     is-loading: root.primary-loading;
+                    has-search-query: root.active-pane == 0 && root.search-text != "";
                     error-message: root.primary-error;
                     dragging-active <=> root.dragging-active;
                     drag-generation: root.drag-generation;
@@ -690,6 +729,7 @@ export component OnyxWindow inherits Window {
                     sort-ascending: root.secondary-sort-ascending;
                     view-mode: root.view-mode;
                     is-loading: root.secondary-loading;
+                    has-search-query: root.active-pane == 1 && root.search-text != "";
                     error-message: root.secondary-error;
                     dragging-active <=> root.dragging-active;
                     drag-generation: root.drag-generation;

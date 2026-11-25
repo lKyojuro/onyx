@@ -642,7 +642,7 @@ impl Controller {
         );
     }
 
-    /// Extracts the selected `.zip` archive directly into the active directory.
+    /// Extracts the selected `.zip` archive directly alongside the archive file.
     pub(crate) fn extract_here(&self, ui: &OnyxWindow) {
         let Some(entry) = self
             .selected()
@@ -651,7 +651,11 @@ impl Controller {
             ui.set_status_message("Select a .zip archive to extract.".into());
             return;
         };
-        let dest_dir = self.state.borrow().path(self.active()).to_path_buf();
+        let dest_dir = entry
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.state.borrow().path(self.active()).to_path_buf());
         self.start_operation(
             ui,
             Operation::ExtractArchive {
@@ -694,13 +698,21 @@ impl Controller {
 
     /// Asynchronously lists entries of `archive_path` and presents them in the Archive Browser overlay.
     pub(crate) fn browse_archive_path(&self, ui: &OnyxWindow, archive_path: PathBuf) {
+        if ui.get_modal_open() {
+            return;
+        }
         let cancel = {
             let mut state = self.state.borrow_mut();
+            state.quick_look = false;
             state.archive_cancel.cancel();
             state.archive_cancel = CancellationToken::new();
             state.archive_path = Some(archive_path.clone());
             state.archive_cancel.clone()
         };
+
+        ui.set_command_palette_open(false);
+        ui.set_settings_open(false);
+        ui.set_quick_look_open(false);
 
         let title = archive_path
             .file_name()

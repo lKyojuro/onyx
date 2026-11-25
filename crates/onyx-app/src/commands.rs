@@ -197,8 +197,14 @@ pub(crate) const COMMANDS: &[Command] = &[
 ];
 
 pub(crate) fn toggle(ui: &OnyxWindow) {
+    if ui.get_modal_open() {
+        return;
+    }
     let open = !ui.get_command_palette_open();
     if open {
+        ui.set_settings_open(false);
+        ui.set_archive_open(false);
+        ui.set_quick_look_open(false);
         ui.set_command_query("".into());
         filter(ui, "");
     }

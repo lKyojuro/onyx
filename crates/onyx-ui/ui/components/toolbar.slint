@@ -42,6 +42,8 @@ export component Toolbar inherits Rectangle {
         return root.sort-column == column ? (root.sort-ascending ? "sort-ascending" : "sort-descending") : "";
     }
 
+    in property <bool> compact-labels: false;
+
     height: 40px;
     background: OnyxTheme.bg-surface-alt;
 
@@ -54,6 +56,10 @@ export component Toolbar inherits Rectangle {
     }
 
     HorizontalLayout {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
         padding-left: 10px;
         padding-right: 10px;
         padding-top: 6px;
@@ -68,7 +74,7 @@ export component Toolbar inherits Rectangle {
 
             FluentButton {
                 icon-name: "folder-plus";
-                label: "New";
+                label: root.compact-labels ? "" : "New";
                 a11y-label: "New folder";
                 compact: true;
                 clicked => { root.action-new-folder(); }
@@ -251,7 +257,7 @@ export component Toolbar inherits Rectangle {
 
             FluentButton {
                 icon-name: root.view-mode == 0 ? "list" : "grid";
-                label: root.view-mode == 0 ? "Details" : "Grid";
+                label: root.compact-labels ? "" : (root.view-mode == 0 ? "Details" : "Grid");
                 a11y-label: "Toggle view mode";
                 compact: true;
                 clicked => { root.toggle-view-mode(); }
@@ -259,7 +265,7 @@ export component Toolbar inherits Rectangle {
 
             FluentButton {
                 icon-name: "eye";
-                label: "Hidden";
+                label: root.compact-labels ? "" : "Hidden";
                 a11y-label: "Toggle hidden files";
                 compact: true;
                 active: root.show-hidden;
@@ -268,7 +274,7 @@ export component Toolbar inherits Rectangle {
 
             FluentButton {
                 icon-name: "columns";
-                label: "Dual";
+                label: root.compact-labels ? "" : "Dual";
                 a11y-label: "Toggle dual-pane layout";
                 compact: true;
                 active: root.dual-pane;
@@ -277,7 +283,7 @@ export component Toolbar inherits Rectangle {
 
             FluentButton {
                 icon-name: "panel-right";
-                label: "Preview";
+                label: root.compact-labels ? "" : "Preview";
                 a11y-label: "Toggle preview pane";
                 compact: true;
                 active: root.preview-pane;

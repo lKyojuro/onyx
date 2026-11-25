@@ -104,6 +104,7 @@ export component FilePane inherits Rectangle {
     in property <bool> sort-ascending: true;
     in property <int> view-mode: 0; // 0 = Details, 1 = Grid
     in property <bool> is-loading: false;
+    in property <bool> has-search-query: false;
     in property <string> error-message: "";
 
     // Shared internal drag-and-drop state
@@ -130,7 +131,7 @@ export component FilePane inherits Rectangle {
     callback finish-internal-drag(bool);
     callback cancel-internal-drag();
 
-    property <int> grid-columns: Math.max(1, Math.floor((self.width - 24px) / 140px));
+    out property <int> grid-columns: Math.max(1, Math.floor((self.width - 24px) / 140px));
     property <int> grid-rows: root.entries.length == 0
         ? 0
         : Math.floor((root.entries.length + root.grid-columns - 1) / root.grid-columns);
@@ -385,14 +386,14 @@ export component FilePane inherits Rectangle {
                 HorizontalLayout {
                     alignment: center;
                     OnyxIcon {
-                        name: "folder";
+                        name: root.has-search-query ? "search" : "folder";
                         size: 36px;
                         icon-color: OnyxTheme.text-muted;
                     }
                 }
 
                 Text {
-                    text: "This folder is empty";
+                    text: root.has-search-query ? "No matching items" : "This folder is empty";
                     font-size: OnyxTheme.font-md;
                     font-weight: 500;
                     color: OnyxTheme.text-secondary;
@@ -400,7 +401,9 @@ export component FilePane inherits Rectangle {
                 }
 
                 Text {
-                    text: "Create a new folder or navigate using the sidebar.";
+                    text: root.has-search-query
+                        ? "Try a different search term or clear the search box."
+                        : "Create a new folder or navigate using the sidebar.";
                     font-size: OnyxTheme.font-xs;
                     color: OnyxTheme.text-muted;
                     horizontal-alignment: center;

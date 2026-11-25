@@ -125,11 +125,16 @@ export component SettingsOverlayModal inherits Rectangle {
         settings-scope.focus();
     }
 
+    function dismiss() {
+        root.new-excluded-dir = "";
+        root.close();
+    }
+
     background: OnyxTheme.bg-backdrop;
 
     // Click backdrop to dismiss
     TouchArea {
-        clicked => { root.close(); }
+        clicked => { root.dismiss(); }
     }
 
     Rectangle {
@@ -161,7 +166,7 @@ export component SettingsOverlayModal inherits Rectangle {
 
             key-pressed(event) => {
                 if event.text == Key.Escape {
-                    root.close();
+                    root.dismiss();
                     return accept;
                 }
                 return reject;
