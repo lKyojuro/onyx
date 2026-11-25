@@ -117,9 +117,9 @@ fn compute_folder_size_blocking(
                 break;
             }
 
-            let entry_path = dir_path.join(dir_entry.file_name());
-            let extended_entry = to_extended_length_path(&entry_path);
-            let Ok(meta) = fs::symlink_metadata(&extended_entry) else {
+            // On Windows, `DirEntry::metadata()` reuses `WIN32_FIND_DATA` from `FindNextFileW`
+            // with zero extra syscalls and reports symlinks/reparse points without following links.
+            let Ok(meta) = dir_entry.metadata() else {
                 continue;
             };
 
@@ -131,7 +131,7 @@ fn compute_folder_size_blocking(
             entries_seen += 1;
 
             if file_type.is_dir() {
-                stack.push(entry_path);
+                stack.push(dir_path.join(dir_entry.file_name()));
             } else if file_type.is_file() {
                 total_bytes = total_bytes.saturating_add(meta.len());
                 file_count = file_count.saturating_add(1);

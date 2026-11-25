@@ -1,4 +1,4 @@
-use onyx_cache::RgbaImageData;
+use onyx_cache::{FolderSizeStore, RgbaImageData};
 use onyx_config::{
     AppConfig, ConfigStore, PreviewSide, clamp_pane_split_ratio, clamp_preview_width,
     clamp_sidebar_width,
@@ -88,6 +88,14 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
             for favorite in &config.favorites {
                 collect_icon(&favorite.path);
             }
+            let folder_size_db = store.dir().join("cache").join("folder_sizes.db");
+            let folder_size_store = match FolderSizeStore::open(&folder_size_db) {
+                Ok(db) => Some(Arc::new(db)),
+                Err(error) => {
+                    tracing::warn!(%error, "could not open persistent folder size cache");
+                    None
+                }
+            };
             Ok((
                 store,
                 config,
@@ -99,11 +107,24 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
                 folders,
                 fonts,
                 sidebar_icons,
+                folder_size_store,
             ))
         })
         .await
     })??;
-    let (store, config, session, home, path, dark, accent, folders, fonts, sidebar_icons) = startup;
+    let (
+        store,
+        config,
+        session,
+        home,
+        path,
+        dark,
+        accent,
+        folders,
+        fonts,
+        sidebar_icons,
+        folder_size_store,
+    ) = startup;
     let ui = OnyxWindow::new()?;
     let [ui_font, mono_font] = fonts;
     let theme = ui.global::<OnyxTheme>();
@@ -117,7 +138,8 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
     if let Some(color) = accent {
         ui.set_accent_color(color);
     }
-    let state = State::new(store, config, session, home, path);
+    let mut state = State::new(store, config, session, home, path);
+    state.folder_size_store = folder_size_store;
     for (key, data) in sidebar_icons {
         state.icons.put(key, data);
     }
@@ -415,6 +437,10 @@ impl Controller {
             .settings_set_show_preview(&ui, enabled));
         bind!(on_settings_set_dual_pane_default, |app, ui, enabled| app
             .settings_set_dual_pane_default(&ui, enabled));
+        bind!(
+            on_settings_set_calculate_folder_sizes,
+            |app, ui, enabled| app.settings_set_calculate_folder_sizes(&ui, enabled)
+        );
         bind!(on_settings_set_default_terminal, |app, ui, term| app
             .settings_set_default_terminal(&ui, term.as_str()));
         bind!(on_settings_add_excluded_dir, |app, ui, dir| app
@@ -677,6 +703,29 @@ impl Controller {
             self.reload(ui, PaneId::Secondary, true);
         } else {
             self.update_preview(ui);
+        }
+        self.persist_config();
+    }
+
+    pub(crate) fn settings_set_calculate_folder_sizes(&self, ui: &OnyxWindow, enabled: bool) {
+        let panes: Vec<_> = {
+            let mut state = self.state.borrow_mut();
+            if state.config.calculate_folder_sizes == enabled {
+                return;
+            }
+            state.config.calculate_folder_sizes = enabled;
+            if !enabled {
+                for pane in &state.panes {
+                    pane.folder_size_cancel.cancel();
+                }
+            }
+            ui_sync::settings(ui, &state.config);
+            state.visible_panes().collect()
+        };
+        if enabled {
+            for pane in panes {
+                self.queue_folder_sizes(pane);
+            }
         }
         self.persist_config();
     }

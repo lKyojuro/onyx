@@ -128,6 +128,7 @@ export component OnyxWindow inherits Window {
     in property <bool> settings-show-preview: true;
     in property <bool> settings-dual-pane-default: false;
     in property <string> settings-default-terminal: "wt";
+    in property <bool> settings-calculate-folder-sizes: true;
     in property <[string]> settings-excluded-dirs;
 
     // Archive browser overlay state
@@ -268,6 +269,7 @@ export component OnyxWindow inherits Window {
     callback settings-set-show-system(bool);
     callback settings-set-show-preview(bool);
     callback settings-set-dual-pane-default(bool);
+    callback settings-set-calculate-folder-sizes(bool);
     callback settings-set-default-terminal(string);
     callback settings-add-excluded-dir(string);
     callback settings-remove-excluded-dir(string);
@@ -1261,6 +1263,7 @@ export component OnyxWindow inherits Window {
             show-system: root.settings-show-system;
             show-preview-pane: root.settings-show-preview;
             dual-pane-default: root.settings-dual-pane-default;
+            calculate-folder-sizes: root.settings-calculate-folder-sizes;
             default-terminal: root.settings-default-terminal;
             excluded-dirs: root.settings-excluded-dirs;
             set-theme(mode) => { root.settings-set-theme(mode); }
@@ -1269,6 +1272,7 @@ export component OnyxWindow inherits Window {
             set-show-system(val) => { root.settings-set-show-system(val); }
             set-show-preview(val) => { root.settings-set-show-preview(val); }
             set-dual-pane-default(val) => { root.settings-set-dual-pane-default(val); }
+            set-calculate-folder-sizes(val) => { root.settings-set-calculate-folder-sizes(val); }
             set-default-terminal(val) => { root.settings-set-default-terminal(val); }
             add-excluded-dir(val) => { root.settings-add-excluded-dir(val); }
             remove-excluded-dir(val) => { root.settings-remove-excluded-dir(val); }

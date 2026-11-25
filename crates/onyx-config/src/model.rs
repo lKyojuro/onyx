@@ -22,6 +22,8 @@ pub struct AppConfig {
     pub default_view: ViewMode,
     pub dual_pane_default: bool,
     pub show_preview_pane: bool,
+    #[serde(default = "default_true")]
+    pub calculate_folder_sizes: bool,
     #[serde(default = "default_terminal_value")]
     pub default_terminal: String,
     pub favorites: Vec<FavoriteItem>,
@@ -31,6 +33,10 @@ pub struct AppConfig {
 
 fn default_terminal_value() -> String {
     DEFAULT_TERMINAL.to_string()
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -43,6 +49,7 @@ impl Default for AppConfig {
             default_view: ViewMode::default(),
             dual_pane_default: false,
             show_preview_pane: true,
+            calculate_folder_sizes: true,
             default_terminal: default_terminal_value(),
             favorites: Vec::new(),
             excluded_index_dirs: Vec::new(),

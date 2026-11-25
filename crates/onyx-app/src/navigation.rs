@@ -190,17 +190,21 @@ impl Controller {
     }
 
     pub(crate) fn refresh_paths(&self, ui: &OnyxWindow, paths: &[PathBuf]) {
-        let panes: Vec<_> = {
+        let (panes, size_store): (Vec<_>, _) = {
             let mut state = self.state.borrow_mut();
             for path in paths {
                 state.directories.invalidate(path);
+                state.folder_sizes.invalidate_ancestors(path);
+                state.folder_sizes.invalidate_prefix(path);
             }
             let panes: Vec<_> = state
                 .visible_panes()
                 .filter(|&id| paths.iter().any(|path| paths_overlap(path, state.path(id))))
                 .collect();
             for &id in &panes {
-                state.directories.invalidate(state.path(id));
+                let pane_path = state.path(id).to_path_buf();
+                state.directories.invalidate(&pane_path);
+                state.folder_sizes.invalidate_ancestors(&pane_path);
             }
             state
                 .indexed_roots
@@ -214,8 +218,16 @@ impl Controller {
                 cancel.cancel();
                 ui.set_status_message("Indexing cancelled because the folder changed.".into());
             }
-            panes
+            (panes, state.folder_size_store.clone())
         };
+        if let Some(store) = size_store {
+            let changed: Vec<PathBuf> = paths.to_vec();
+            self.runtime.spawn_blocking(move || {
+                for path in changed {
+                    let _ = store.invalidate_with_ancestors(&path);
+                }
+            });
+        }
         for pane in panes {
             self.reload(ui, pane, false);
         }

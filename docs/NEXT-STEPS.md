@@ -62,3 +62,18 @@ Dateien: [lib.rs](../crates/onyx-windows/src/lib.rs), [controller.rs](../crates/
 Dateien: [commands.rs](../crates/onyx-app/src/commands.rs), [controller.rs](../crates/onyx-app/src/controller.rs), [state.rs](../crates/onyx-app/src/state.rs), [tab_bar.slint](../crates/onyx-ui/ui/components/tab_bar.slint) und [main.slint](../crates/onyx-ui/ui/main.slint).
 
 Nach jedem Meilenstein die Qualitätschecks aus [AGENTS.md](../AGENTS.md) ausführen. Die Abnahme im laufenden Fenster umfasst beide Themes, Tastaturbedienung und die Kombination aus schmalem Fenster, zwei Dateibereichen und Vorschau.
+
+## Nächste Prioritäten (v0.2-Abschluss & Phase 8)
+
+- [ ] **Ordnergrößen-Cache & CPU-Optimierung (hohe Priorität):**
+  - Berechnete Ordnergrößen dauerhaft in SQLite speichern (`path`, `total_bytes`, `file_count`, `mtime`, `updated_at`), sodass nach Neustarts sofort `< 1 ms` ohne Neu-Scan geladen wird.
+  - Gezielte Invalidierung: Änderungen über den `notify`-Watcher markieren nur den betroffenen Ordner + Elternpfade als „dirty“ und berechnen nur diese neu (nach Neustart Abgleich via `mtime` und perspektivisch NTFS USN Journal).
+  - Scan-CPU-Last drastisch senken: in [folder_size.rs](../crates/onyx-fs/src/folder_size.rs) direkt `dir_entry.metadata()` statt extra `symlink_metadata()`-Syscall nutzen, Parallelität auf 1–2 Hintergrund-Worker mit niedriger Priorität begrenzen und in den Einstellungen (`Ctrl+,`) den Modus (*Automatisch / Nur auf Abruf / Aus*) wählbar machen.
+- [ ] **Zieh-Auswahl (Marquee / Gummiband-Auswahl) & Mehrfachauswahl-Komfort:**
+  - Auf freier Fläche in der Dateiliste (Details- und Grid-Ansicht) klicken und ein Auswahlrechteck aufziehen, um mehrere Dateien/Ordner gleichzeitig zu markieren (inkl. Live-Highlight während des Ziehens und sauberem Scroll-Verhalten).
+  - Ergänzend dazu `Ctrl+Klick` (einzelne Einträge hinzufügen/entfernen), `Shift+Klick` (Bereichsauswahl), `Ctrl+A` (Alles auswählen) und direktes Inline-Umbenennen in der Zeile.
+- [ ] **Konfliktdialog-UI für Kopieren/Verschieben:** Slint-Modal (*Ersetzen / Überspringen / Beide behalten / Für alle anwenden*) an die fertige Engine in `onyx-operations` anbinden.
+- [ ] **UI-Redesign & visuelle Ausrichtung:**
+  - Grundlegende gestalterische Überarbeitung der Oberfläche (Farb-/Kontrastsystem, Typografie, Abstände/Dichte, Header-/Tab-/Toolbar-Aufbau, Seitenleiste, Dateiliste und Dark/Light-Theme), um ein wirklich stimmiges, eigenes und vertrautes Design zu finden.
+  - Vor der Slint-Umsetzung gezielt Design-Entwürfe/Varianten abstimmen, statt blind umzubauen.
+- [ ] **Weitere Phase-8-Ideen** siehe [Roadmap](ROADMAP.md) (Inline-Filter & Gruppierung, Baumansicht, anpassbare Spalten, USB/Netzwerk-Hotplug, `.7z`/`.tar.gz`, RAM-Optimierung, USN-Journal, signierte Releases).

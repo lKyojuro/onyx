@@ -105,6 +105,7 @@ export component SettingsOverlayModal inherits Rectangle {
     in property <bool> show-system: false;
     in property <bool> show-preview-pane: true;
     in property <bool> dual-pane-default: false;
+    in property <bool> calculate-folder-sizes: true;
     in property <string> default-terminal: "wt";
     in property <[string]> excluded-dirs;
 
@@ -116,6 +117,7 @@ export component SettingsOverlayModal inherits Rectangle {
     callback set-show-system(bool);
     callback set-show-preview(bool);
     callback set-dual-pane-default(bool);
+    callback set-calculate-folder-sizes(bool);
     callback set-default-terminal(string);
     callback add-excluded-dir(string);
     callback remove-excluded-dir(string);
@@ -347,6 +349,17 @@ export component SettingsOverlayModal inherits Rectangle {
                                 checked: root.dual-pane-default;
                                 a11y-label: "Dual-pane default";
                                 toggled(val) => { root.set-dual-pane-default(val); }
+                            }
+                        }
+
+                        SettingsRow {
+                            title: "Calculate Folder Sizes";
+                            description: "Compute recursive folder sizes and size bars in the background (cached in SQLite).";
+
+                            FluentSwitch {
+                                checked: root.calculate-folder-sizes;
+                                a11y-label: "Calculate folder sizes";
+                                toggled(val) => { root.set-calculate-folder-sizes(val); }
                             }
                         }
 

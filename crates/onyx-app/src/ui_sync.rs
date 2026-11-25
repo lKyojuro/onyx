@@ -144,6 +144,7 @@ pub(crate) fn settings(ui: &OnyxWindow, config: &AppConfig) {
     ui.set_settings_show_system(config.show_system);
     ui.set_settings_show_preview(config.show_preview_pane);
     ui.set_settings_dual_pane_default(config.dual_pane_default);
+    ui.set_settings_calculate_folder_sizes(config.calculate_folder_sizes);
     ui.set_settings_default_terminal(config.normalized_terminal().into());
     ui.set_settings_excluded_dirs(model(
         config.excluded_index_dirs.iter().map(|p| display_path(p)),

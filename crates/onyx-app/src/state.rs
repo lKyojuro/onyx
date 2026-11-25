@@ -1,4 +1,4 @@
-use onyx_cache::{DirectoryCache, FolderSizeCache, IconCache};
+use onyx_cache::{DirectoryCache, FolderSizeCache, FolderSizeStore, IconCache};
 use onyx_config::{
     AppConfig, ConfigStore, DEFAULT_PANE_SPLIT_RATIO, DEFAULT_SIDEBAR_WIDTH, PreviewSide,
     SessionState, VALID_SIDEBAR_GROUPS, clamp_pane_split_ratio, clamp_preview_width,
@@ -85,6 +85,7 @@ pub(crate) struct State {
     pub quick_look: bool,
     pub directories: DirectoryCache,
     pub folder_sizes: FolderSizeCache,
+    pub folder_size_store: Option<Arc<FolderSizeStore>>,
     pub icons: IconCache,
     pub pending_icons: HashSet<String>,
     pub missing_icons: HashSet<String>,
@@ -157,6 +158,7 @@ impl State {
             quick_look: false,
             directories: DirectoryCache::default(),
             folder_sizes: FolderSizeCache::default(),
+            folder_size_store: None,
             icons: IconCache::default(),
             pending_icons: HashSet::new(),
             missing_icons: HashSet::new(),

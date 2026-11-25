@@ -1,4 +1,4 @@
-use onyx_cache::{CachedFolderSize, RgbaImageData};
+use onyx_cache::{CachedFolderSize, RgbaImageData, dir_mtime_secs};
 use onyx_core::{
     FileEntry, GenerationId, OnyxError, OnyxResult, PaneId, SortSpec, ViewMode,
     normalize_display_path, sort_entries,
@@ -29,7 +29,7 @@ pub(crate) const THUMBNAIL_TARGET_PX: u32 = 128;
 const MAX_THUMBNAIL_WORKERS: usize = 4;
 
 /// Maximum concurrent recursive folder size calculations per pane.
-const MAX_FOLDER_SIZE_CONCURRENCY: usize = 3;
+const MAX_FOLDER_SIZE_CONCURRENCY: usize = 2;
 
 #[derive(Clone)]
 pub(crate) struct IndexWatchRequest {
@@ -332,8 +332,12 @@ impl Controller {
     /// Checks [`FolderSizeCache`] first and spawns up to [`MAX_FOLDER_SIZE_CONCURRENCY`] concurrent
     /// folder size walks tagged with the pane's [`GenerationId`] and `folder_size_cancel` token.
     pub(crate) fn queue_folder_sizes(&self, id: PaneId) {
-        let (generation, cancel, pending, any_cached_applied) = {
+        let (generation, cancel, pending, any_cached_applied, size_store) = {
             let mut state = self.state.borrow_mut();
+            if !state.config.calculate_folder_sizes {
+                state.pane_mut(id).folder_size_cancel.cancel();
+                return;
+            }
             let mut cached_hits = Vec::new();
             let mut pending = Vec::new();
             for (index, entry) in state.pane(id).entries.iter().enumerate() {
@@ -345,7 +349,7 @@ impl Controller {
                         cached_hits.push((index, cached.total_bytes));
                     }
                 } else {
-                    pending.push(entry.path.clone());
+                    pending.push((entry.path.clone(), entry.modified));
                 }
             }
             let any_cached = !cached_hits.is_empty();
@@ -359,7 +363,13 @@ impl Controller {
             if any_cached {
                 ui_sync::update_size_bars(&state, id);
             }
-            (generation, cancel, pending, any_cached)
+            (
+                generation,
+                cancel,
+                pending,
+                any_cached,
+                state.folder_size_store.clone(),
+            )
         };
 
         if any_cached_applied && let Some(ui) = self.ui.upgrade() {
@@ -371,12 +381,52 @@ impl Controller {
         }
 
         let semaphore = Arc::new(Semaphore::new(MAX_FOLDER_SIZE_CONCURRENCY));
-        for path in pending {
+        for (path, entry_modified) in pending {
             let sem = Arc::clone(&semaphore);
             let cancel = cancel.clone();
             let shutdown = self.shutdown.clone();
             let weak = self.ui.clone();
+            let store = size_store.clone();
             self.runtime.spawn(async move {
+                if cancel.is_cancelled() || shutdown.is_cancelled() {
+                    return;
+                }
+
+                // Check persistent SQLite cache first (0 recursive CPU work when mtime matches).
+                let mtime_secs = if let Some(store_ref) = &store {
+                    let path_for_db = path.clone();
+                    let store_for_db = Arc::clone(store_ref);
+                    let lookup = tokio::task::spawn_blocking(move || {
+                        let mtime = entry_modified.or_else(|| dir_mtime_secs(&path_for_db));
+                        let cached = mtime.and_then(|ts| {
+                            store_for_db.get_if_fresh(&path_for_db, ts).ok().flatten()
+                        });
+                        (mtime, cached)
+                    })
+                    .await;
+
+                    match lookup {
+                        Ok((_, Some(cached))) => {
+                            if cancel.is_cancelled() || shutdown.is_cancelled() {
+                                return;
+                            }
+                            let size = FolderSizeResult {
+                                total_bytes: cached.total_bytes,
+                                file_count: cached.file_count,
+                                truncated: cached.truncated,
+                            };
+                            post(&weak, move |app, ui| {
+                                app.folder_size_loaded(ui, id, generation, path, size)
+                            });
+                            return;
+                        }
+                        Ok((mtime, None)) => mtime,
+                        Err(_) => entry_modified,
+                    }
+                } else {
+                    entry_modified
+                };
+
                 let permit = tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = shutdown.cancelled() => return,
@@ -385,14 +435,31 @@ impl Controller {
                         Err(_) => return,
                     },
                 };
-                let result =
-                    compute_folder_size(path.clone(), DEFAULT_MAX_FOLDER_SIZE_ENTRIES, cancel.clone())
-                        .await;
+                let result = compute_folder_size(
+                    path.clone(),
+                    DEFAULT_MAX_FOLDER_SIZE_ENTRIES,
+                    cancel.clone(),
+                )
+                .await;
                 drop(permit);
                 match result {
                     Ok(size) => {
                         if cancel.is_cancelled() || shutdown.is_cancelled() {
                             return;
+                        }
+                        if let Some(store_ref) = store
+                            && let Some(mtime) = mtime_secs
+                        {
+                            let path_for_db = path.clone();
+                            let cached = CachedFolderSize::new(
+                                size.total_bytes,
+                                size.file_count,
+                                size.truncated,
+                            );
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let _ = store_ref.upsert(&path_for_db, cached, mtime);
+                            })
+                            .await;
                         }
                         post(&weak, move |app, ui| {
                             app.folder_size_loaded(ui, id, generation, path, size)
