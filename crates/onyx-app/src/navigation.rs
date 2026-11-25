@@ -1,10 +1,13 @@
 use onyx_core::{
     FileEntry, GenerationId, OnyxError, OnyxResult, PaneId, SortColumn, SortDirection, SortSpec,
-    sort_entries,
+    natural_cmp, sort_entries,
 };
 use onyx_fs::{EnumerationOptions, FsEngine};
 use onyx_ui::OnyxWindow;
+use slint::{ModelRc, VecModel};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::atomic::Ordering;
 
 use crate::controller::{Controller, post};
 use crate::state::is_zip_path;
@@ -43,15 +46,46 @@ impl Controller {
             .and_then(|value| value.strip_suffix('"'))
             .unwrap_or(value);
         let id = self.active();
+        ui.set_address_suggestions(ModelRc::default());
         if value.is_empty() {
             ui.set_address_editing(false);
             self.sync_chrome(ui);
             return;
         }
+        let expanded = onyx_core::expand_env_vars(value);
         let base = self.state.borrow().path(id).to_path_buf();
-        let joined = base.join(value);
+        let joined = base.join(expanded.trim());
         let path = std::path::absolute(&joined).unwrap_or(joined);
         self.change_path(ui, id, path, true);
+    }
+
+    /// Computes live address bar suggestions off the UI thread.
+    /// A monotonically increasing generation counter drops stale results.
+    pub(crate) fn address_edited(&self, ui: &OnyxWindow, text: &str) {
+        let expanded = onyx_core::expand_env_vars(text.trim());
+        let Some((parent, prefix)) = onyx_core::split_autocomplete_prefix(&expanded) else {
+            ui.set_address_suggestions(ModelRc::default());
+            return;
+        };
+        let parent = if parent.is_absolute() {
+            parent
+        } else {
+            self.state.borrow().path(self.active()).join(parent)
+        };
+        let generation = self.address_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let weak = self.ui.clone();
+        self.runtime.spawn_blocking(move || {
+            let suggestions = list_address_suggestions(&parent, &prefix);
+            post(&weak, move |app, ui| {
+                if app.address_generation.load(Ordering::Relaxed) == generation {
+                    let suggestions: Vec<_> = suggestions
+                        .into_iter()
+                        .map(slint::SharedString::from)
+                        .collect();
+                    ui.set_address_suggestions(ModelRc::from(Rc::new(VecModel::from(suggestions))));
+                }
+            });
+        });
     }
 
     pub(crate) fn history(&self, ui: &OnyxWindow, forward: bool) {
@@ -420,6 +454,33 @@ impl Controller {
 
 fn tab_index(state: &crate::state::State, id: i32) -> Option<usize> {
     state.tabs.tabs().iter().position(|tab| tab.id as i32 == id)
+}
+
+/// Lists up to 8 subdirectories of `parent` whose names case-insensitively
+/// start with `prefix`, sorted naturally. Runs on a blocking worker only.
+fn list_address_suggestions(parent: &Path, prefix: &str) -> Vec<String> {
+    let prefix = prefix.to_lowercase();
+    let mut matches: Vec<(String, String)> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if !kind.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.to_lowercase().starts_with(&prefix) {
+            continue;
+        }
+        let path = entry.path().to_string_lossy().into_owned();
+        matches.push((name, path));
+    }
+    matches.sort_by(|first, second| natural_cmp(&first.0, &second.0));
+    matches.truncate(8);
+    matches.into_iter().map(|(_, path)| path).collect()
 }
 
 fn paths_overlap(first: &Path, second: &Path) -> bool {

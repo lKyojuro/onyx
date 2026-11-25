@@ -41,6 +41,72 @@ pub fn to_extended_length_path(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Looks up an environment variable case-insensitively.
+fn lookup_env_var(name: &str) -> Option<String> {
+    std::env::var(name).ok().or_else(|| {
+        std::env::vars_os().find_map(|(key, value)| {
+            (key.to_string_lossy().eq_ignore_ascii_case(name))
+                .then(|| value.to_string_lossy().into_owned())
+        })
+    })
+}
+
+/// Expands Windows `%VAR%` environment variable references (case-insensitive).
+/// Unknown variables are left intact and an unclosed `%` keeps the rest verbatim.
+#[must_use]
+pub fn expand_env_vars(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find('%') {
+        result.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('%') {
+            Some(end) if !after[..end].is_empty() => {
+                let name = &after[..end];
+                match lookup_env_var(name) {
+                    Some(value) => result.push_str(&value),
+                    None => {
+                        result.push('%');
+                        result.push_str(name);
+                        result.push('%');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            // Unclosed or empty `%` pair: keep the remainder verbatim.
+            _ => {
+                result.push('%');
+                rest = &rest[start + 1..];
+                break;
+            }
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Splits a typed path into `(parent_directory, prefix)` for autocomplete.
+/// `C:\Users\zk\Doc` splits into `(C:\Users\zk, "Doc")`, a trailing separator
+/// such as `C:\Users\` yields an empty prefix. Returns `None` when there is no
+/// usable parent directory (empty input or a bare relative name).
+#[must_use]
+pub fn split_autocomplete_prefix(expanded: &str) -> Option<(PathBuf, String)> {
+    let trimmed = expanded.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = Path::new(trimmed);
+    if trimmed.ends_with('\\') || trimmed.ends_with('/') {
+        return Some((path.to_path_buf(), String::new()));
+    }
+    let prefix = path.file_name()?.to_string_lossy().into_owned();
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty() {
+        return None;
+    }
+    Some((parent.to_path_buf(), prefix))
+}
+
 /// Builds clickable breadcrumb segments from an absolute Windows or UNC path.
 #[must_use]
 pub fn build_breadcrumbs(path: &Path) -> Vec<BreadcrumbSegment> {
@@ -198,5 +264,71 @@ mod tests {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1536), "1.50 KB");
         assert_eq!(format_bytes(10 * 1024 * 1024), "10.0 MB");
+    }
+
+    #[test]
+    fn expand_env_vars_resolves_known_variable() {
+        let expected = std::env::var("PATH").unwrap_or_default();
+        assert_eq!(expand_env_vars("%PATH%"), expected);
+        // Lookup is case-insensitive.
+        assert_eq!(expand_env_vars("%pAtH%"), expected);
+        assert_eq!(
+            expand_env_vars(r"prefix %PATH% suffix"),
+            format!("prefix {expected} suffix")
+        );
+    }
+
+    #[test]
+    fn expand_env_vars_keeps_unknown_and_unclosed() {
+        assert_eq!(
+            expand_env_vars("%NO_SUCH_VAR_ONYX_42%"),
+            "%NO_SUCH_VAR_ONYX_42%"
+        );
+        assert_eq!(
+            expand_env_vars(r"%NO_SUCH_VAR_ONYX_42%\sub"),
+            r"%NO_SUCH_VAR_ONYX_42%\sub"
+        );
+        // Unclosed `%` keeps the remainder verbatim.
+        assert_eq!(expand_env_vars(r"C:\100%\done"), r"C:\100%\done");
+        assert_eq!(expand_env_vars("trailing %"), "trailing %");
+        // Empty `%%` is not a variable reference.
+        assert_eq!(expand_env_vars("a %% b"), "a %% b");
+        assert_eq!(expand_env_vars(""), "");
+        assert_eq!(expand_env_vars("no vars here"), "no vars here");
+    }
+
+    #[test]
+    fn split_autocomplete_prefix_splits_parent_and_prefix() {
+        let Some((parent, prefix)) = split_autocomplete_prefix(r"C:\Users\zk\Doc") else {
+            panic!("expected a parent/prefix split");
+        };
+        assert_eq!(parent, PathBuf::from(r"C:\Users\zk"));
+        assert_eq!(prefix, "Doc");
+
+        let Some((parent, prefix)) = split_autocomplete_prefix(r"C:\Users\") else {
+            panic!("expected a parent/prefix split");
+        };
+        assert_eq!(parent, PathBuf::from(r"C:\Users"));
+        assert_eq!(prefix, "");
+
+        let Some((parent, prefix)) = split_autocomplete_prefix(r"C:\") else {
+            panic!("expected a parent/prefix split");
+        };
+        assert_eq!(parent, PathBuf::from(r"C:\"));
+        assert_eq!(prefix, "");
+
+        let Some((parent, prefix)) = split_autocomplete_prefix(r"C:/Users/zk/Do") else {
+            panic!("expected a parent/prefix split");
+        };
+        assert_eq!(parent, PathBuf::from(r"C:\Users\zk"));
+        assert_eq!(prefix, "Do");
+    }
+
+    #[test]
+    fn split_autocomplete_prefix_rejects_unusable_input() {
+        assert!(split_autocomplete_prefix("").is_none());
+        assert!(split_autocomplete_prefix("   ").is_none());
+        // A bare relative name has no parent directory to list.
+        assert!(split_autocomplete_prefix("Doc").is_none());
     }
 }
