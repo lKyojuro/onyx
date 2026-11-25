@@ -1,12 +1,16 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod components;
 mod explorer;
+mod icons;
 mod led_pill;
 mod theme;
 
 use explorer::OnyxExplorer;
-use gpui_kit::{AppContext, Bounds, WindowBounds, WindowOptions, px, size};
+use gpui_kit::{
+    AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, assets::Assets, px, size,
+};
 use onyx_core::GenerationId;
 use onyx_fs::{EnumerationOptions, FsEngine};
 use std::error::Error;
@@ -117,19 +121,26 @@ async fn smoke_test() -> AppResult<()> {
 }
 
 fn run_window(runtime: Arc<Runtime>, initial_path: PathBuf) {
-    gpui_kit::application().run(move |cx| {
+    gpui_kit::application().with_assets(Assets).run(move |cx| {
         gpui_kit::init(cx);
 
-        let bounds = Bounds::centered(None, size(px(1160.0), px(740.0)), cx);
+        let bounds = Bounds::centered(None, size(px(1320.0), px(820.0)), cx);
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_min_size: Some(size(px(960.0), px(620.0))),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Onyx".into()),
+                appears_transparent: true,
+                traffic_light_position: None,
+            }),
+            app_owns_titlebar_drag: true,
             ..WindowOptions::default()
         };
 
         let runtime = Arc::clone(&runtime);
         let initial_path = initial_path.clone();
-        if let Err(err) = gpui_kit::open_window(window_options, cx, move |_, cx| {
-            cx.new(|cx| OnyxExplorer::new(runtime, initial_path, cx))
+        if let Err(err) = gpui_kit::open_window(window_options, cx, move |window, cx| {
+            cx.new(|cx| OnyxExplorer::new(runtime, initial_path, window, cx))
         }) {
             eprintln!("failed to open Onyx GPUI window: {err}");
             cx.quit();

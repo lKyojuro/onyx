@@ -8,12 +8,13 @@ Standalone Windows prototype exploring Onyx's next-generation UI built on [`gpui
 - **Direct Core Integration**: Uses `onyx-fs::FsEngine` and `onyx-core` (`GenerationId`, `NavHistory`, `FileEntry`, `build_breadcrumbs`, `format_bytes`, `format_timestamp`) with cancellation-aware async directory enumeration on a bounded Tokio/Rayon pool (never blocking the GPUI UI thread).
 - **Virtualized List & Navigation**: Renders entries via `gpui_kit::uniform_list` with Back / Forward / Up / Refresh controls, clickable breadcrumbs, sidebar quick-links, single-click selection, and double-click folder entry.
 - **Obsidian & LED Dot-Matrix Design**: Deep matte obsidian surfaces (`#080808`–`#141414`), subtle `#1e1e1e` borders, and a 7×7 warm-amber LED dot-matrix status pill (`src/led_pill.rs`) with animated scanning wave + typography shimmer while active and zero timer wakeups at idle.
+- **Command Palette & Settings**: `Ctrl+K` opens a searchable command palette (`src/components/command_palette.rs`) mirroring `crates/onyx-app/src/commands.rs`, `Ctrl+,` opens the settings overlay (`src/components/settings_overlay.rs`) for theme, default view, hidden/system files, preview, dual-pane default, folder sizes, terminal profile and excluded index folders. Both stay modal, close on `Escape`, and persist through `ConfigStore` (atomic write-to-temp-and-rename).
 - **CLI Parity**: Supports `--version` / `-V`, `--smoke-test`, and optional `[PATH]` for direct benchmarking with `scripts/measure-perf.ps1`.
 
 ## Windows Build Caveats (`gpui-kit` + `gpui-fast`)
 
 1. **Release HLSL Shader Precompilation (`fxc.exe`)**: In `--release` builds, `gpui-fast-windows` and `gpui-pre-windows` run `fxc.exe` in `build.rs` to precompile `shaders.hlsl` (`#include "alpha_correction.hlsl"`). This requires the Windows SDK shader compiler (`fxc.exe`) and filesystem read access to the Cargo registry source directory. Dev/test builds skip build-time `fxc.exe`.
-2. **Additive Cargo Features in `gpui-kit 0.11.0`**: Enabling `features = ["gpui-fast"]` switches the active backend to `gpui-fast 0.1.19` cleanly without import changes, but Cargo still compiles `gpui-pre` / `gpui-pre-windows` in the dependency graph. Release LTO + symbol stripping eliminates unused code (`16.23 MB` final EXE).
+2. **Additive Cargo Features in `gpui-kit 0.11.0`**: Enabling `features = ["gpui-fast"]` switches the active backend to `gpui-fast 0.1.19` cleanly without import changes, but Cargo still compiles `gpui-pre` / `gpui-pre-windows` in the dependency graph. Release LTO + symbol stripping eliminates unused code (`24.09 MB` final EXE).
 
 ## Benchmark Comparison (`scripts/measure-perf.ps1`)
 
@@ -22,11 +23,11 @@ Release profile: `opt-level = "s"`, `lto = "thin"`, `codegen-units = 16`, `strip
 
 | Metric | Slint `release-fast` Baseline | `onyx-ui-gpui` (`gpui-fast`) | Delta |
 |---|---:|---:|---:|
-| **EXE Size** | `21.23 MB` | **`16.23 MB`** (`17,013,760` B) | **-5.00 MB (-23.6%)** |
-| **Window-Ready** | `142.99 ms` | **`222.75 ms`** | **+79.76 ms (+55.8%)** |
-| **3s Idle WorkingSet64** | `269.43 MB` | **`100.29 MB`** (`105,164,800` B) | **-169.14 MB (-62.8%)** |
-| **3s Idle PrivateMemory64** | `455.86 MB` | **`85.71 MB`** (`89,878,528` B) | **-370.15 MB (-81.2%)** |
-| **`--smoke-test` Median (5 runs)** | — | `1018.68 ms` (`1014.84–1021.05 ms`) | — |
+| **EXE Size** | `21.23 MB` | **`24.09 MB`** (`25,265,152` B) | **+2.86 MB (+13.5%)** |
+| **Window-Ready** | `142.99 ms` | **`232.88 ms`** | **+89.89 ms (+62.9%)** |
+| **3s Idle WorkingSet64** | `269.43 MB` | **`67.37 MB`** (`70,643,712` B) | **-202.06 MB (-75.0%)** |
+| **3s Idle PrivateMemory64** | `455.86 MB` | **`66.88 MB`** (`70,127,616` B) | **-388.98 MB (-85.3%)** |
+| **`--smoke-test` Median (5 runs)** | — | `1016.77 ms` (`1005.93–1021.22 ms`) | — |
 
 ## Commands
 

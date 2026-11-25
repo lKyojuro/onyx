@@ -2,15 +2,15 @@
 //!
 //! Styled after `docs/design-inspo/01-dot-matrix-thinking-pill.png`:
 //! calm single-dot standby when idle, sweeping warm-amber wave + subtle
-//! typography shimmer when background scanning/loading is active.
+//! typography shimmer when background scanning/loading/folder-sizing is active.
 
-use crate::theme;
-use gpui_kit::{IntoElement, ParentElement, Styled, div, px, rgb};
+use crate::theme::{self, OnyxTheme};
+use gpui_kit::{Hsla, IntoElement, ParentElement, Styled, div, px, rgb};
 
 /// Side length of the square LED matrix.
 pub const MATRIX_DIM: usize = 7;
 
-/// Computes the 0..=4 intensity for cell `(row, col)` at animation `frame`.
+/// Computes the `0..=4` intensity for cell `(row, col)` at animation `frame`.
 #[must_use]
 pub fn dot_intensity(row: usize, col: usize, frame: usize, active: bool) -> u8 {
     if !active {
@@ -57,19 +57,24 @@ pub fn dot_intensity(row: usize, col: usize, frame: usize, active: bool) -> u8 {
     }
 }
 
-/// Renders the obsidian LED dot-matrix status pill.
-pub fn render_led_status_pill(label: &str, frame: usize, active: bool) -> impl IntoElement {
-    let mut matrix_col = div().flex().flex_col().gap(px(1.5));
+/// Renders the obsidian 7x7 warm-amber LED dot-matrix status pill.
+pub fn render_led_status_pill(
+    label: &str,
+    frame: usize,
+    active: bool,
+    theme: OnyxTheme,
+) -> impl IntoElement {
+    let mut matrix_col = div().flex().flex_col().gap(px(1.2));
 
     for row in 0..MATRIX_DIM {
-        let mut matrix_row = div().flex().flex_row().gap(px(1.5));
+        let mut matrix_row = div().flex().flex_row().gap(px(1.2));
         for col in 0..MATRIX_DIM {
             let intensity = dot_intensity(row, col, frame, active);
             matrix_row = matrix_row.child(
                 div()
-                    .w(px(2.5))
-                    .h(px(2.5))
-                    .rounded(px(0.75))
+                    .w(px(2.0))
+                    .h(px(2.0))
+                    .rounded(px(0.6))
                     .bg(theme::led_color(intensity)),
             );
         }
@@ -84,6 +89,7 @@ pub fn render_led_status_pill(label: &str, frame: usize, active: bool) -> impl I
         None
     };
 
+    let idle_text_color: Hsla = rgb(0xc0ccdc).into();
     let mut label_row = div().flex().flex_row().items_center().text_xs();
     for (idx, ch) in chars.iter().enumerate() {
         let color = match shimmer_idx {
@@ -93,10 +99,10 @@ pub fn render_led_status_pill(label: &str, frame: usize, active: bool) -> impl I
                     0 => rgb(0xffd08a).into(),
                     1 => rgb(0xd9a15b).into(),
                     2 => rgb(0xa38564).into(),
-                    _ => theme::text_secondary(),
+                    _ => idle_text_color,
                 }
             }
-            None => theme::text_secondary(),
+            None => idle_text_color,
         };
         label_row = label_row.child(div().text_color(color).child(ch.to_string()));
     }
@@ -105,16 +111,17 @@ pub fn render_led_status_pill(label: &str, frame: usize, active: bool) -> impl I
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(10.0))
-        .px(px(12.0))
-        .py(px(6.0))
+        .flex_shrink_0()
+        .gap(px(8.0))
+        .px(px(10.0))
+        .py(px(3.5))
         .rounded_full()
-        .bg(theme::bg_pill())
+        .bg(theme.bg_led_pill())
         .border_1()
         .border_color(if active {
-            rgb(0x3a2612).into()
+            rgb(0x6b451c).into()
         } else {
-            theme::border_control()
+            theme.border_subtle()
         })
         .child(matrix_col)
         .child(label_row)

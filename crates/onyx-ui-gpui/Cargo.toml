@@ -12,8 +12,15 @@ description = "Standalone GPUI + gpui-fast next-gen UI prototype for Onyx"
 [dependencies]
 dirs = "7.0"
 gpui-kit = { version = "0.11.0", features = ["gpui-fast"] }
+image = { version = "0.25", default-features = false }
+onyx-cache = { path = "../onyx-cache" }
+onyx-config = { path = "../onyx-config" }
 onyx-core = { path = "../onyx-core" }
 onyx-fs = { path = "../onyx-fs" }
+onyx-operations = { path = "../onyx-operations" }
+onyx-preview = { path = "../onyx-preview" }
+onyx-windows = { path = "../onyx-windows" }
+raw-window-handle = "0.6"
 rayon = "1.12"
 tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time", "fs", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -27,8 +34,12 @@ all = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 expect_used = "warn"
 
+# Dependencies render the frame; unoptimized gpui/wgpu dominate frame time in
+# development (~20 ms of a 21 ms frame), so optimize them while the workspace
+# crate itself stays unoptimized and incrementally compiled.
 [profile.dev.package."*"]
 debug = 0
+opt-level = 2
 
 [profile.release]
 opt-level = "s"
