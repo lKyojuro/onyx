@@ -589,16 +589,31 @@ export component FilePane inherits Rectangle {
                             horizontal-stretch: 0;
                         }
 
-                        // Size
-                        Text {
-                            text: entry.size_label;
-                            font-size: OnyxTheme.font-xs;
-                            color: OnyxTheme.text-muted;
-                            vertical-alignment: center;
-                            horizontal-alignment: right;
-                            overflow: elide;
+                        // Size + Proportional Fill Bar
+                        Rectangle {
                             width: root.size-column-width;
                             horizontal-stretch: 0;
+
+                            if entry.size_ratio > 0.0 : Rectangle {
+                                property <length> fill-w: Math.max(3px, parent.width * Math.min(1.0, entry.size_ratio));
+                                x: parent.width - self.fill-w;
+                                y: 6px;
+                                width: self.fill-w;
+                                height: parent.height - 12px;
+                                border-radius: 3px;
+                                background: OnyxTheme.accent-subtle;
+                            }
+
+                            Text {
+                                width: parent.width;
+                                height: parent.height;
+                                text: entry.size_label;
+                                font-size: OnyxTheme.font-xs;
+                                color: OnyxTheme.text-muted;
+                                vertical-alignment: center;
+                                horizontal-alignment: right;
+                                overflow: elide;
+                            }
                         }
                     }
                 }
