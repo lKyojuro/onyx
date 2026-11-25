@@ -193,6 +193,36 @@ pub const COMMANDS: &[PaletteCommand] = &[
         shortcut: "Ctrl+`",
         category: "Tools",
     },
+    PaletteCommand {
+        id: "reset-layout",
+        title: "Reset Layout",
+        shortcut: "",
+        category: "View",
+    },
+    PaletteCommand {
+        id: "compress-zip",
+        title: "Compress to ZIP",
+        shortcut: "",
+        category: "Archive",
+    },
+    PaletteCommand {
+        id: "extract-here",
+        title: "Extract Here",
+        shortcut: "",
+        category: "Archive",
+    },
+    PaletteCommand {
+        id: "extract-to-folder",
+        title: "Extract to Folder",
+        shortcut: "",
+        category: "Archive",
+    },
+    PaletteCommand {
+        id: "browse-archive",
+        title: "Browse Archive",
+        shortcut: "",
+        category: "Archive",
+    },
 ];
 
 /// Returns the indices of all commands matching every whitespace-separated
@@ -529,6 +559,32 @@ mod tests {
             .collect();
         assert_eq!(ids.len(), MAX_VISIBLE_MATCHES);
         assert_eq!(ids.first().copied(), Some("settings"));
+    }
+
+    #[test]
+    fn archive_and_layout_commands_are_registered() {
+        // Mirrors `command_palette_includes_settings_archive_and_dnd_actions`
+        // in `crates/onyx-app/src/commands.rs`.
+        let ids: Vec<&str> = COMMANDS.iter().map(|command| command.id).collect();
+        for required in [
+            "compress-zip",
+            "extract-here",
+            "extract-to-folder",
+            "browse-archive",
+            "reset-layout",
+        ] {
+            assert!(
+                ids.contains(&required),
+                "expected command '{required}' to be registered"
+            );
+        }
+
+        let archive_hits: Vec<&str> = matching_commands("archive")
+            .iter()
+            .filter_map(|index| COMMANDS.get(*index))
+            .map(|command| command.id)
+            .collect();
+        assert!(archive_hits.contains(&"browse-archive"));
     }
 
     #[test]

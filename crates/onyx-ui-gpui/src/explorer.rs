@@ -3476,6 +3476,56 @@ impl OnyxExplorer {
         self.selected_entry().is_some_and(entry_is_archive)
     }
 
+    /// Resets the workspace layout to the defaults (`reset-layout`), mirroring
+    /// Slint's `Controller::reset_layout`.
+    pub fn reset_layout(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_visible = true;
+        self.preview_visible = true;
+        self.sidebar_width = onyx_config::DEFAULT_SIDEBAR_WIDTH;
+        self.preview_width = None;
+        self.pane_split_ratio = onyx_config::DEFAULT_PANE_SPLIT_RATIO;
+        self.collapsed_sidebar_groups.clear();
+        // A layout the user picked explicitly wins over a session that is still
+        // being restored by the bootstrap task.
+        self.layout_touched = true;
+        cx.notify();
+    }
+
+    /// Extracts the selected archive into `<active dir>/<stem>`.
+    pub fn extract_selection_to_folder(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.selected_entry() else {
+            return;
+        };
+        if !entry_is_archive(entry) {
+            self.status_message = Some("Select a .zip, .tar.gz or .tgz archive first.".to_string());
+            cx.notify();
+            return;
+        }
+        let archive_path = entry.path.clone();
+        let dest_dir = extract_folder_for(&archive_path);
+        self.start_operation(
+            FileOperation::ExtractArchive {
+                archive_path,
+                dest_dir,
+            },
+            cx,
+        );
+    }
+
+    /// Opens the archive browser for the selected archive.
+    pub fn browse_selected_archive(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.selected_entry() else {
+            return;
+        };
+        if !entry_is_archive(entry) {
+            self.status_message = Some("Select a .zip, .tar.gz or .tgz archive first.".to_string());
+            cx.notify();
+            return;
+        }
+        let path = entry.path.clone();
+        self.open_archive_browser(path, cx);
+    }
+
     // ---- Internal drag & drop (Stage 3B) ----
 
     /// Starts a potential drag on mouse-down; it only arms after the threshold.
@@ -3670,6 +3720,11 @@ impl OnyxExplorer {
             "copy-path" => self.copy_active_path(cx),
             "properties" => self.show_properties(cx),
             "terminal" => self.open_terminal(cx),
+            "reset-layout" => self.reset_layout(cx),
+            "compress-zip" => self.compress_selection_to_zip(cx),
+            "extract-here" => self.extract_selected_archive(cx),
+            "extract-to-folder" => self.extract_selection_to_folder(cx),
+            "browse-archive" => self.browse_selected_archive(cx),
             _ => {}
         }
     }
