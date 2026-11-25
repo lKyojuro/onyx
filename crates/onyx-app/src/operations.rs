@@ -627,7 +627,10 @@ impl Controller {
 
         ui.set_status_message("Drag the selection into another application.".into());
         post(&self.ui, move |app, ui| {
-            let result = onyx_windows::start_external_file_drag(&paths);
+            // This frontend starts the drag from a toolbar action, so there is no
+            // client-area point of a dragged item to snapshot; the drag runs with the
+            // default cursor instead of a picture of the toolbar button.
+            let result = onyx_windows::start_external_file_drag(&paths, None);
             app.state.borrow_mut().external_drag_active = false;
             let message = match result {
                 Ok(DragOutcome::Copied) => "Dragged selection copied.".into(),

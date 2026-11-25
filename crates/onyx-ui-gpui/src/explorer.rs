@@ -53,8 +53,8 @@ use onyx_operations::{
 use onyx_preview::{PreviewEngine, ThumbnailEngine, is_thumbnail_supported};
 use onyx_search::{SearchIndex, SearchQuery, SearchResult, UnifiedSearchEngine};
 use onyx_windows::{
-    DragOutcome, RgbaIcon, TerminalProfile, enumerate_drives, enumerate_known_folders,
-    extract_file_icon_rgba, extract_path_icon_rgba, get_clipboard_files,
+    DragImageSource, DragOutcome, RgbaIcon, TerminalProfile, enumerate_drives,
+    enumerate_known_folders, extract_file_icon_rgba, extract_path_icon_rgba, get_clipboard_files,
     launch_terminal_with_profile, open_file, open_with_dialog, set_clipboard_files,
     show_context_menu, show_properties_dialog, start_external_file_drag,
 };
@@ -4168,7 +4168,12 @@ impl OnyxExplorer {
     /// [`external_drag_watcher`], because GPUI's hit-tested `on_mouse_move`
     /// handlers stop firing at the window edge. The internal drag is dropped
     /// without touching the selection, so a cancelled drop behaves like `Escape`.
-    pub(crate) fn hand_drag_to_shell(&mut self, pointer: (f32, f32), cx: &mut Context<Self>) {
+    pub(crate) fn hand_drag_to_shell(
+        &mut self,
+        pointer: (f32, f32),
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         log_drag(format!(
             "handover pointer=({:.0},{:.0}) viewport=({:.0},{:.0}) drag={} armed={} external={}",
             pointer.0,
@@ -4191,7 +4196,10 @@ impl OnyxExplorer {
             return;
         };
         cx.notify();
-        self.start_external_drag(drag.source, cx);
+        // The pointer already left the client area, so the drag image is anchored
+        // at the point the drag started from: that is where the held item sits.
+        let drag_image = drag_image_source(window, drag.origin);
+        self.start_external_drag(drag.source, drag_image, cx);
     }
 
     /// Files another application drags into the window: remember them on
@@ -4258,7 +4266,12 @@ impl OnyxExplorer {
     /// `ReleaseCapture` only releases capture owned by the calling thread. A
     /// worker thread therefore hands the drag over and then waits forever for a
     /// release it never sees.
-    fn start_external_drag(&mut self, source: PathBuf, cx: &mut Context<Self>) {
+    fn start_external_drag(
+        &mut self,
+        source: PathBuf,
+        drag_image: Option<DragImageSource>,
+        cx: &mut Context<Self>,
+    ) {
         if self.external_drag_active {
             return;
         }
@@ -4266,8 +4279,8 @@ impl OnyxExplorer {
         self.status_message = Some("Drag the selection into another application.".to_string());
         cx.notify();
 
-        let result =
-            start_external_file_drag(std::slice::from_ref(&source)).map_err(|err| err.to_string());
+        let result = start_external_file_drag(std::slice::from_ref(&source), drag_image)
+            .map_err(|err| err.to_string());
         self.finish_external_drag(result, &source, cx);
     }
 
@@ -5310,13 +5323,14 @@ fn external_drag_watcher(cx: &mut Context<OnyxExplorer>) -> impl IntoElement {
         |_, _, _| (),
         move |_, (), window, _cx| {
             let drag_view = view.clone();
-            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
                 let pointer = (f32::from(event.position.x), f32::from(event.position.y));
-                let _ =
-                    drag_view.update(cx, |explorer, cx| explorer.hand_drag_to_shell(pointer, cx));
+                let _ = drag_view.update(cx, |explorer, cx| {
+                    explorer.hand_drag_to_shell(pointer, window, cx)
+                });
             });
             window.on_mouse_event(move |event: &FileDropEvent, phase, _window, cx| {
                 if phase != DispatchPhase::Bubble {
@@ -5363,6 +5377,17 @@ fn extract_window_hwnd(window: &Window) -> Option<isize> {
         RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
         _ => None,
     }
+}
+
+/// Turns a viewport point into the window handle plus client-area point Windows
+/// snapshots into the drag image of an external drag.
+fn drag_image_source(window: &Window, point: (f32, f32)) -> Option<DragImageSource> {
+    let hwnd = extract_window_hwnd(window)?;
+    Some(DragImageSource::new(
+        hwnd,
+        point.0.round() as i32,
+        point.1.round() as i32,
+    ))
 }
 
 pub(crate) fn same_path(first: &Path, second: &Path) -> bool {

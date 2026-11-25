@@ -2,36 +2,41 @@
 
 use crate::own_window;
 use onyx_core::{OnyxError, OnyxResult, normalize_display_path};
+use std::borrow::Cow;
 use std::ffi::{OsStr, OsString, c_void};
 use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, size_of};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::ptr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use windows::Win32::Foundation::{
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_DVASPECT,
-    DV_E_FORMATETC, DV_E_TYMED, E_NOTIMPL, E_POINTER, FALSE, GlobalFree, HGLOBAL, HWND, LPARAM,
-    LRESULT, OLE_E_ADVISENOTSUPPORTED, POINT, RPC_E_CHANGED_MODE, S_FALSE, S_OK, TRUE, WPARAM,
+    DV_E_FORMATETC, DV_E_TYMED, E_FAIL, E_NOTIMPL, E_POINTER, FALSE, GlobalFree, HGLOBAL, HWND,
+    LPARAM, LRESULT, OLE_E_ADVISENOTSUPPORTED, POINT, RPC_E_CHANGED_MODE, S_FALSE, S_OK, TRUE,
+    WPARAM,
 };
 use windows::Win32::System::Com::{
-    DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
-    IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
+    CLSCTX_INPROC_SERVER, CoCreateInstance, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink,
+    IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0,
+    TYMED_HGLOBAL,
 };
+use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{
-    GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalUnlock,
+    GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
 use windows::Win32::System::Ole::{
     CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE, DoDragDrop,
-    IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize,
+    IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize, ReleaseStgMedium,
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_RBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_LBUTTON};
 use windows::Win32::UI::Shell::{
-    DROPFILES, DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP,
-    RemoveWindowSubclass, SHCreateStdEnumFmtEtc, SetWindowSubclass,
+    CLSID_DragDropHelper, DROPFILES, DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW,
+    DragQueryPoint, HDROP, IDragSourceHelper, RemoveWindowSubclass, SHCreateStdEnumFmtEtc,
+    SetWindowSubclass,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, WM_DROPFILES, WM_NCDESTROY,
@@ -60,6 +65,31 @@ pub enum DragOutcome {
     Moved,
     /// Drag was cancelled or dropped with `DROPEFFECT_NONE`.
     Cancelled,
+}
+
+/// Window handle and client-area point an external drag starts from, used to let the shell
+/// snapshot a drag image.
+///
+/// Windows copies the window content under `(x, y)` into a translucent bitmap that follows the
+/// pointer, which is what makes the held item look like it is carried along instead of only
+/// showing the default drag cursor. Pass `None` to [`start_external_file_drag`] to keep the
+/// plain cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DragImageSource {
+    /// Handle of the window that renders the dragged item.
+    pub hwnd: isize,
+    /// Client-area X coordinate of the drag start point.
+    pub x: i32,
+    /// Client-area Y coordinate of the drag start point.
+    pub y: i32,
+}
+
+impl DragImageSource {
+    /// Builds a drag image source from a raw window handle and a client-area point.
+    #[must_use]
+    pub const fn new(hwnd: isize, x: i32, y: i32) -> Self {
+        Self { hwnd, x, y }
+    }
 }
 
 struct DropCallbackState {
@@ -478,8 +508,12 @@ impl Drop for OleGuard {
 }
 
 fn hdrop_formatetc() -> FORMATETC {
+    hglobal_formatetc(CF_HDROP.0)
+}
+
+fn hglobal_formatetc(cf_format: u16) -> FORMATETC {
     FORMATETC {
-        cfFormat: CF_HDROP.0,
+        cfFormat: cf_format,
         ptd: ptr::null_mut(),
         dwAspect: DVASPECT_CONTENT.0,
         lindex: -1,
@@ -487,8 +521,24 @@ fn hdrop_formatetc() -> FORMATETC {
     }
 }
 
+/// Clipboard format the shell's drag-drop helper stores the generated drag image under
+/// (`CFSTR_DRAGIMAGEBITS`), registered once per process.
+fn drag_image_format() -> u16 {
+    static FORMAT: OnceLock<u16> = OnceLock::new();
+    *FORMAT.get_or_init(|| {
+        // SAFETY: The literal is a valid null-terminated wide string; registering a clipboard
+        // format only returns its identifier and never touches the object being dragged.
+        let id = unsafe { RegisterClipboardFormatW(windows::core::w!("DragImageBits")) };
+        u16::try_from(id).unwrap_or(0)
+    })
+}
+
 fn matches_hdrop_format(fmt: &FORMATETC) -> Result<(), HRESULT> {
-    if fmt.cfFormat != CF_HDROP.0 {
+    matches_hglobal_format(fmt, CF_HDROP.0)
+}
+
+fn matches_hglobal_format(fmt: &FORMATETC, cf_format: u16) -> Result<(), HRESULT> {
+    if fmt.cfFormat != cf_format {
         return Err(DV_E_FORMATETC);
     }
     if (fmt.dwAspect & DVASPECT_CONTENT.0) == 0 {
@@ -540,6 +590,43 @@ impl IDropSource_Impl for FileDropSource_Impl {
 #[implement(IDataObject)]
 struct FileDataObject {
     hdrop_payload: Vec<u8>,
+    /// Drag image bitmap the shell's `IDragSourceHelper` writes back through `SetData`; served
+    /// again through `GetData` so the OLE drag loop can paint it.
+    drag_image_bits: Mutex<Option<Vec<u8>>>,
+}
+
+impl FileDataObject {
+    fn new(hdrop_payload: Vec<u8>) -> Self {
+        Self {
+            hdrop_payload,
+            drag_image_bits: Mutex::new(None),
+        }
+    }
+
+    fn drag_image_bytes(&self) -> Option<Vec<u8>> {
+        self.drag_image_bits
+            .lock()
+            .ok()
+            .and_then(|bits| bits.clone())
+    }
+}
+
+/// Copies the bytes of a `TYMED_HGLOBAL` medium out of global memory without taking ownership.
+fn read_hglobal_bytes(hglobal: HGLOBAL) -> Option<Vec<u8>> {
+    // SAFETY: `hglobal` is a global memory handle owned by the caller of `SetData`.
+    unsafe {
+        let size = GlobalSize(hglobal);
+        if size == 0 {
+            return None;
+        }
+        let locked = GlobalLock(hglobal).cast::<u8>();
+        if locked.is_null() {
+            return None;
+        }
+        let bytes = std::slice::from_raw_parts(locked, size).to_vec();
+        let _ = GlobalUnlock(hglobal);
+        Some(bytes)
+    }
 }
 
 impl IDataObject_Impl for FileDataObject_Impl {
@@ -549,11 +636,22 @@ impl IDataObject_Impl for FileDataObject_Impl {
         }
         // SAFETY: `pformatetcin` was verified non-null above.
         let fmt = unsafe { &*pformatetcin };
-        if let Err(hr) = matches_hdrop_format(fmt) {
-            return Err(hr.into());
-        }
+        let payload: Cow<'_, [u8]> = if fmt.cfFormat == drag_image_format() {
+            if let Err(hr) = matches_hglobal_format(fmt, fmt.cfFormat) {
+                return Err(hr.into());
+            }
+            match self.drag_image_bytes() {
+                Some(bits) => Cow::Owned(bits),
+                None => return Err(DV_E_FORMATETC.into()),
+            }
+        } else {
+            if let Err(hr) = matches_hdrop_format(fmt) {
+                return Err(hr.into());
+            }
+            Cow::Borrowed(&self.hdrop_payload)
+        };
 
-        let hglobal = alloc_hglobal_with_bytes(&self.hdrop_payload)?;
+        let hglobal = alloc_hglobal_with_bytes(&payload)?;
         Ok(STGMEDIUM {
             tymed: TYMED_HGLOBAL.0 as u32,
             u: STGMEDIUM_0 { hGlobal: hglobal },
@@ -575,6 +673,12 @@ impl IDataObject_Impl for FileDataObject_Impl {
         }
         // SAFETY: `pformatetc` was verified non-null above.
         let fmt = unsafe { &*pformatetc };
+        if fmt.cfFormat == drag_image_format()
+            && matches_hglobal_format(fmt, fmt.cfFormat).is_ok()
+            && self.drag_image_bytes().is_some()
+        {
+            return S_OK;
+        }
         match matches_hdrop_format(fmt) {
             Ok(()) => S_OK,
             Err(hr) => hr,
@@ -597,21 +701,52 @@ impl IDataObject_Impl for FileDataObject_Impl {
 
     fn SetData(
         &self,
-        _pformatetc: *const FORMATETC,
-        _pmedium: *const STGMEDIUM,
-        _frelease: BOOL,
+        pformatetc: *const FORMATETC,
+        pmedium: *const STGMEDIUM,
+        frelease: BOOL,
     ) -> windows::core::Result<()> {
-        Err(E_NOTIMPL.into())
+        if pformatetc.is_null() || pmedium.is_null() {
+            return Err(E_POINTER.into());
+        }
+        // SAFETY: Both pointers were verified non-null above and stay valid for the call.
+        let (fmt, medium) = unsafe { (&*pformatetc, &*pmedium) };
+        // SAFETY: `medium.tymed` is checked before `u.hGlobal` is read, so the union field holds a
+        // global memory handle at that point.
+        let bytes = unsafe {
+            (fmt.cfFormat == drag_image_format()
+                && medium.tymed == TYMED_HGLOBAL.0 as u32
+                && !medium.u.hGlobal.is_invalid())
+            .then(|| read_hglobal_bytes(medium.u.hGlobal))
+            .flatten()
+        };
+        if frelease.as_bool() {
+            // SAFETY: `frelease == TRUE` hands ownership of the medium to this method, which
+            // therefore releases it after the bytes were copied.
+            unsafe {
+                let mut owned = ptr::read(pmedium);
+                ReleaseStgMedium(&raw mut owned);
+            }
+        }
+        let Some(bytes) = bytes else {
+            return Err(E_NOTIMPL.into());
+        };
+        match self.drag_image_bits.lock() {
+            Ok(mut slot) => *slot = Some(bytes),
+            Err(_) => return Err(E_FAIL.into()),
+        }
+        Ok(())
     }
 
     fn EnumFormatEtc(&self, dwdirection: u32) -> windows::core::Result<IEnumFORMATETC> {
-        if dwdirection == (DATADIR_GET.0 as u32) {
-            let formats = [hdrop_formatetc()];
-            // SAFETY: `formats` is a valid slice of `FORMATETC` structs copied by `SHCreateStdEnumFmtEtc`.
-            unsafe { SHCreateStdEnumFmtEtc(&formats) }
-        } else {
-            Err(E_NOTIMPL.into())
+        if dwdirection != (DATADIR_GET.0 as u32) {
+            return Err(E_NOTIMPL.into());
         }
+        let mut formats = vec![hdrop_formatetc()];
+        if self.drag_image_bytes().is_some() {
+            formats.push(hglobal_formatetc(drag_image_format()));
+        }
+        // SAFETY: `formats` is a valid slice of `FORMATETC` structs copied by `SHCreateStdEnumFmtEtc`.
+        unsafe { SHCreateStdEnumFmtEtc(&formats) }
     }
 
     fn DAdvise(
@@ -632,11 +767,44 @@ impl IDataObject_Impl for FileDataObject_Impl {
     }
 }
 
+/// Lets the shell's drag-drop helper snapshot the window area under `source` into the drag image
+/// of `data_object`.
+///
+/// Must be called on the STA thread that already initialized OLE, before `DoDragDrop` runs.
+fn attach_drag_image(source: DragImageSource, data_object: &IDataObject) -> OnyxResult<()> {
+    let window = own_window(source.hwnd)?;
+    // SAFETY: `CLSID_DragDropHelper` is an in-process COM class created on the calling STA
+    // thread, which the caller initialized via `OleGuard`.
+    let helper: IDragSourceHelper =
+        unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) }.map_err(
+            |error| OnyxError::Platform {
+                message: format!("IDragSourceHelper is unavailable: {error}"),
+            },
+        )?;
+    let point = POINT {
+        x: source.x,
+        y: source.y,
+    };
+    // SAFETY: `own_window` verified that `window` belongs to this process, `point` stays alive
+    // for the whole call, and `data_object` is a valid COM interface the helper only reads from.
+    unsafe { helper.InitializeFromWindow(Some(window), Some(&raw const point), data_object) }
+        .map_err(|error| OnyxError::Platform {
+            message: format!("drag image initialization failed: {error}"),
+        })
+}
+
 /// Initiates an outbound synchronous Windows OLE drag-and-drop loop for `paths` using a
 /// `CF_HDROP` [`IDataObject`] and [`IDropSource`].
 ///
+/// `drag_image` optionally names the window and client-area point the drag starts from; Windows
+/// then snapshots that area into a bitmap that follows the pointer. Without it the drag runs with
+/// the default cursor only.
+///
 /// Must be called on an STA thread (typically the UI thread when a pointer drag threshold is crossed).
-pub fn start_external_file_drag(paths: &[PathBuf]) -> OnyxResult<DragOutcome> {
+pub fn start_external_file_drag(
+    paths: &[PathBuf],
+    drag_image: Option<DragImageSource>,
+) -> OnyxResult<DragOutcome> {
     let hdrop_payload = encode_cf_hdrop(paths)?;
     let _ole = OleGuard::init()?;
     // SAFETY: VK_LBUTTON is a valid virtual-key code and this call reads the current input state.
@@ -647,7 +815,14 @@ pub fn start_external_file_drag(paths: &[PathBuf]) -> OnyxResult<DragOutcome> {
     // owned by this thread, allowing OLE to take over the active drag.
     let _ = unsafe { ReleaseCapture() };
 
-    let data_object: IDataObject = FileDataObject { hdrop_payload }.into();
+    let data_object: IDataObject = FileDataObject::new(hdrop_payload).into();
+    // The drag image is purely cosmetic, so a helper that cannot snapshot the window must not
+    // stop the drag itself.
+    if let Some(source) = drag_image
+        && let Err(error) = attach_drag_image(source, &data_object)
+    {
+        tracing::debug!(%error, "starting the external drag without a drag image");
+    }
     let drop_source: IDropSource = FileDropSource.into();
     let mut effect = DROPEFFECT_NONE;
 
@@ -700,9 +875,69 @@ mod tests {
             Err(OnyxError::InvalidPath { .. })
         ));
         assert!(matches!(
-            start_external_file_drag(&[]),
+            start_external_file_drag(&[], None),
             Err(OnyxError::InvalidPath { .. })
         ));
+        assert!(matches!(
+            start_external_file_drag(&[], Some(DragImageSource::new(0, 0, 0))),
+            Err(OnyxError::InvalidPath { .. })
+        ));
+    }
+
+    #[test]
+    fn drag_image_rejects_a_foreign_window() {
+        let payload = encode_cf_hdrop(&[PathBuf::from("C:\\temp\\dragged.txt")]).unwrap();
+        let data_object: IDataObject = FileDataObject::new(payload).into();
+        let _ole = OleGuard::init().expect("OLE should initialize on this test thread");
+
+        let result = attach_drag_image(DragImageSource::new(0, 10, 20), &data_object);
+        assert!(matches!(result, Err(OnyxError::Platform { .. })));
+    }
+
+    #[test]
+    fn data_object_stores_the_drag_image_bits() {
+        let payload = encode_cf_hdrop(&[PathBuf::from("C:\\temp\\dragged.txt")]).unwrap();
+        let data_object: IDataObject = FileDataObject::new(payload).into();
+        let fmt = hglobal_formatetc(drag_image_format());
+        // The helper only offers the image format after `SetData` stored one.
+        // SAFETY: `fmt` is a valid `FORMATETC` pointer.
+        assert_eq!(
+            unsafe { data_object.QueryGetData(&raw const fmt) },
+            DV_E_FORMATETC
+        );
+
+        let image_bits = vec![0x5A_u8; 64];
+        let mut medium = STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 {
+                hGlobal: alloc_hglobal_with_bytes(&image_bits).unwrap(),
+            },
+            pUnkForRelease: ManuallyDrop::new(None),
+        };
+        // SAFETY: `fmt` and `medium` are valid pointers, and `false` keeps their ownership here.
+        unsafe { data_object.SetData(&raw const fmt, &raw const medium, false) }
+            .expect("the drag image bits should be accepted");
+        // SAFETY: `medium` was not transferred (`fRelease == FALSE`), so it is freed here.
+        unsafe { ReleaseStgMedium(&raw mut medium) };
+
+        // SAFETY: `fmt` is a valid `FORMATETC` pointer.
+        assert_eq!(unsafe { data_object.QueryGetData(&raw const fmt) }, S_OK);
+
+        // SAFETY: `fmt` is valid; the returned `STGMEDIUM` is freed via `ReleaseStgMedium` below.
+        let mut served = unsafe { data_object.GetData(&raw const fmt) }.unwrap();
+        // SAFETY: `served` has `tymed == TYMED_HGLOBAL`, so its `u.hGlobal` can be locked and read.
+        let decoded = unsafe {
+            let hglobal = served.u.hGlobal;
+            let size = GlobalSize(hglobal);
+            let ptr = GlobalLock(hglobal).cast::<u8>();
+            assert!(!ptr.is_null());
+            let slice = std::slice::from_raw_parts(ptr, size);
+            let decoded = slice.to_vec();
+            let _ = GlobalUnlock(hglobal);
+            ReleaseStgMedium(&raw mut served);
+            decoded
+        };
+        assert_eq!(decoded, image_bits);
     }
 
     #[test]
@@ -732,10 +967,7 @@ mod tests {
         let paths = vec![file_a, file_b];
 
         let payload = encode_cf_hdrop(&paths).unwrap();
-        let data_object: IDataObject = FileDataObject {
-            hdrop_payload: payload,
-        }
-        .into();
+        let data_object: IDataObject = FileDataObject::new(payload).into();
 
         let fmt = hdrop_formatetc();
         // SAFETY: `fmt` is a valid `FORMATETC` pointer.

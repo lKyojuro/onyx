@@ -22,7 +22,7 @@ pub use com::ComGuard;
 pub use console::attach_parent_console;
 pub use context_menu::show_context_menu;
 pub use dnd::{
-    DragOutcome, DropEvent, DropTargetGuard, decode_cf_hdrop, encode_cf_hdrop,
+    DragImageSource, DragOutcome, DropEvent, DropTargetGuard, decode_cf_hdrop, encode_cf_hdrop,
     register_file_drop_target, start_external_file_drag,
 };
 pub use drives::{enumerate_drives, free_disk_space};
