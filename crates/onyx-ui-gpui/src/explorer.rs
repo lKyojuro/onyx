@@ -17,10 +17,10 @@ use crate::components::{
 use crate::icons::{ShellIconStore, entry_icon_key, path_icon_key, rgba_pixels_to_render_image};
 use crate::theme::OnyxTheme;
 use gpui_kit::{
-    AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point, Render, RenderImage, ScrollEvent, ScrollHandle, Styled, Subscription,
-    UniformListScrollHandle, Window,
+    AppContext, ClipboardItem, Context, DispatchPhase, Entity, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, Render, RenderImage, ScrollEvent, ScrollHandle, Styled,
+    Subscription, UniformListScrollHandle, Window, canvas,
     component::input::{InputEvent, InputState},
     div, point, px,
 };
@@ -45,9 +45,10 @@ use onyx_operations::{
 };
 use onyx_preview::{PreviewEngine, ThumbnailEngine, is_thumbnail_supported};
 use onyx_windows::{
-    RgbaIcon, TerminalProfile, enumerate_drives, enumerate_known_folders, extract_file_icon_rgba,
-    extract_path_icon_rgba, get_clipboard_files, launch_terminal_with_profile, open_file,
-    open_with_dialog, set_clipboard_files, show_context_menu, show_properties_dialog,
+    DragOutcome, RgbaIcon, TerminalProfile, enumerate_drives, enumerate_known_folders,
+    extract_file_icon_rgba, extract_path_icon_rgba, get_clipboard_files,
+    launch_terminal_with_profile, open_file, open_with_dialog, set_clipboard_files,
+    show_context_menu, show_properties_dialog, start_external_file_drag,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -513,6 +514,9 @@ pub struct OnyxExplorer {
     archive_generation: GenerationId,
     archive_cancel: CancellationToken,
     pub(crate) drag: Option<DragState>,
+    /// Set while the OLE drag loop runs on its own STA thread, so pointer
+    /// crossings of the window edge cannot start a second drag.
+    external_drag_active: bool,
     /// Last painted viewport size, used for layout clamping and session persistence.
     pub(crate) viewport_size: (f32, f32),
     watch_cmd_tx: mpsc::UnboundedSender<PathBuf>,
@@ -717,6 +721,7 @@ impl OnyxExplorer {
             archive_generation: GenerationId::new(0),
             archive_cancel: CancellationToken::new(),
             drag: None,
+            external_drag_active: false,
             viewport_size: (1320.0, 820.0),
             watch_cmd_tx,
             watched_path: None,
@@ -3634,6 +3639,110 @@ impl OnyxExplorer {
             .is_some_and(|drag| drag.armed && drag.hover.as_ref() == Some(&DropTarget::Pane(pane)))
     }
 
+    // ---- External drag & drop (OLE `DoDragDrop` out of the window) ----
+
+    /// Hands the armed drag over to the shell once the pointer has left the
+    /// window, so items can be dropped into Explorer, the desktop or Outlook.
+    ///
+    /// Callers reach this through the raw window mouse listener of
+    /// [`external_drag_watcher`], because GPUI's hit-tested `on_mouse_move`
+    /// handlers stop firing at the window edge. The internal drag is dropped
+    /// without touching the selection, so a cancelled drop behaves like `Escape`.
+    pub(crate) fn hand_drag_to_shell(&mut self, pointer: (f32, f32), cx: &mut Context<Self>) {
+        if !drag_drop::should_start_external_drag(
+            self.drag.as_ref(),
+            self.external_drag_active,
+            pointer,
+            self.viewport_size,
+        ) {
+            return;
+        }
+        let Some(drag) = self.drag.take() else {
+            return;
+        };
+        cx.notify();
+        self.start_external_drag(drag.source, cx);
+    }
+
+    /// Runs OLE `DoDragDrop` for one dragged item on a dedicated STA thread.
+    fn start_external_drag(&mut self, source: PathBuf, cx: &mut Context<Self>) {
+        if self.external_drag_active {
+            return;
+        }
+        self.external_drag_active = true;
+        self.status_message = Some("Drag the selection into another application.".to_string());
+        cx.notify();
+
+        let paths = vec![source.clone()];
+        let (tx, rx) = oneshot::channel::<Result<DragOutcome, String>>();
+
+        // `start_external_file_drag` blocks in `DoDragDrop` until the drop target
+        // answers and needs a fresh STA thread, so it runs off the UI thread like
+        // the native shell context menu does.
+        let spawn_res = std::thread::Builder::new()
+            .name("onyx-external-drag".to_string())
+            .spawn(move || {
+                let res = start_external_file_drag(&paths).map_err(|err| err.to_string());
+                let _ = tx.send(res);
+            });
+
+        if let Err(err) = spawn_res {
+            self.external_drag_active = false;
+            self.status_message = Some(format!("Failed to start the external drag: {err}"));
+            cx.notify();
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else {
+                // The drag thread died without reporting, so the guard has to be
+                // released here or no further external drag would ever start.
+                let _ = this.update(cx, |explorer, cx| {
+                    explorer.external_drag_active = false;
+                    explorer.status_message = Some("The external drag aborted.".to_string());
+                    cx.notify();
+                });
+                return;
+            };
+            let _ = this.update(cx, |explorer, cx| {
+                explorer.finish_external_drag(result, &source, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Reports the OLE outcome and keeps the panes in sync with the shell.
+    fn finish_external_drag(
+        &mut self,
+        result: Result<DragOutcome, String>,
+        source: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        self.external_drag_active = false;
+        let mut affected = Vec::new();
+        add_parent(&mut affected, source);
+
+        let message = match result {
+            Ok(DragOutcome::Moved) => {
+                // A `CF_HDROP` target performs the move itself, so the source is
+                // normally gone already. A source that survived was only copied by
+                // the target and is removed through the operations engine, which
+                // never deletes permanently.
+                if source.exists() {
+                    self.start_operation(FileOperation::Recycle(source.to_path_buf()), cx);
+                } else {
+                    self.refresh_affected_paths(&affected, cx);
+                }
+                "Dragged selection moved.".to_string()
+            }
+            Ok(DragOutcome::Copied) => "Dragged selection copied.".to_string(),
+            Ok(DragOutcome::Cancelled) => "External drag cancelled.".to_string(),
+            Err(message) => format!("External drag failed: {message}"),
+        };
+        self.status_message = Some(message);
+        cx.notify();
+    }
+
     // ---- Command Palette & Settings overlays (Stage 3A) ----
 
     /// Reports whether a blocking overlay owns the keyboard right now.
@@ -4315,7 +4424,16 @@ impl Render for OnyxExplorer {
             .child(nav_bar::render_nav_bar(self, window, cx))
             .child(toolbar::render_toolbar(self, window, cx))
             .child(workspace)
-            .child(status_bar::render_status_bar(self, cx));
+            .child(status_bar::render_status_bar(self, cx))
+            // Zero-sized, so it only registers the pointer listener that turns a
+            // drag leaving the window into a native OLE drag.
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .child(external_drag_watcher(cx)),
+            );
 
         if let Some(suggestions_overlay) = nav_bar::render_address_suggestions_overlay(self, cx) {
             root = root.child(suggestions_overlay);
@@ -4399,6 +4517,29 @@ fn spawn_directory_watcher(
     .detach();
 
     cmd_tx
+}
+
+/// Registers a raw window mouse listener that hands an armed drag to the shell
+/// as soon as the pointer leaves the window.
+///
+/// `Window::on_mouse_event` is not gated by hit testing, so it still sees the
+/// out-of-bounds positions Windows reports while the left button is held; the
+/// hit-tested `on_mouse_move` handlers of the panes do not.
+fn external_drag_watcher(cx: &mut Context<OnyxExplorer>) -> impl IntoElement {
+    let view = cx.weak_entity();
+    canvas(
+        |_, _, _| (),
+        move |_, (), window, _cx| {
+            let view = view.clone();
+            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                let pointer = (f32::from(event.position.x), f32::from(event.position.y));
+                let _ = view.update(cx, |explorer, cx| explorer.hand_drag_to_shell(pointer, cx));
+            });
+        },
+    )
 }
 
 fn extract_window_hwnd(window: &Window) -> Option<isize> {
