@@ -24,6 +24,8 @@ fn sample_entries() -> Vec<UiFileEntry> {
             selected: false,
             icon: Image::default(),
             has_icon: false,
+            thumbnail: Image::default(),
+            has_thumbnail: false,
         },
         UiFileEntry {
             path: "D:\\Onyx\\assets".into(),
@@ -37,6 +39,8 @@ fn sample_entries() -> Vec<UiFileEntry> {
             selected: false,
             icon: Image::default(),
             has_icon: false,
+            thumbnail: Image::default(),
+            has_thumbnail: false,
         },
         UiFileEntry {
             path: "D:\\Onyx\\AGENTS.md".into(),
@@ -50,6 +54,8 @@ fn sample_entries() -> Vec<UiFileEntry> {
             selected: true,
             icon: Image::default(),
             has_icon: false,
+            thumbnail: Image::default(),
+            has_thumbnail: false,
         },
         UiFileEntry {
             path: "D:\\Onyx\\Cargo.toml".into(),
@@ -63,6 +69,8 @@ fn sample_entries() -> Vec<UiFileEntry> {
             selected: false,
             icon: Image::default(),
             has_icon: false,
+            thumbnail: Image::default(),
+            has_thumbnail: false,
         },
         UiFileEntry {
             path: "D:\\Onyx\\README.md".into(),
@@ -76,6 +84,8 @@ fn sample_entries() -> Vec<UiFileEntry> {
             selected: false,
             icon: Image::default(),
             has_icon: false,
+            thumbnail: Image::default(),
+            has_thumbnail: false,
         },
         UiFileEntry {
             path: "D:\\Onyx\\onyx-link".into(),
@@ -89,6 +99,8 @@ fn sample_entries() -> Vec<UiFileEntry> {
             selected: false,
             icon: Image::default(),
             has_icon: false,
+            thumbnail: Image::default(),
+            has_thumbnail: false,
         },
         UiFileEntry {
             path: "D:\\Onyx\\.gitignore".into(),
@@ -102,6 +114,8 @@ fn sample_entries() -> Vec<UiFileEntry> {
             selected: false,
             icon: Image::default(),
             has_icon: false,
+            thumbnail: Image::default(),
+            has_thumbnail: false,
         },
     ]
 }

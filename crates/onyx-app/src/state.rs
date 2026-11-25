@@ -2,22 +2,28 @@ use onyx_cache::{DirectoryCache, IconCache};
 use onyx_config::{AppConfig, ConfigStore, SessionState};
 use onyx_core::{FileEntry, GenerationId, PaneId, TabManager, TabState, ThemeMode};
 use onyx_operations::FileOperationsEngine;
-use onyx_search::UnifiedSearchEngine;
+use onyx_preview::ThumbnailEngine;
+use onyx_search::{IncrementalIndexer, SearchIndex, UnifiedSearchEngine};
 use onyx_ui::UiFileEntry;
+use onyx_windows::DropTargetGuard;
 use slint::VecModel;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::operations::Prompt;
 
+/// Maximum number of root directories watched concurrently by [`IncrementalIndexer`].
+pub(crate) const MAX_WATCHED_INDEX_ROOTS: usize = 8;
+
 #[derive(Default)]
 pub(crate) struct Pane {
     pub generation: GenerationId,
     pub cancel: CancellationToken,
+    pub thumb_cancel: CancellationToken,
     pub entries: Vec<FileEntry>,
     pub model: Rc<VecModel<UiFileEntry>>,
     pub loading: bool,
@@ -29,11 +35,19 @@ pub(crate) struct Pane {
 impl Pane {
     pub fn restart(&mut self) -> (GenerationId, CancellationToken) {
         self.cancel.cancel();
+        self.thumb_cancel.cancel();
         self.generation = self.generation.next();
         self.cancel = CancellationToken::new();
+        self.thumb_cancel = self.cancel.child_token();
         self.loading = true;
         self.error.clear();
         (self.generation, self.cancel.clone())
+    }
+
+    pub fn restart_thumbnails(&mut self) -> (GenerationId, CancellationToken) {
+        self.thumb_cancel.cancel();
+        self.thumb_cancel = self.cancel.child_token();
+        (self.generation, self.thumb_cancel.clone())
     }
 }
 
@@ -51,9 +65,13 @@ pub(crate) struct State {
     pub icons: IconCache,
     pub pending_icons: HashSet<String>,
     pub missing_icons: HashSet<String>,
+    pub thumbnails: ThumbnailEngine,
     pub preview_cancel: CancellationToken,
     pub preview_path: Option<PathBuf>,
     pub search: UnifiedSearchEngine,
+    pub search_index: Option<Arc<Mutex<SearchIndex>>>,
+    pub incremental_indexer: Option<Arc<IncrementalIndexer>>,
+    pub watched_index_roots: VecDeque<PathBuf>,
     pub index_path: PathBuf,
     pub indexed_search: bool,
     pub indexed_roots: HashSet<PathBuf>,
@@ -61,6 +79,9 @@ pub(crate) struct State {
     pub operations: Arc<FileOperationsEngine>,
     pub operation: Option<(CancellationToken, JoinHandle<()>)>,
     pub prompt: Option<Prompt>,
+    pub archive_path: Option<PathBuf>,
+    pub archive_cancel: CancellationToken,
+    pub drop_target: Option<DropTargetGuard>,
 }
 
 impl State {
@@ -104,9 +125,13 @@ impl State {
             icons: IconCache::default(),
             pending_icons: HashSet::new(),
             missing_icons: HashSet::new(),
+            thumbnails: ThumbnailEngine::new(),
             preview_cancel: CancellationToken::new(),
             preview_path: None,
             search: UnifiedSearchEngine::live_only(),
+            search_index: None,
+            incremental_indexer: None,
+            watched_index_roots: VecDeque::new(),
             index_path,
             indexed_search: false,
             indexed_roots: HashSet::new(),
@@ -114,6 +139,9 @@ impl State {
             operations: Arc::new(FileOperationsEngine::new()),
             operation: None,
             prompt: None,
+            archive_path: None,
+            archive_cancel: CancellationToken::new(),
+            drop_target: None,
         }
     }
 
@@ -151,10 +179,24 @@ impl State {
             .find(|entry| &entry.path == path)
     }
 
+    pub fn selected_paths(&self, pane: PaneId) -> Vec<PathBuf> {
+        self.tab(pane)
+            .map(|tab| tab.selected_paths.clone())
+            .unwrap_or_default()
+    }
+
     pub fn visible_panes(&self) -> impl Iterator<Item = PaneId> + use<> {
         [PaneId::Primary, PaneId::Secondary]
             .into_iter()
             .take(if self.dual { 2 } else { 1 })
+    }
+
+    pub fn index_exclusions(&self) -> Vec<PathBuf> {
+        let mut exclusions = self.config.excluded_index_dirs.clone();
+        if let Some(cache_dir) = self.index_path.parent() {
+            exclusions.push(cache_dir.to_path_buf());
+        }
+        exclusions
     }
 
     pub fn session(&self, width: u32, height: u32) -> SessionState {
@@ -172,6 +214,12 @@ impl State {
             window_height: height,
         }
     }
+}
+
+pub(crate) fn is_zip_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
 }
 
 pub(crate) const fn pane_number(pane: PaneId) -> usize {
@@ -193,5 +241,44 @@ pub(crate) fn effective_theme(theme: ThemeMode) -> ThemeMode {
     match theme {
         ThemeMode::System => onyx_windows::detect_system_theme(),
         explicit => explicit,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pane_restart_and_thumbnail_cancellation_track_generations() {
+        let mut pane = Pane::default();
+        let (g1, c1) = pane.restart();
+        assert_eq!(g1, GenerationId::new(1));
+        assert!(!c1.is_cancelled());
+
+        let (tg1, tc1) = pane.restart_thumbnails();
+        assert_eq!(tg1, g1);
+        assert!(!tc1.is_cancelled());
+
+        // Restarting thumbnails cancels prior thumbnail token without cancelling directory load.
+        let (tg2, tc2) = pane.restart_thumbnails();
+        assert_eq!(tg2, g1);
+        assert!(tc1.is_cancelled());
+        assert!(!c1.is_cancelled());
+        assert!(!tc2.is_cancelled());
+
+        // Restarting the pane increments generation and cancels both directory and thumbnail tokens.
+        let (g2, c2) = pane.restart();
+        assert_eq!(g2, GenerationId::new(2));
+        assert!(c1.is_cancelled());
+        assert!(tc2.is_cancelled());
+        assert!(!c2.is_cancelled());
+    }
+
+    #[test]
+    fn zip_extension_detection_is_case_insensitive() {
+        assert!(is_zip_path(Path::new(r"C:\archive.zip")));
+        assert!(is_zip_path(Path::new(r"C:\ARCHIVE.ZIP")));
+        assert!(!is_zip_path(Path::new(r"C:\archive.tar.gz")));
+        assert!(!is_zip_path(Path::new(r"C:\zip")));
     }
 }

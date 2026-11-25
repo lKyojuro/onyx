@@ -1,24 +1,29 @@
 use onyx_cache::RgbaImageData;
+use onyx_config::AppConfig;
 use onyx_core::{
     DriveInfo, FileEntry, KnownFolder, KnownFolderKind, PaneId, SortColumn, SortDirection,
-    ViewMode, build_breadcrumbs, format_bytes, format_timestamp, normalize_display_path,
+    ThemeMode, ViewMode, build_breadcrumbs, format_bytes, format_timestamp, normalize_display_path,
 };
-use onyx_preview::PreviewContent;
+use onyx_operations::ArchiveEntry;
+use onyx_preview::{PreviewContent, ThumbnailImage, is_thumbnail_supported};
 use onyx_ui::{
-    OnyxTheme, OnyxWindow, UiBreadcrumb, UiDriveItem, UiFileEntry, UiMetadataRow, UiSidebarItem,
-    UiTabItem,
+    OnyxTheme, OnyxWindow, UiArchiveEntry, UiBreadcrumb, UiDriveItem, UiFileEntry, UiMetadataRow,
+    UiSidebarItem, UiTabItem,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use slint::{ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
+use slint::{
+    ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel,
+};
 use std::{collections::HashMap, path::Path};
 
-use crate::state::{State, pane_number};
+use crate::content::THUMBNAIL_TARGET_PX;
+use crate::state::{State, is_zip_path, pane_number};
 
 pub(crate) fn model<T: Clone + 'static>(items: impl IntoIterator<Item = T>) -> ModelRc<T> {
     ModelRc::new(VecModel::from_iter(items))
 }
 
-pub(crate) fn display_path(path: &Path) -> slint::SharedString {
+pub(crate) fn display_path(path: &Path) -> SharedString {
     normalize_display_path(path).into()
 }
 
@@ -117,6 +122,24 @@ pub(crate) fn drives(ui: &OnyxWindow, drives: Vec<DriveInfo>) {
     })));
 }
 
+pub(crate) fn settings(ui: &OnyxWindow, config: &AppConfig) {
+    let theme_mode = match config.theme {
+        ThemeMode::Dark => 0,
+        ThemeMode::Light => 1,
+        ThemeMode::System => 2,
+    };
+    ui.set_settings_theme_mode(theme_mode);
+    ui.set_settings_default_view(i32::from(config.default_view == ViewMode::Grid));
+    ui.set_settings_show_hidden(config.show_hidden);
+    ui.set_settings_show_system(config.show_system);
+    ui.set_settings_show_preview(config.show_preview_pane);
+    ui.set_settings_dual_pane_default(config.dual_pane_default);
+    ui.set_settings_default_terminal(config.normalized_terminal().into());
+    ui.set_settings_excluded_dirs(model(
+        config.excluded_index_dirs.iter().map(|p| display_path(p)),
+    ));
+}
+
 pub(crate) fn chrome(ui: &OnyxWindow, state: &State) {
     ui.set_tabs(model(state.tabs.tabs().iter().enumerate().map(
         |(index, tab)| UiTabItem {
@@ -162,6 +185,7 @@ pub(crate) fn chrome(ui: &OnyxWindow, state: &State) {
     ui.set_view_mode(i32::from(state.config.default_view == ViewMode::Grid));
     ui.set_show_hidden(state.config.show_hidden);
     ui.set_indexed_search(state.indexed_search);
+    settings(ui, &state.config);
 }
 
 pub(crate) fn same_path(first: &Path, second: &Path) -> bool {
@@ -198,6 +222,12 @@ pub(crate) fn rgba_image(data: &RgbaImageData) -> Image {
     ))
 }
 
+pub(crate) fn thumbnail_image(img: &ThumbnailImage) -> Image {
+    Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+        &img.rgba, img.width, img.height,
+    ))
+}
+
 pub(crate) fn rows(state: &State, id: PaneId) {
     let pane = state.pane(id);
     pane.model
@@ -210,12 +240,25 @@ pub(crate) fn file_rows<'a>(
     entries: &'a [FileEntry],
 ) -> impl Iterator<Item = UiFileEntry> + 'a {
     let selected = state.tab(id).and_then(|tab| tab.selected_paths.first());
+    let grid_mode = state.config.default_view == ViewMode::Grid;
     let mut images = HashMap::new();
     entries.iter().map(move |entry| {
         let key = icon_key(entry);
         let icon = images
             .entry(key.clone())
             .or_insert_with(|| state.icons.get(&key).as_ref().map(rgba_image));
+        let cached_thumb = if grid_mode
+            && !entry.is_dir()
+            && is_thumbnail_supported(&entry.path)
+            && let Some(modified_secs) = entry.modified
+        {
+            state
+                .thumbnails
+                .get_cached(&entry.path, modified_secs, entry.size, THUMBNAIL_TARGET_PX)
+                .map(|img| thumbnail_image(&img))
+        } else {
+            None
+        };
         UiFileEntry {
             path: display_path(&entry.path),
             name: entry.name.as_str().into(),
@@ -232,6 +275,8 @@ pub(crate) fn file_rows<'a>(
             selected: selected == Some(&entry.path),
             has_icon: icon.is_some(),
             icon: icon.clone().unwrap_or_default(),
+            has_thumbnail: cached_thumb.is_some(),
+            thumbnail: cached_thumb.unwrap_or_default(),
         }
     })
 }
@@ -297,6 +342,7 @@ pub(crate) fn status(ui: &OnyxWindow, state: &State) {
     });
     let selected = state.selected(state.active);
     ui.set_has_selection(selected.is_some());
+    ui.set_has_archive_selection(selected.is_some_and(|e| !e.is_dir() && is_zip_path(&e.path)));
     ui.set_status_selection_text(selected.map_or_else(Default::default, |entry| {
         if entry.is_dir() {
             "1 selected".into()
@@ -311,6 +357,32 @@ pub(crate) fn status(ui: &OnyxWindow, state: &State) {
     } else {
         format!("{count} matches").into()
     });
+}
+
+pub(crate) fn archive_entries(entries: &[ArchiveEntry]) -> ModelRc<UiArchiveEntry> {
+    model(entries.iter().map(|entry| {
+        let rel = entry.relative_path.to_string_lossy().replace('\\', "/");
+        UiArchiveEntry {
+            name: entry.name.as_str().into(),
+            relative_path: if entry.is_dir {
+                format!("{rel}/").into()
+            } else {
+                rel.into()
+            },
+            size_label: if entry.is_dir {
+                "".into()
+            } else {
+                format_bytes(entry.size).into()
+            },
+            compressed_label: if entry.is_dir {
+                "".into()
+            } else {
+                format_bytes(entry.compressed_size).into()
+            },
+            is_dir: entry.is_dir,
+            modified: format_timestamp(entry.modified.map(|dt| dt.timestamp())).into(),
+        }
+    }))
 }
 
 pub(crate) fn reset_preview(ui: &OnyxWindow, entry: Option<&FileEntry>) {

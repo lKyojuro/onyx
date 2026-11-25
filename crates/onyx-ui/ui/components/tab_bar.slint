@@ -6,6 +6,12 @@ import { OnyxIcon, OnyxIconSize } from "icons.slint";
 export component TabBar inherits Rectangle {
     in property <[UiTabItem]> tabs;
     in property <bool> dual-pane: false;
+    in property <bool> dragging-active: false;
+    in property <length> drag-x: 0px;
+    in property <length> drag-y: 0px;
+    in property <string> drag-source-dir: "";
+    in-out property <string> drag-hover-tab-path: "";
+    in-out property <string> drag-hover-tab-title: "";
 
     callback new-tab();
     callback close-tab(int);
@@ -65,16 +71,38 @@ export component TabBar inherits Rectangle {
             accessible-label: "Open tabs";
 
             for tab[idx] in root.tabs : Rectangle {
+                property <bool> is-drop-hovered: root.dragging-active
+                    && tab.path != ""
+                    && tab.path != root.drag-source-dir
+                    && root.drag-x >= self.absolute-position.x
+                    && root.drag-x <= self.absolute-position.x + self.width
+                    && root.drag-y >= self.absolute-position.y
+                    && root.drag-y <= self.absolute-position.y + self.height;
+
+                changed is-drop-hovered => {
+                    if self.is-drop-hovered {
+                        root.drag-hover-tab-path = tab.path;
+                        root.drag-hover-tab-title = tab.title;
+                    } else if root.drag-hover-tab-path == tab.path {
+                        root.drag-hover-tab-path = "";
+                        root.drag-hover-tab-title = "";
+                    }
+                }
+
                 min-width: 112px;
                 max-width: 224px;
                 horizontal-stretch: 1;
                 height: 30px;
                 border-radius: OnyxTheme.radius-md;
-                border-width: 1px;
-                border-color: tab.active ? OnyxTheme.accent-border : transparent;
-                background: tab.active
-                    ? OnyxTheme.bg-surface
-                    : (tab-ta.has-hover ? OnyxTheme.bg-hover : transparent);
+                border-width: self.is-drop-hovered ? 1.5px : 1px;
+                border-color: self.is-drop-hovered
+                    ? OnyxTheme.accent-bright
+                    : (tab.active ? OnyxTheme.accent-border : transparent);
+                background: self.is-drop-hovered
+                    ? OnyxTheme.accent-subtle
+                    : (tab.active
+                        ? OnyxTheme.bg-surface
+                        : (tab-ta.has-hover ? OnyxTheme.bg-hover : transparent));
 
                 animate background { duration: 110ms; easing: ease-out; }
 

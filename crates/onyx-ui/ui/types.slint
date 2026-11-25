@@ -39,6 +39,17 @@ export struct UiFileEntry {
     selected: bool,
     icon: image,
     has_icon: bool,
+    thumbnail: image,
+    has_thumbnail: bool,
+}
+
+export struct UiArchiveEntry {
+    name: string,
+    relative_path: string,
+    size_label: string,
+    compressed_label: string,
+    is_dir: bool,
+    modified: string,
 }
 
 export struct UiMetadataRow {

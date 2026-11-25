@@ -105,6 +105,7 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
     controller.bind(&ui);
     controller.start_watcher(watch_requests);
     controller.start_clipboard_monitor(clipboard_commands);
+    controller.start_incremental_indexer();
     controller.runtime.spawn_blocking({
         let weak = controller.ui.clone();
         move || {
@@ -117,6 +118,19 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
     post(&controller.ui, |controller, ui| {
         if let Some(hwnd) = ui_sync::window_hwnd(ui) {
             ui_sync::apply_window_theme(hwnd, ui);
+            let drop_weak = controller.ui.clone();
+            match onyx_windows::register_file_drop_target(hwnd, move |event| {
+                post(&drop_weak, move |app, ui| {
+                    app.handle_external_drop(ui, event)
+                });
+            }) {
+                Ok(guard) => {
+                    controller.state.borrow_mut().drop_target = Some(guard);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not register Windows file drop target");
+                }
+            }
             controller.runtime.spawn_blocking(move || {
                 if let Err(error) = onyx_windows::set_window_icon_from_exe(hwnd) {
                     tracing::warn!(%error, "could not set the Windows window icon");
@@ -133,20 +147,25 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
     let event_result = slint::run_event_loop();
     controller.shutdown.cancel();
     let size = ui.window().size();
-    let (store, config, session, operation) = {
+    let (store, config, session, operation, indexer) = {
         let mut state = controller.state.borrow_mut();
         for pane in &state.panes {
             pane.cancel.cancel();
+            pane.thumb_cancel.cancel();
         }
         state.preview_cancel.cancel();
+        state.archive_cancel.cancel();
         if let Some((_, cancel)) = state.indexing.take() {
             cancel.cancel();
         }
+        // Unregister Windows WM_DROPFILES subclass cleanly before teardown.
+        drop(state.drop_target.take());
         (
             state.store.clone(),
             state.config.clone(),
             state.session(size.width, size.height),
             state.operation.take(),
+            state.incremental_indexer.take(),
         )
     };
     let completed = operation.map(|(cancel, operation)| {
@@ -155,6 +174,11 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
     });
     let saved = controller.runtime.block_on(async {
         tokio::task::spawn_blocking(move || {
+            if let Some(arc_indexer) = indexer
+                && let Ok(owned) = Arc::try_unwrap(arc_indexer)
+            {
+                owned.shutdown();
+            }
             let config_result = store.save_config(&config);
             let session_result = store.save_session(&session);
             config_result.and(session_result)
@@ -283,6 +307,50 @@ impl Controller {
         bind!(on_modal_cancel, |app, ui| app.cancel_prompt(&ui));
         bind!(on_move_selection, |app, ui, offset| app
             .move_selection(&ui, offset));
+
+        // Settings callbacks
+        bind!(on_toggle_settings, |app, ui| app.toggle_settings(&ui));
+        bind!(on_settings_set_theme, |app, ui, mode| app
+            .settings_set_theme(&ui, mode));
+        bind!(on_settings_set_default_view, |app, ui, mode| app
+            .settings_set_default_view(&ui, mode));
+        bind!(on_settings_set_show_hidden, |app, ui, enabled| app
+            .settings_set_show_hidden(&ui, enabled));
+        bind!(on_settings_set_show_system, |app, ui, enabled| app
+            .settings_set_show_system(&ui, enabled));
+        bind!(on_settings_set_show_preview, |app, ui, enabled| app
+            .settings_set_show_preview(&ui, enabled));
+        bind!(on_settings_set_dual_pane_default, |app, ui, enabled| app
+            .settings_set_dual_pane_default(&ui, enabled));
+        bind!(on_settings_set_default_terminal, |app, ui, term| app
+            .settings_set_default_terminal(&ui, term.as_str()));
+        bind!(on_settings_add_excluded_dir, |app, ui, dir| app
+            .settings_add_excluded_dir(&ui, dir.as_str()));
+        bind!(on_settings_remove_excluded_dir, |app, ui, dir| app
+            .settings_remove_excluded_dir(&ui, dir.as_str()));
+
+        // Archive callbacks
+        bind!(on_action_compress_zip, |app, ui| app.compress_zip(&ui));
+        bind!(on_action_extract_here, |app, ui| app.extract_here(&ui));
+        bind!(on_action_extract_to_folder, |app, ui| app
+            .extract_to_folder(&ui));
+        bind!(on_action_browse_archive, |app, ui| app.browse_archive(&ui));
+        bind!(on_close_archive_browser, |app, ui| app
+            .close_archive_browser(&ui));
+        bind!(on_archive_extract_here, |app, ui| app
+            .archive_extract_here(&ui));
+        bind!(on_archive_extract_to_folder, |app, ui| app
+            .archive_extract_to_folder(&ui));
+
+        // Drag & Drop callbacks
+        bind!(on_internal_drop, |app, ui, src, dst, copy| app
+            .internal_drop(
+                &ui,
+                PathBuf::from(src.as_str()),
+                PathBuf::from(dst.as_str()),
+                copy
+            ));
+        bind!(on_action_external_drag, |app, ui| app.external_drag(&ui));
     }
 
     fn start_watcher(&self, mut requests: watch::Receiver<Vec<PathBuf>>) {
@@ -342,6 +410,19 @@ impl Controller {
         );
     }
 
+    /// Atomically persists the current `AppConfig` on a background worker thread.
+    pub(crate) fn persist_config(&self) {
+        let (store, config) = {
+            let state = self.state.borrow();
+            (state.store.clone(), state.config.clone())
+        };
+        self.runtime.spawn_blocking(move || {
+            if let Err(error) = store.save_config(&config) {
+                tracing::warn!(%error, "could not persist Onyx configuration");
+            }
+        });
+    }
+
     pub(crate) fn sync_chrome(&self, ui: &OnyxWindow) {
         let state = self.state.borrow();
         ui_sync::chrome(ui, &state);
@@ -381,41 +462,194 @@ impl Controller {
         self.update_preview(ui);
     }
 
-    fn toggle_view(&self, ui: &OnyxWindow) {
-        let mut state = self.state.borrow_mut();
-        state.config.default_view = if state.config.default_view == ViewMode::Grid {
-            ViewMode::Details
-        } else {
-            ViewMode::Grid
-        };
-        ui.set_view_mode(i32::from(state.config.default_view == ViewMode::Grid));
+    pub(crate) fn toggle_settings(&self, ui: &OnyxWindow) {
+        let open = !ui.get_settings_open();
+        if open {
+            ui.set_command_palette_open(false);
+            let state = self.state.borrow();
+            ui_sync::settings(ui, &state.config);
+        }
+        ui.set_settings_open(open);
     }
 
-    pub(crate) fn toggle_dual(&self, ui: &OnyxWindow) {
-        let enabled = {
+    pub(crate) fn settings_set_theme(&self, ui: &OnyxWindow, mode: i32) {
+        let theme = match mode {
+            1 => ThemeMode::Light,
+            2 => ThemeMode::System,
+            _ => ThemeMode::Dark,
+        };
+        let dark = effective_theme(theme) == ThemeMode::Dark;
+        {
             let mut state = self.state.borrow_mut();
-            state.dual = !state.dual;
-            state.config.dual_pane_default = state.dual;
+            state.config.theme = theme;
+            ui_sync::settings(ui, &state.config);
+        }
+        ui.set_dark_mode(dark);
+        if let Some(hwnd) = ui_sync::window_hwnd(ui) {
+            ui_sync::apply_window_theme(hwnd, ui);
+        }
+        self.persist_config();
+    }
+
+    pub(crate) fn settings_set_default_view(&self, ui: &OnyxWindow, mode: i32) {
+        let view = if mode == 1 {
+            ViewMode::Grid
+        } else {
+            ViewMode::Details
+        };
+        let visible: Vec<_> = {
+            let mut state = self.state.borrow_mut();
+            state.config.default_view = view;
+            let visible: Vec<_> = state.visible_panes().collect();
+            for &id in &visible {
+                if view != ViewMode::Grid {
+                    state.pane_mut(id).thumb_cancel.cancel();
+                } else {
+                    ui_sync::rows(&state, id);
+                }
+            }
+            ui_sync::settings(ui, &state.config);
+            visible
+        };
+        ui.set_view_mode(i32::from(view == ViewMode::Grid));
+        if view == ViewMode::Grid {
+            for id in visible {
+                self.queue_thumbnails(id);
+            }
+        }
+        self.persist_config();
+    }
+
+    pub(crate) fn settings_set_show_hidden(&self, ui: &OnyxWindow, enabled: bool) {
+        let panes: Vec<_> = {
+            let mut state = self.state.borrow_mut();
+            if state.config.show_hidden == enabled {
+                return;
+            }
+            state.config.show_hidden = enabled;
+            state.directories.clear();
+            state.visible_panes().collect()
+        };
+        self.sync_chrome(ui);
+        for pane in panes {
+            self.reload(ui, pane, true);
+        }
+        self.persist_config();
+    }
+
+    pub(crate) fn settings_set_show_system(&self, ui: &OnyxWindow, enabled: bool) {
+        let panes: Vec<_> = {
+            let mut state = self.state.borrow_mut();
+            if state.config.show_system == enabled {
+                return;
+            }
+            state.config.show_system = enabled;
+            state.directories.clear();
+            state.visible_panes().collect()
+        };
+        self.sync_chrome(ui);
+        for pane in panes {
+            self.reload(ui, pane, true);
+        }
+        self.persist_config();
+    }
+
+    pub(crate) fn settings_set_show_preview(&self, ui: &OnyxWindow, enabled: bool) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.config.show_preview_pane = enabled;
+            ui_sync::settings(ui, &state.config);
+        }
+        ui.set_preview_pane(enabled);
+        self.update_preview(ui);
+        self.persist_config();
+    }
+
+    pub(crate) fn settings_set_dual_pane_default(&self, ui: &OnyxWindow, enabled: bool) {
+        let changed_to_enabled = {
+            let mut state = self.state.borrow_mut();
+            state.config.dual_pane_default = enabled;
+            let was_dual = state.dual;
+            state.dual = enabled;
             if !state.dual {
                 state.active = PaneId::Primary;
                 state.pane_mut(PaneId::Secondary).cancel.cancel();
+                state.pane_mut(PaneId::Secondary).thumb_cancel.cancel();
             }
-            state.dual
+            enabled && !was_dual
         };
         self.sync_chrome(ui);
         self.update_watcher();
-        if enabled {
+        if changed_to_enabled {
             self.reload(ui, PaneId::Secondary, true);
         } else {
             self.update_preview(ui);
         }
+        self.persist_config();
+    }
+
+    pub(crate) fn settings_set_default_terminal(&self, ui: &OnyxWindow, terminal: &str) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.config.set_default_terminal(terminal);
+            ui_sync::settings(ui, &state.config);
+        }
+        self.persist_config();
+    }
+
+    pub(crate) fn settings_add_excluded_dir(&self, ui: &OnyxWindow, raw: &str) {
+        let trimmed = raw.trim().trim_matches('"');
+        if trimmed.is_empty() {
+            return;
+        }
+        let added = {
+            let mut state = self.state.borrow_mut();
+            let added = state.config.add_excluded_index_dir(PathBuf::from(trimmed));
+            if added {
+                ui_sync::settings(ui, &state.config);
+            }
+            added
+        };
+        if added {
+            self.persist_config();
+            self.restart_incremental_indexer();
+            ui.set_status_message(format!("Excluded from search index: {trimmed}").into());
+        }
+    }
+
+    pub(crate) fn settings_remove_excluded_dir(&self, ui: &OnyxWindow, raw: &str) {
+        let removed = {
+            let mut state = self.state.borrow_mut();
+            let removed = state.config.remove_excluded_index_dir(Path::new(raw));
+            if removed {
+                ui_sync::settings(ui, &state.config);
+            }
+            removed
+        };
+        if removed {
+            self.persist_config();
+            self.restart_incremental_indexer();
+            ui.set_status_message(format!("Removed search index exclusion: {raw}").into());
+        }
+    }
+
+    fn toggle_view(&self, ui: &OnyxWindow) {
+        let next = if self.state.borrow().config.default_view == ViewMode::Grid {
+            0
+        } else {
+            1
+        };
+        self.settings_set_default_view(ui, next);
+    }
+
+    pub(crate) fn toggle_dual(&self, ui: &OnyxWindow) {
+        let enabled = !self.state.borrow().dual;
+        self.settings_set_dual_pane_default(ui, enabled);
     }
 
     pub(crate) fn toggle_preview(&self, ui: &OnyxWindow) {
         let enabled = !self.state.borrow().config.show_preview_pane;
-        self.state.borrow_mut().config.show_preview_pane = enabled;
-        ui.set_preview_pane(enabled);
-        self.update_preview(ui);
+        self.settings_set_show_preview(ui, enabled);
     }
 
     pub(crate) fn toggle_quick_look(&self, ui: &OnyxWindow) {
@@ -426,15 +660,7 @@ impl Controller {
     }
 
     pub(crate) fn toggle_theme(&self, ui: &OnyxWindow) {
-        let dark = !ui.get_dark_mode();
-        self.state.borrow_mut().config.theme = if dark {
-            ThemeMode::Dark
-        } else {
-            ThemeMode::Light
-        };
-        ui.set_dark_mode(dark);
-        if let Some(hwnd) = ui_sync::window_hwnd(ui) {
-            ui_sync::apply_window_theme(hwnd, ui);
-        }
+        let next = if ui.get_dark_mode() { 1 } else { 0 };
+        self.settings_set_theme(ui, next);
     }
 }

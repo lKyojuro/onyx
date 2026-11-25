@@ -97,6 +97,7 @@ export component FilePane inherits Rectangle {
     in property <int> pane-index: 0;
     in property <bool> is-active: true;
     in property <bool> show-active-indicator: false;
+    in property <bool> dual-pane: false;
     in property <string> current-path: "";
     in property <[UiFileEntry]> entries;
     in property <int> sort-column: 0;
@@ -105,16 +106,52 @@ export component FilePane inherits Rectangle {
     in property <bool> is-loading: false;
     in property <string> error-message: "";
 
+    // Shared internal drag-and-drop state
+    in-out property <bool> dragging-active: false;
+    in-out property <string> drag-source-path: "";
+    in-out property <string> drag-source-name: "";
+    in-out property <string> drag-source-dir: "";
+    in-out property <bool> drag-source-is-dir: false;
+    in-out property <int> drag-source-pane: -1;
+    in-out property <length> drag-x: 0px;
+    in-out property <length> drag-y: 0px;
+    in-out property <string> drag-hover-folder-path: "";
+    in-out property <string> drag-hover-folder-name: "";
+    in-out property <int> drag-hover-pane: -1;
+    in-out property <string> drag-hover-pane-path: "";
+
     callback select-entry(int, int);
     callback activate-entry(int, int);
     callback context-menu-requested(int, int);
     callback set-active-pane(int);
     callback sort-by(int, int);
+    callback finish-internal-drag(bool);
+    callback cancel-internal-drag();
 
     property <int> grid-columns: Math.max(1, Math.floor((self.width - 24px) / 140px));
     property <int> grid-rows: root.entries.length == 0
         ? 0
         : Math.floor((root.entries.length + root.grid-columns - 1) / root.grid-columns);
+
+    property <bool> is-pane-drop-hovered: root.dragging-active
+        && root.dual-pane
+        && root.drag-source-pane != root.pane-index
+        && root.current-path != ""
+        && root.current-path != root.drag-source-dir
+        && root.drag-x >= self.absolute-position.x
+        && root.drag-x <= self.absolute-position.x + self.width
+        && root.drag-y >= self.absolute-position.y
+        && root.drag-y <= self.absolute-position.y + self.height;
+
+    changed is-pane-drop-hovered => {
+        if self.is-pane-drop-hovered {
+            root.drag-hover-pane = root.pane-index;
+            root.drag-hover-pane-path = root.current-path;
+        } else if root.drag-hover-pane == root.pane-index {
+            root.drag-hover-pane = -1;
+            root.drag-hover-pane-path = "";
+        }
+    }
 
     // Transparent in dark mode so the cosmic dithered aurora background shines through
     background: OnyxTheme.dark-mode ? transparent : OnyxTheme.bg-base;
@@ -372,16 +409,38 @@ export component FilePane inherits Rectangle {
                 background: transparent;
 
                 Rectangle {
+                    property <bool> is-drop-target: root.dragging-active
+                        && entry.is_dir
+                        && entry.path != root.drag-source-path
+                        && root.drag-x >= self.absolute-position.x
+                        && root.drag-x <= self.absolute-position.x + self.width
+                        && root.drag-y >= self.absolute-position.y
+                        && root.drag-y <= self.absolute-position.y + self.height;
+
+                    changed is-drop-target => {
+                        if self.is-drop-target {
+                            root.drag-hover-folder-path = entry.path;
+                            root.drag-hover-folder-name = entry.name;
+                        } else if root.drag-hover-folder-path == entry.path {
+                            root.drag-hover-folder-path = "";
+                            root.drag-hover-folder-name = "";
+                        }
+                    }
+
                     x: 6px;
                     y: 1px;
                     width: parent.width - 12px;
                     height: parent.height - 2px;
                     border-radius: OnyxTheme.radius-sm;
-                    border-width: entry.selected ? 1px : 0px;
-                    border-color: entry.selected ? OnyxTheme.accent-border : transparent;
-                    background: entry.selected
-                        ? OnyxTheme.bg-selected
-                        : (row-ta.has-hover ? OnyxTheme.bg-hover : transparent);
+                    border-width: self.is-drop-target ? 1.5px : (entry.selected ? 1px : 0px);
+                    border-color: self.is-drop-target
+                        ? OnyxTheme.accent-bright
+                        : (entry.selected ? OnyxTheme.accent-border : transparent);
+                    background: self.is-drop-target
+                        ? OnyxTheme.accent-subtle
+                        : (entry.selected
+                            ? OnyxTheme.bg-selected
+                            : (row-ta.has-hover ? OnyxTheme.bg-hover : transparent));
 
                     animate background { duration: 80ms; }
 
@@ -399,7 +458,11 @@ export component FilePane inherits Rectangle {
                     }
 
                     row-ta := TouchArea {
-                        mouse-cursor: pointer;
+                        property <bool> drag-armed: false;
+                        property <length> press-x: 0px;
+                        property <length> press-y: 0px;
+
+                        mouse-cursor: root.dragging-active ? grabbing : pointer;
                         clicked => {
                             root.set-active-pane(root.pane-index);
                             root.select-entry(root.pane-index, idx);
@@ -411,6 +474,40 @@ export component FilePane inherits Rectangle {
                         pointer-event(event) => {
                             if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
                                 root.context-menu-requested(root.pane-index, idx);
+                            }
+                            if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                self.drag-armed = true;
+                                self.press-x = self.mouse-x;
+                                self.press-y = self.mouse-y;
+                            }
+                            if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
+                                if root.dragging-active {
+                                    root.finish-internal-drag(event.modifiers.control);
+                                }
+                                self.drag-armed = false;
+                            }
+                            if event.kind == PointerEventKind.cancel {
+                                if root.dragging-active {
+                                    root.cancel-internal-drag();
+                                }
+                                self.drag-armed = false;
+                            }
+                        }
+                        moved => {
+                            if self.drag-armed {
+                                if !root.dragging-active && (Math.abs(self.mouse-x - self.press-x) + Math.abs(self.mouse-y - self.press-y) > 8px) {
+                                    root.select-entry(root.pane-index, idx);
+                                    root.dragging-active = true;
+                                    root.drag-source-path = entry.path;
+                                    root.drag-source-name = entry.name;
+                                    root.drag-source-dir = root.current-path;
+                                    root.drag-source-is-dir = entry.is_dir;
+                                    root.drag-source-pane = root.pane-index;
+                                }
+                                if root.dragging-active {
+                                    root.drag-x = self.absolute-position.x + self.mouse-x;
+                                    root.drag-y = self.absolute-position.y + self.mouse-y;
+                                }
                             }
                         }
                     }
@@ -491,7 +588,7 @@ export component FilePane inherits Rectangle {
             accessible-label: "Directory grid";
 
             for row-idx in root.grid-rows : Rectangle {
-                height: 124px;
+                height: 134px;
                 background: transparent;
 
                 HorizontalLayout {
@@ -505,27 +602,53 @@ export component FilePane inherits Rectangle {
                         property <int> item-idx: row-idx * root.grid-columns + col-idx;
                         property <bool> valid: item-idx < root.entries.length;
                         property <UiFileEntry> entry: root.entries[item-idx];
+                        property <bool> is-drop-target: valid
+                            && root.dragging-active
+                            && entry.is_dir
+                            && entry.path != root.drag-source-path
+                            && root.drag-x >= self.absolute-position.x
+                            && root.drag-x <= self.absolute-position.x + self.width
+                            && root.drag-y >= self.absolute-position.y
+                            && root.drag-y <= self.absolute-position.y + self.height;
+
+                        changed is-drop-target => {
+                            if self.is-drop-target {
+                                root.drag-hover-folder-path = entry.path;
+                                root.drag-hover-folder-name = entry.name;
+                            } else if root.drag-hover-folder-path == entry.path {
+                                root.drag-hover-folder-path = "";
+                                root.drag-hover-folder-name = "";
+                            }
+                        }
 
                         horizontal-stretch: 1;
-                        height: 112px;
+                        height: 122px;
                         border-radius: OnyxTheme.radius-md;
-                        border-width: 1px;
+                        border-width: self.is-drop-target ? 2px : 1px;
                         border-color: !valid
                             ? transparent
-                            : (entry.selected
-                                ? OnyxTheme.accent-border
-                                : (tile-ta.has-hover ? OnyxTheme.border-strong : OnyxTheme.border-subtle));
+                            : (self.is-drop-target
+                                ? OnyxTheme.accent-bright
+                                : (entry.selected
+                                    ? OnyxTheme.accent-border
+                                    : (tile-ta.has-hover ? OnyxTheme.border-strong : OnyxTheme.border-subtle)));
                         background: !valid
                             ? transparent
-                            : (entry.selected
-                                ? OnyxTheme.bg-selected
-                                : (tile-ta.has-hover ? OnyxTheme.bg-hover : OnyxTheme.bg-surface-alt));
+                            : (self.is-drop-target
+                                ? OnyxTheme.accent-subtle
+                                : (entry.selected
+                                    ? OnyxTheme.bg-selected
+                                    : (tile-ta.has-hover ? OnyxTheme.bg-hover : OnyxTheme.bg-surface-alt)));
 
                         animate background { duration: 90ms; }
 
                         tile-ta := TouchArea {
+                            property <bool> drag-armed: false;
+                            property <length> press-x: 0px;
+                            property <length> press-y: 0px;
+
                             enabled: valid;
-                            mouse-cursor: valid ? pointer : default;
+                            mouse-cursor: valid ? (root.dragging-active ? grabbing : pointer) : default;
                             clicked => {
                                 root.set-active-pane(root.pane-index);
                                 root.select-entry(root.pane-index, item-idx);
@@ -537,6 +660,40 @@ export component FilePane inherits Rectangle {
                             pointer-event(event) => {
                                 if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
                                     root.context-menu-requested(root.pane-index, item-idx);
+                                }
+                                if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                                    self.drag-armed = true;
+                                    self.press-x = self.mouse-x;
+                                    self.press-y = self.mouse-y;
+                                }
+                                if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
+                                    if root.dragging-active {
+                                        root.finish-internal-drag(event.modifiers.control);
+                                    }
+                                    self.drag-armed = false;
+                                }
+                                if event.kind == PointerEventKind.cancel {
+                                    if root.dragging-active {
+                                        root.cancel-internal-drag();
+                                    }
+                                    self.drag-armed = false;
+                                }
+                            }
+                            moved => {
+                                if self.drag-armed {
+                                    if !root.dragging-active && (Math.abs(self.mouse-x - self.press-x) + Math.abs(self.mouse-y - self.press-y) > 8px) {
+                                        root.select-entry(root.pane-index, item-idx);
+                                        root.dragging-active = true;
+                                        root.drag-source-path = entry.path;
+                                        root.drag-source-name = entry.name;
+                                        root.drag-source-dir = root.current-path;
+                                        root.drag-source-is-dir = entry.is_dir;
+                                        root.drag-source-pane = root.pane-index;
+                                    }
+                                    if root.dragging-active {
+                                        root.drag-x = self.absolute-position.x + self.mouse-x;
+                                        root.drag-y = self.absolute-position.y + self.mouse-y;
+                                    }
                                 }
                             }
                         }
@@ -551,12 +708,35 @@ export component FilePane inherits Rectangle {
 
                             HorizontalLayout {
                                 alignment: center;
-                                EntryGlyph {
-                                    is-dir: entry.is_dir;
-                                    is-symlink: entry.is_symlink;
-                                    has-icon: entry.has_icon;
-                                    icon: entry.icon;
-                                    icon-size: 38px;
+
+                                if entry.has_thumbnail : Rectangle {
+                                    width: 96px;
+                                    height: 58px;
+                                    border-radius: OnyxTheme.radius-sm;
+                                    background: OnyxTheme.bg-chrome;
+                                    border-width: 1px;
+                                    border-color: OnyxTheme.border-subtle;
+                                    clip: true;
+
+                                    Image {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        source: entry.thumbnail;
+                                        image-fit: contain;
+                                    }
+                                }
+
+                                if !entry.has_thumbnail : VerticalLayout {
+                                    height: 58px;
+                                    alignment: center;
+
+                                    EntryGlyph {
+                                        is-dir: entry.is_dir;
+                                        is-symlink: entry.is_symlink;
+                                        has-icon: entry.has_icon;
+                                        icon: entry.icon;
+                                        icon-size: 40px;
+                                    }
                                 }
                             }
 
@@ -581,5 +761,17 @@ export component FilePane inherits Rectangle {
                 }
             }
         }
+    }
+
+    // Dual-pane drop highlight overlay when dragging over opposite pane background
+    if root.is-pane-drop-hovered && root.drag-hover-folder-path == "" : Rectangle {
+        x: 4px;
+        y: 4px;
+        width: parent.width - 8px;
+        height: parent.height - 8px;
+        border-radius: OnyxTheme.radius-md;
+        border-width: 2px;
+        border-color: OnyxTheme.accent-bright;
+        background: OnyxTheme.accent-subtle;
     }
 }
