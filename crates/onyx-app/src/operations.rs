@@ -103,7 +103,7 @@ enum Operation {
     },
     CreateArchive {
         sources: Vec<PathBuf>,
-        dest_zip: PathBuf,
+        current_dir: PathBuf,
     },
     ExtractArchive {
         archive_path: PathBuf,
@@ -238,7 +238,23 @@ impl Operation {
                     )
                     .await
             }
-            Self::CreateArchive { sources, dest_zip } => {
+            Self::CreateArchive {
+                sources,
+                current_dir,
+            } => {
+                affected.push(current_dir.clone());
+                let sources_for_dest = sources.clone();
+                let cancel_for_dest = cancel.clone();
+                let dest_zip = tokio::task::spawn_blocking(move || {
+                    if cancel_for_dest.is_cancelled() {
+                        return Err(OnyxError::Cancelled);
+                    }
+                    compute_archive_dest_path(&sources_for_dest, &current_dir)
+                })
+                .await
+                .map_err(|err| OnyxError::OperationFailed {
+                    message: format!("Archive destination task join failed: {err}"),
+                })??;
                 add_parent(affected, &dest_zip);
                 create_archive(sources, dest_zip, Some(progress), cancel).await
             }
@@ -622,14 +638,13 @@ impl Controller {
             ui.set_status_message("Select one or more items to compress.".into());
             return;
         }
-        let dest_zip = match compute_archive_dest_path(&sources, &current_dir) {
-            Ok(path) => path,
-            Err(error) => {
-                ui.set_status_message(error.to_string().into());
-                return;
-            }
-        };
-        self.start_operation(ui, Operation::CreateArchive { sources, dest_zip });
+        self.start_operation(
+            ui,
+            Operation::CreateArchive {
+                sources,
+                current_dir,
+            },
+        );
     }
 
     /// Extracts the selected `.zip` archive directly into the active directory.
@@ -1059,5 +1074,40 @@ mod tests {
 
         let extract_dir = compute_extract_folder_dest(&dir.path().join("bundle.zip"));
         assert_eq!(extract_dir, dir.path().join("bundle"));
+    }
+
+    #[tokio::test]
+    async fn create_archive_operation_computes_auto_renamed_dest_in_background() {
+        let dir = TempDir::new().unwrap();
+        let single_file = dir.path().join("report.txt");
+        std::fs::write(&single_file, b"archive payload").unwrap();
+        // Pre-exist report.zip so background destination resolution must auto-rename to report (2).zip
+        std::fs::write(dir.path().join("report.zip"), b"existing").unwrap();
+
+        let engine = Arc::new(FileOperationsEngine::new());
+        let (clip_tx, _clip_rx) = mpsc::unbounded_channel();
+        let (prog_tx, _prog_rx) = mpsc::channel(16);
+        let mut affected = Vec::new();
+
+        let op = Operation::CreateArchive {
+            sources: vec![single_file],
+            current_dir: dir.path().to_path_buf(),
+        };
+        let report = op
+            .run(
+                engine,
+                clip_tx,
+                CancellationToken::new(),
+                prog_tx,
+                &mut affected,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let expected_zip = dir.path().join("report (2).zip");
+        assert_eq!(report.succeeded, vec![expected_zip.clone()]);
+        assert!(expected_zip.exists());
+        assert!(affected.contains(&dir.path().to_path_buf()));
     }
 }
