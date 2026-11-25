@@ -5,6 +5,7 @@
 [CmdletBinding()]
 param(
     [switch]$SkipBuild,
+    [switch]$Require,
     [string]$OutputDir = "dist",
     [string]$Version = "",
     [string]$BinaryPath = ""
@@ -42,8 +43,12 @@ $wixCmd = Get-Command wix -ErrorAction SilentlyContinue
 if ($null -eq $wixCmd) {
     Write-Warning "WiX Toolset v4+ ('wix' CLI) is not installed or not on PATH."
     Write-Host "To install WiX Toolset v4+, run one of:" -ForegroundColor Yellow
-    Write-Host "  dotnet tool install --global wix"
+    Write-Host "  dotnet tool install --global wix --version 5.*"
     Write-Host "  winget install WiXToolset.WiXToolset"
+    if ($Require) {
+        Write-Error "WiX Toolset is required (-Require was specified), failing build." -ErrorAction Continue
+        exit 1
+    }
     Write-Host "Exiting cleanly without building .msi (XML validation succeeded)." -ForegroundColor Yellow
     exit 0
 }

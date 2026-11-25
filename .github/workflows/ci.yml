@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
@@ -29,13 +32,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy lints
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run unit & integration tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Build release binary
-        run: cargo build --release --bin onyx
+        run: cargo build --locked --release --bin onyx
 
       - name: Verify release binary (--version and --smoke-test)
         run: |

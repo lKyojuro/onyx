@@ -21,7 +21,7 @@ function New-PngFromIcon {
     )
 
     Add-Type -AssemblyName System.Drawing
-    $icon = [System.Drawing.Icon]::new($IconPath)
+    $icon = [System.Drawing.Icon]::new($IconPath, 256, 256)
     $bitmap = [System.Drawing.Bitmap]::new($Width, $Height)
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     try {
@@ -146,7 +146,11 @@ $makeappxPath = if ($null -ne $makeappxCmd) { $makeappxCmd.Source } else { $null
 
 if ([string]::IsNullOrWhiteSpace($makeappxPath)) {
     $sdkCandidates = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\makeappx.exe" -ErrorAction SilentlyContinue |
-        Sort-Object FullName -Descending
+        Sort-Object {
+            $verText = $_.Directory.Parent.Name
+            $parsed = $null
+            if ([version]::TryParse($verText, [ref]$parsed)) { $parsed } else { [version]"0.0.0.0" }
+        } -Descending
     if ($sdkCandidates) {
         $makeappxPath = $sdkCandidates[0].FullName
     }

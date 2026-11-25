@@ -3,12 +3,13 @@
 use crate::own_window;
 use onyx_core::{OnyxError, OnyxResult, normalize_display_path};
 use std::ffi::{OsStr, OsString, c_void};
+use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, size_of};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::ptr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{
     DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_DVASPECT,
     DV_E_FORMATETC, DV_E_TYMED, E_NOTIMPL, E_POINTER, FALSE, GlobalFree, HGLOBAL, HWND, LPARAM,
@@ -26,11 +27,14 @@ use windows::Win32::System::Ole::{
     IDropSource, IDropSource_Impl, OleInitialize, OleUninitialize,
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_RBUTTON, MODIFIERKEYS_FLAGS};
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{
     DROPFILES, DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP,
     RemoveWindowSubclass, SHCreateStdEnumFmtEtc, SetWindowSubclass,
 };
-use windows::Win32::UI::WindowsAndMessaging::{WM_DROPFILES, WM_NCDESTROY};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetWindowThreadProcessId, WM_DROPFILES, WM_NCDESTROY,
+};
 use windows::core::{BOOL, HRESULT, Ref, implement};
 
 static NEXT_SUBCLASS_ID: AtomicUsize = AtomicUsize::new(1);
@@ -58,8 +62,9 @@ pub enum DragOutcome {
 }
 
 struct DropCallbackState {
-    on_drop: Mutex<Box<dyn Fn(DropEvent) + Send + 'static>>,
+    on_drop: Arc<dyn Fn(DropEvent) + Send + Sync + 'static>,
     detached: AtomicBool,
+    closed: AtomicBool,
 }
 
 impl DropCallbackState {
@@ -110,23 +115,28 @@ impl std::fmt::Debug for DropTargetGuard {
 
 impl Drop for DropTargetGuard {
     fn drop(&mut self) {
+        self.state.closed.store(true, Ordering::Release);
         if !self.state.detached.load(Ordering::Acquire) {
-            // SAFETY: `self.hwnd` was validated as a window in the current process. Calling
+            // SAFETY: `self.hwnd` was validated as a window on the current thread. Calling
             // `DragAcceptFiles` and `RemoveWindowSubclass` on teardown is safe even if the
             // window is already closing.
-            unsafe {
+            let removed = unsafe {
                 DragAcceptFiles(self.hwnd, false);
-                let _ = RemoveWindowSubclass(
-                    self.hwnd,
-                    Some(drop_target_subclass_proc),
-                    self.subclass_id,
+                RemoveWindowSubclass(self.hwnd, Some(drop_target_subclass_proc), self.subclass_id)
+            };
+            if removed.as_bool() {
+                // SAFETY: `RemoveWindowSubclass` succeeded, so the subclass procedure will no
+                // longer be invoked with `self.raw_state_ptr`. Reclaim the subclass `Arc` reference.
+                unsafe {
+                    DropCallbackState::release_subclass_ref(self.raw_state_ptr);
+                }
+            } else if !self.state.detached.load(Ordering::Acquire) {
+                tracing::error!(
+                    hwnd = self.hwnd.0 as isize,
+                    subclass_id = self.subclass_id,
+                    "RemoveWindowSubclass failed during DropTargetGuard::drop; deferring Arc release to WM_NCDESTROY"
                 );
             }
-        }
-        // SAFETY: `self.raw_state_ptr` came from `Arc::into_raw` in `register_file_drop_target`,
-        // and `self.state` keeps the underlying allocation alive during `release_subclass_ref`.
-        unsafe {
-            DropCallbackState::release_subclass_ref(self.raw_state_ptr);
         }
     }
 }
@@ -137,20 +147,33 @@ impl Drop for DropTargetGuard {
 /// Returns an RAII [`DropTargetGuard`] that unregisters the drop target when dropped.
 pub fn register_file_drop_target<F>(hwnd: isize, on_drop: F) -> OnyxResult<DropTargetGuard>
 where
-    F: Fn(DropEvent) + Send + 'static,
+    F: Fn(DropEvent) + Send + Sync + 'static,
 {
     let window = own_window(hwnd)?;
+    // SAFETY: `GetWindowThreadProcessId` and `GetCurrentThreadId` are safe to call on any thread.
+    let (window_thread, current_thread) =
+        unsafe { (GetWindowThreadProcessId(window, None), GetCurrentThreadId()) };
+    if window_thread == 0 || window_thread != current_thread {
+        return Err(OnyxError::Platform {
+            message: format!(
+                "HWND 0x{hwnd:X} belongs to thread {window_thread}, not calling thread {current_thread}"
+            ),
+        });
+    }
+
     let subclass_id = NEXT_SUBCLASS_ID.fetch_add(1, Ordering::Relaxed);
 
     let state = Arc::new(DropCallbackState {
-        on_drop: Mutex::new(Box::new(on_drop)),
+        on_drop: Arc::new(on_drop),
         detached: AtomicBool::new(false),
+        closed: AtomicBool::new(false),
     });
     let raw_state_ptr = Arc::into_raw(Arc::clone(&state));
 
-    // SAFETY: `window` belongs to the current process (`own_window`), `drop_target_subclass_proc`
-    // is a valid subclass procedure, and `raw_state_ptr` is an `Arc`-backed pointer that stays
-    // valid until `release_subclass_ref` is called on subclass removal or `WM_NCDESTROY`.
+    // SAFETY: `window` belongs to the calling thread (`own_window` + thread check),
+    // `drop_target_subclass_proc` is a valid subclass procedure, and `raw_state_ptr` is an
+    // `Arc`-backed pointer that stays valid until `release_subclass_ref` is called on successful
+    // subclass removal or `WM_NCDESTROY`.
     let installed = unsafe {
         SetWindowSubclass(
             window,
@@ -161,6 +184,7 @@ where
     };
 
     if !installed.as_bool() {
+        state.closed.store(true, Ordering::Release);
         // SAFETY: `SetWindowSubclass` failed, so reclaim the cloned `Arc` immediately.
         unsafe {
             DropCallbackState::release_subclass_ref(raw_state_ptr);
@@ -170,7 +194,7 @@ where
         });
     }
 
-    // SAFETY: `window` is a valid HWND in the current process.
+    // SAFETY: `window` is a valid HWND in the current process and thread.
     unsafe {
         DragAcceptFiles(window, true);
     }
@@ -202,65 +226,99 @@ unsafe extern "system" fn drop_target_subclass_proc(
     subclass_id: usize,
     ref_data: usize,
 ) -> LRESULT {
-    let raw_state_ptr = ref_data as *const DropCallbackState;
+    let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Option<LRESULT> {
+        let raw_state_ptr = ref_data as *const DropCallbackState;
 
-    if msg == WM_DROPFILES && !raw_state_ptr.is_null() {
-        // Increment the Arc strong count for the duration of callback execution so that even
-        // if `on_drop` drops the `DropTargetGuard`, `state` stays alive throughout this call.
-        // SAFETY: `raw_state_ptr` is valid while the subclass is installed and not detached.
-        let state = unsafe {
-            Arc::increment_strong_count(raw_state_ptr);
-            Arc::from_raw(raw_state_ptr)
-        };
+        if msg == WM_DROPFILES && !raw_state_ptr.is_null() {
+            // Increment the Arc strong count for the duration of callback execution so that even
+            // if `on_drop` drops the `DropTargetGuard`, `state` stays alive throughout this call.
+            // SAFETY: `raw_state_ptr` is valid while the subclass is installed and not detached.
+            let state = unsafe {
+                Arc::increment_strong_count(raw_state_ptr);
+                Arc::from_raw(raw_state_ptr)
+            };
 
-        let hdrop = HDROP(wparam.0 as *mut c_void);
-        let _finish_guard = HdropFinishGuard(hdrop);
+            let hdrop = HDROP(wparam.0 as *mut c_void);
+            let _finish_guard = HdropFinishGuard(hdrop);
 
-        let mut pt = POINT::default();
-        // SAFETY: `hdrop` is a valid drop handle from `WM_DROPFILES` and `pt` is writable.
-        let _ = unsafe { DragQueryPoint(hdrop, &raw mut pt) };
-
-        // SAFETY: Passing `0xFFFF_FFFF` queries the number of dropped files in `hdrop`.
-        let file_count = unsafe { DragQueryFileW(hdrop, 0xFFFF_FFFF, None) };
-        let mut paths = Vec::with_capacity(file_count as usize);
-
-        for index in 0..file_count {
-            // SAFETY: Passing `None` queries the required character count (excluding null terminator).
-            let char_len = unsafe { DragQueryFileW(hdrop, index, None) };
-            if char_len == 0 {
-                continue;
+            if state.closed.load(Ordering::Acquire) || state.detached.load(Ordering::Acquire) {
+                return Some(LRESULT(0));
             }
-            let mut buf = vec![0u16; (char_len as usize) + 1];
-            // SAFETY: `buf` has capacity for `char_len + 1` UTF-16 code units.
-            let copied = unsafe { DragQueryFileW(hdrop, index, Some(&mut buf)) };
-            if copied > 0 {
-                let os_str = OsString::from_wide(&buf[..copied as usize]);
-                paths.push(PathBuf::from(os_str));
+
+            let mut pt = POINT::default();
+            // SAFETY: `hdrop` is a valid drop handle from `WM_DROPFILES` and `pt` is writable.
+            let _ = unsafe { DragQueryPoint(hdrop, &raw mut pt) };
+
+            // SAFETY: Passing `0xFFFF_FFFF` queries the number of dropped files in `hdrop`.
+            let file_count = unsafe { DragQueryFileW(hdrop, 0xFFFF_FFFF, None) };
+            let mut paths = Vec::with_capacity(file_count as usize);
+
+            for index in 0..file_count {
+                // SAFETY: Passing `None` queries the required character count (excluding null terminator).
+                let char_len = unsafe { DragQueryFileW(hdrop, index, None) };
+                if char_len == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u16; (char_len as usize) + 1];
+                // SAFETY: `buf` has capacity for `char_len + 1` UTF-16 code units.
+                let copied = unsafe { DragQueryFileW(hdrop, index, Some(&mut buf)) };
+                if copied > 0 {
+                    let os_str = OsString::from_wide(&buf[..copied as usize]);
+                    paths.push(PathBuf::from(os_str));
+                }
+            }
+
+            if !paths.is_empty() && !state.closed.load(Ordering::Acquire) {
+                let callback = Arc::clone(&state.on_drop);
+                let event = DropEvent {
+                    paths,
+                    x: pt.x,
+                    y: pt.y,
+                };
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    callback(event);
+                }))
+                .is_err()
+                {
+                    tracing::error!(
+                        hwnd = hwnd.0 as isize,
+                        "panic caught in WM_DROPFILES drop target callback"
+                    );
+                }
+            }
+            return Some(LRESULT(0));
+        }
+
+        if msg == WM_NCDESTROY {
+            // SAFETY: Window is being destroyed; remove our subclass and release its Arc reference once.
+            unsafe {
+                let _ = RemoveWindowSubclass(hwnd, Some(drop_target_subclass_proc), subclass_id);
+                if !raw_state_ptr.is_null() {
+                    (*raw_state_ptr).closed.store(true, Ordering::Release);
+                }
+                DropCallbackState::release_subclass_ref(raw_state_ptr);
             }
         }
 
-        if !paths.is_empty()
-            && let Ok(cb) = state.on_drop.lock()
-        {
-            cb(DropEvent {
-                paths,
-                x: pt.x,
-                y: pt.y,
-            });
-        }
-        return LRESULT(0);
-    }
+        None
+    }));
 
-    if msg == WM_NCDESTROY {
-        // SAFETY: Window is being destroyed; remove our subclass and release its Arc reference once.
-        unsafe {
-            let _ = RemoveWindowSubclass(hwnd, Some(drop_target_subclass_proc), subclass_id);
-            DropCallbackState::release_subclass_ref(raw_state_ptr);
+    match handled {
+        Ok(Some(result)) => result,
+        Ok(None) => {
+            // SAFETY: Forward all other messages through the standard window subclass chain.
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        Err(_) => {
+            tracing::error!(
+                hwnd = hwnd.0 as isize,
+                msg,
+                "panic caught in drop_target_subclass_proc; forwarding to DefSubclassProc"
+            );
+            // SAFETY: Forward message to default subclass procedure after catching panic across FFI.
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
         }
     }
-
-    // SAFETY: Forward all other messages through the standard window subclass chain.
-    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
 /// Encodes a non-empty slice of filesystem paths into a raw `CF_HDROP` (`DROPFILES` + double-null
@@ -380,8 +438,12 @@ pub fn decode_cf_hdrop(bytes: &[u8]) -> OnyxResult<Vec<PathBuf>> {
 }
 
 /// RAII guard for `OleInitialize` / `OleUninitialize` on the calling STA thread.
+///
+/// Intentionally `!Send` and `!Sync` because OLE initialization and uninitialization must run
+/// on the same OS thread.
 struct OleGuard {
     should_uninit: bool,
+    _not_send_sync: PhantomData<*mut ()>,
 }
 
 impl OleGuard {
@@ -390,6 +452,7 @@ impl OleGuard {
         match unsafe { OleInitialize(None) } {
             Ok(()) => Ok(Self {
                 should_uninit: true,
+                _not_send_sync: PhantomData,
             }),
             Err(err) if err.code() == RPC_E_CHANGED_MODE => Err(OnyxError::Platform {
                 message: "OLE drag-and-drop requires an STA thread (RPC_E_CHANGED_MODE)"

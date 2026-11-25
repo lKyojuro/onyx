@@ -5,6 +5,7 @@
 [CmdletBinding()]
 param(
     [string]$BinaryPath = "",
+    [ValidateRange(1, 100)]
     [int]$Runs = 5,
     [int]$IdleSeconds = 3
 )
