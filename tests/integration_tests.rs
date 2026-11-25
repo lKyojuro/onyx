@@ -673,6 +673,7 @@ fn e2e_config_session_and_cache_crash_recovery() {
         favorites: Vec::new(),
         excluded_index_dirs: vec![temp.path().join("node_modules")],
         recent_locations: Vec::new(),
+        indexed_search: false,
     };
     cfg.add_favorite(FavoriteItem {
         name: "Work".to_string(),
