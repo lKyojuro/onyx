@@ -9,8 +9,8 @@ pub mod types;
 pub use error::{OnyxError, OnyxResult};
 pub use navigation::{NavHistory, TabManager, TabState};
 pub use path::{
-    BreadcrumbSegment, build_breadcrumbs, format_bytes, format_timestamp, infer_type_label,
-    normalize_display_path, to_extended_length_path,
+    BreadcrumbSegment, build_breadcrumbs, expand_env_vars, format_bytes, format_timestamp,
+    infer_type_label, normalize_display_path, split_autocomplete_prefix, to_extended_length_path,
 };
 pub use sort::{SortColumn, SortDirection, SortSpec, natural_cmp, sort_entries};
 pub use types::{

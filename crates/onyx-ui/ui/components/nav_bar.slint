@@ -9,6 +9,7 @@ export component NavBar inherits Rectangle {
     in property <[UiBreadcrumb]> breadcrumbs;
     in-out property <string> address-text: "";
     in-out property <bool> address-editing: false;
+    in-out property <[string]> address-suggestions;
     in property <bool> can-go-back: false;
     in property <bool> can-go-forward: false;
     in property <bool> is-current-favorite: false;
@@ -21,6 +22,8 @@ export component NavBar inherits Rectangle {
     callback nav-refresh();
     callback navigate-to(int, string);
     callback submit-address(string);
+    callback address-edited(string);
+    callback address-suggestion-accepted(string);
     callback search-changed(string);
     callback search-submitted(string);
     callback toggle-indexed-search();
@@ -30,6 +33,20 @@ export component NavBar inherits Rectangle {
     public function focus-address-bar() {
         root.address-editing = true;
         address-input.focus();
+    }
+
+    // Index of the keyboard-highlighted suggestion, -1 when none is highlighted.
+    property <int> suggestion-index: -1;
+
+    changed address-editing => {
+        if !root.address-editing {
+            root.address-suggestions = [];
+            suggestion-index = -1;
+        }
+    }
+
+    changed address-suggestions => {
+        suggestion-index = -1;
     }
 
     public function focus-search-bar() {
@@ -197,6 +214,23 @@ export component NavBar inherits Rectangle {
                         root.focus-main();
                         return accept;
                     }
+                    if root.address-suggestions.length > 0 {
+                        if event.text == Key.DownArrow {
+                            suggestion-index = Math.min(suggestion-index + 1, root.address-suggestions.length - 1);
+                            return accept;
+                        }
+                        if event.text == Key.UpArrow {
+                            suggestion-index = Math.max(suggestion-index - 1, 0);
+                            return accept;
+                        }
+                        if event.text == Key.Tab {
+                            if suggestion-index < 0 {
+                                suggestion-index = 0;
+                            }
+                            root.address-suggestion-accepted(root.address-suggestions[suggestion-index]);
+                            return accept;
+                        }
+                    }
                     return reject;
                 }
 
@@ -212,10 +246,58 @@ export component NavBar inherits Rectangle {
                         text <=> root.address-text;
                         placeholder-text: "Enter path and press Enter...";
                         font-size: OnyxTheme.font-md;
+                        edited(text) => { root.address-edited(text); }
                         accepted(text) => {
                             root.address-editing = false;
                             root.submit-address(text);
                             root.focus-main();
+                        }
+                    }
+                }
+            }
+
+            // Live autocomplete dropdown beneath the address bar
+            if root.address-editing && root.address-suggestions.length > 0 : Rectangle {
+                y: parent.height + 4px;
+                width: parent.width;
+                height: root.address-suggestions.length * 28px + 8px;
+                background: OnyxTheme.bg-elevated;
+                border-width: 1px;
+                border-color: OnyxTheme.border-strong;
+                border-radius: OnyxTheme.radius-md;
+                drop-shadow-blur: 12px;
+                drop-shadow-color: #00000033;
+
+                VerticalLayout {
+                    padding: 4px;
+                    spacing: 2px;
+
+                    for suggestion[idx] in root.address-suggestions : Rectangle {
+                        height: 26px;
+                        border-radius: OnyxTheme.radius-sm;
+                        background: (sug-ta.has-hover || idx == suggestion-index) ? OnyxTheme.bg-hover : transparent;
+                        accessible-role: button;
+                        accessible-label: "Navigate to " + suggestion;
+
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+
+                            Text {
+                                text: suggestion;
+                                font-size: OnyxTheme.font-sm;
+                                color: idx == suggestion-index ? OnyxTheme.text-primary : OnyxTheme.text-secondary;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+
+                        sug-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                suggestion-index = idx;
+                                root.address-suggestion-accepted(suggestion);
+                            }
                         }
                     }
                 }

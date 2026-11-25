@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak as RcWeak};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -29,6 +30,8 @@ pub(crate) struct Controller {
     config_updates: watch::Sender<AppConfig>,
     pub index_requests: watch::Sender<IndexWatchRequest>,
     pub runtime: Arc<Runtime>,
+    /// Generation counter that drops stale address bar suggestion results.
+    pub address_generation: Arc<AtomicU64>,
 }
 
 pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()> {
@@ -101,6 +104,7 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
         watched,
         config_updates,
         index_requests,
+        address_generation: Arc::new(AtomicU64::new(0)),
     });
     let stop_config_writer = controller.shutdown.clone();
     let config_writer = controller.runtime.spawn(async move {
@@ -280,6 +284,8 @@ impl Controller {
         ));
         bind!(on_submit_address, |app, ui, path| app
             .submit_address(&ui, path.as_str()));
+        bind!(on_address_edited, |app, ui, text| app
+            .address_edited(&ui, text.as_str()));
         bind!(on_search_changed, |app, ui, query| app.search_changed(
             &ui,
             query.as_str(),
