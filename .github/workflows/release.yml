@@ -28,17 +28,31 @@ jobs:
       - name: Cache Cargo registry & build
         uses: Swatinem/rust-cache@v2
 
+      - name: Verify Git tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          $tagVersion = "${{ github.ref_name }}".TrimStart('v')
+          $cargoToml = Get-Content .\Cargo.toml -Raw
+          if ($cargoToml -notmatch '(?m)^version\s*=\s*"([^"]+)"') {
+            throw "Could not parse workspace version from Cargo.toml"
+          }
+          $cargoVersion = $Matches[1]
+          if ($tagVersion -ne $cargoVersion) {
+            throw "Git tag version '$tagVersion' does not match Cargo.toml version '$cargoVersion'"
+          }
+          Write-Host "Verified tag v$tagVersion matches Cargo.toml version $cargoVersion"
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Clippy lints
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run unit & integration tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Build release binary
-        run: cargo build --release --bin onyx
+        run: cargo build --locked --release --bin onyx
 
       - name: Verify release binary (--version and --smoke-test)
         run: |
@@ -59,13 +73,11 @@ jobs:
           }
           Write-Host "SHA-256 verified: $actual"
 
-      - name: Build WiX MSI installer (optional)
-        run: |
-          if (Get-Command wix -ErrorAction SilentlyContinue) {
-            .\scripts\package-wix.ps1 -SkipBuild
-          } else {
-            Write-Host "WiX CLI not available on runner; skipping MSI packaging."
-          }
+      - name: Install WiX Toolset v5
+        run: dotnet tool install --global wix --version 5.*
+
+      - name: Build WiX MSI installer
+        run: .\scripts\package-wix.ps1 -SkipBuild -Require
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
