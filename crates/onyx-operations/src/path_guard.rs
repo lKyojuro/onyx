@@ -252,9 +252,15 @@ pub fn generate_auto_rename_path(desired: &Path) -> OnyxResult<PathBuf> {
     })
 }
 
+/// Generates a unique Windows-Explorer-style sibling path for `KeepBoth` conflict resolution:
+/// `"report.pdf"` -> `"report (2).pdf"`, `"report (3).pdf"`, and `"Ordner"` -> `"Ordner (2)"`.
+pub fn generate_keep_both_path(desired: &Path) -> OnyxResult<PathBuf> {
+    generate_auto_rename_path(desired)
+}
+
 /// Resolution produced by applying a [`ConflictPolicy`] to a desired destination path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ConflictResolution {
+pub(crate) enum PathConflictOutcome {
     /// Proceed using this destination path (does not exist yet).
     Proceed(PathBuf),
     /// Overwrite the existing item at this destination path.
@@ -269,21 +275,21 @@ pub(crate) fn resolve_conflict(
     desired: &Path,
     policy: ConflictPolicy,
     allow_case_only_same_path: bool,
-) -> OnyxResult<ConflictResolution> {
+) -> OnyxResult<PathConflictOutcome> {
     if !path_exists_any(desired) {
-        return Ok(ConflictResolution::Proceed(desired.to_path_buf()));
+        return Ok(PathConflictOutcome::Proceed(desired.to_path_buf()));
     }
 
     if is_same_normalized_path(source, desired) {
         if allow_case_only_same_path && source.file_name() != desired.file_name() {
-            return Ok(ConflictResolution::Proceed(desired.to_path_buf()));
+            return Ok(PathConflictOutcome::Proceed(desired.to_path_buf()));
         }
         return match policy {
             ConflictPolicy::AutoRename => {
                 let renamed = generate_auto_rename_path(desired)?;
-                Ok(ConflictResolution::Proceed(renamed))
+                Ok(PathConflictOutcome::Proceed(renamed))
             }
-            ConflictPolicy::Skip | ConflictPolicy::Overwrite => Ok(ConflictResolution::Skip),
+            ConflictPolicy::Skip | ConflictPolicy::Overwrite => Ok(PathConflictOutcome::Skip),
             ConflictPolicy::Fail => Err(OnyxError::AlreadyExists {
                 path: desired.to_path_buf(),
             }),
@@ -292,15 +298,15 @@ pub(crate) fn resolve_conflict(
     }
 
     match policy {
-        ConflictPolicy::Skip => Ok(ConflictResolution::Skip),
-        ConflictPolicy::Overwrite => Ok(ConflictResolution::Overwrite(desired.to_path_buf())),
+        ConflictPolicy::Skip => Ok(PathConflictOutcome::Skip),
+        ConflictPolicy::Overwrite => Ok(PathConflictOutcome::Overwrite(desired.to_path_buf())),
         ConflictPolicy::Fail => Err(OnyxError::AlreadyExists {
             path: desired.to_path_buf(),
         }),
         ConflictPolicy::Cancel => Err(OnyxError::Cancelled),
         ConflictPolicy::AutoRename => {
             let renamed = generate_auto_rename_path(desired)?;
-            Ok(ConflictResolution::Proceed(renamed))
+            Ok(PathConflictOutcome::Proceed(renamed))
         }
     }
 }

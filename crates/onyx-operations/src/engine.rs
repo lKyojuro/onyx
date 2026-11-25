@@ -2,13 +2,14 @@
 //! cancellation, streaming progress, conflict resolution, partial failure reporting, and undo.
 
 use crate::path_guard::{
-    ConflictResolution, generate_auto_rename_path, is_dir_reparse, is_reparse_or_symlink,
+    PathConflictOutcome, generate_auto_rename_path, is_dir_reparse, is_reparse_or_symlink,
     is_same_normalized_path, is_same_or_descendant, is_same_volume, path_exists_any,
     resolve_conflict, validate_item_name,
 };
 use crate::recycler::{Recycler, SpaceChecker, WindowsRecycler, WindowsSpaceChecker};
 use crate::types::{
-    ConflictPolicy, OperationKind, OperationProgress, OperationReport, PermanentDeleteRequest,
+    ConflictInfo, ConflictPolicy, ConflictResolution, ConflictResolver, OperationKind,
+    OperationProgress, OperationReport, PermanentDeleteRequest,
 };
 use crate::undo::{UndoAction, UndoJournal};
 use onyx_core::{OnyxError, OnyxResult};
@@ -98,6 +99,45 @@ impl FileOperationsEngine {
         cancel: CancellationToken,
         progress: Option<mpsc::Sender<OperationProgress>>,
     ) -> OnyxResult<OperationReport> {
+        self.copy_items_internal(sources, destination_dir, conflict, None, cancel, progress)
+            .await
+    }
+
+    /// Copies `sources` into `destination_dir`, invoking `resolver` whenever a destination
+    /// collision occurs. Returning `apply_to_all: true` reuses that decision for all remaining
+    /// conflicts in this operation.
+    pub async fn copy_items_with_resolver<R>(
+        &self,
+        sources: &[PathBuf],
+        destination_dir: &Path,
+        default_conflict: ConflictPolicy,
+        resolver: R,
+        cancel: CancellationToken,
+        progress: Option<mpsc::Sender<OperationProgress>>,
+    ) -> OnyxResult<OperationReport>
+    where
+        R: ConflictResolver + 'static,
+    {
+        self.copy_items_internal(
+            sources,
+            destination_dir,
+            default_conflict,
+            Some(Box::new(resolver)),
+            cancel,
+            progress,
+        )
+        .await
+    }
+
+    async fn copy_items_internal(
+        &self,
+        sources: &[PathBuf],
+        destination_dir: &Path,
+        conflict: ConflictPolicy,
+        resolver: Option<Box<dyn ConflictResolver>>,
+        cancel: CancellationToken,
+        progress: Option<mpsc::Sender<OperationProgress>>,
+    ) -> OnyxResult<OperationReport> {
         let op_id = self.alloc_op_id();
         let sources = sources.to_vec();
         let destination_dir = destination_dir.to_path_buf();
@@ -110,6 +150,7 @@ impl FileOperationsEngine {
                 &sources,
                 &destination_dir,
                 conflict,
+                resolver,
                 &cancel,
                 progress.as_ref(),
                 space_checker.as_ref(),
@@ -134,6 +175,45 @@ impl FileOperationsEngine {
         cancel: CancellationToken,
         progress: Option<mpsc::Sender<OperationProgress>>,
     ) -> OnyxResult<OperationReport> {
+        self.move_items_internal(sources, destination_dir, conflict, None, cancel, progress)
+            .await
+    }
+
+    /// Moves `sources` into `destination_dir`, invoking `resolver` whenever a destination
+    /// collision occurs. Returning `apply_to_all: true` reuses that decision for all remaining
+    /// conflicts in this operation.
+    pub async fn move_items_with_resolver<R>(
+        &self,
+        sources: &[PathBuf],
+        destination_dir: &Path,
+        default_conflict: ConflictPolicy,
+        resolver: R,
+        cancel: CancellationToken,
+        progress: Option<mpsc::Sender<OperationProgress>>,
+    ) -> OnyxResult<OperationReport>
+    where
+        R: ConflictResolver + 'static,
+    {
+        self.move_items_internal(
+            sources,
+            destination_dir,
+            default_conflict,
+            Some(Box::new(resolver)),
+            cancel,
+            progress,
+        )
+        .await
+    }
+
+    async fn move_items_internal(
+        &self,
+        sources: &[PathBuf],
+        destination_dir: &Path,
+        conflict: ConflictPolicy,
+        resolver: Option<Box<dyn ConflictResolver>>,
+        cancel: CancellationToken,
+        progress: Option<mpsc::Sender<OperationProgress>>,
+    ) -> OnyxResult<OperationReport> {
         let op_id = self.alloc_op_id();
         let sources = sources.to_vec();
         let destination_dir = destination_dir.to_path_buf();
@@ -145,6 +225,7 @@ impl FileOperationsEngine {
                 &sources,
                 &destination_dir,
                 conflict,
+                resolver,
                 &cancel,
                 progress.as_ref(),
                 space_checker.as_ref(),
@@ -225,6 +306,7 @@ impl FileOperationsEngine {
                 &sources,
                 &parent_dir,
                 ConflictPolicy::AutoRename,
+                None,
                 &cancel,
                 progress.as_ref(),
                 space_checker.as_ref(),
@@ -386,6 +468,37 @@ fn ensure_not_recursive(sources: &[PathBuf], destination_dir: &Path) -> OnyxResu
     Ok(())
 }
 
+fn resolve_item_conflict(
+    src: &Path,
+    desired_target: &Path,
+    default_policy: ConflictPolicy,
+    resolver: &mut Option<Box<dyn ConflictResolver>>,
+    sticky_resolution: &mut Option<ConflictResolution>,
+) -> OnyxResult<PathConflictOutcome> {
+    if !path_exists_any(desired_target) {
+        return Ok(PathConflictOutcome::Proceed(desired_target.to_path_buf()));
+    }
+
+    let effective_policy = if let Some(resolution) = *sticky_resolution {
+        ConflictPolicy::from(resolution)
+    } else if let Some(res_fn) = resolver.as_deref_mut() {
+        let info = ConflictInfo {
+            source: src.to_path_buf(),
+            destination: desired_target.to_path_buf(),
+            is_dir: fs::symlink_metadata(desired_target).is_ok_and(|m| m.is_dir()),
+        };
+        let decision = res_fn.resolve(&info);
+        if decision.apply_to_all {
+            *sticky_resolution = Some(decision.resolution);
+        }
+        ConflictPolicy::from(decision.resolution)
+    } else {
+        default_policy
+    };
+
+    resolve_conflict(src, desired_target, effective_policy, false)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn copy_items_blocking(
     op_id: u64,
@@ -393,6 +506,7 @@ fn copy_items_blocking(
     sources: &[PathBuf],
     destination_dir: &Path,
     conflict: ConflictPolicy,
+    mut resolver: Option<Box<dyn ConflictResolver>>,
     cancel: &CancellationToken,
     progress: Option<&mpsc::Sender<OperationProgress>>,
     space_checker: &dyn SpaceChecker,
@@ -412,6 +526,7 @@ fn copy_items_blocking(
     let mut report = OperationReport::default();
     let mut bytes_copied = 0u64;
     let mut completed_items = 0usize;
+    let mut sticky_resolution: Option<ConflictResolution> = None;
 
     for src in sources {
         if cancel.is_cancelled() {
@@ -454,20 +569,44 @@ fn copy_items_blocking(
         };
 
         let desired_target = destination_dir.join(&item_name);
-        let target = match resolve_conflict(src, &desired_target, conflict, false) {
-            Ok(ConflictResolution::Skip) => {
+        let target = match resolve_item_conflict(
+            src,
+            &desired_target,
+            conflict,
+            &mut resolver,
+            &mut sticky_resolution,
+        ) {
+            Ok(PathConflictOutcome::Skip) => {
                 report.skipped.push(src.clone());
                 completed_items += 1;
                 continue;
             }
-            Ok(ConflictResolution::Proceed(path)) => path,
-            Ok(ConflictResolution::Overwrite(path)) => {
+            Ok(PathConflictOutcome::Proceed(path)) => path,
+            Ok(PathConflictOutcome::Overwrite(path)) => {
                 if let Err(err) = remove_existing_for_overwrite(&path) {
                     report.failed.push((src.clone(), err.to_string()));
                     completed_items += 1;
                     continue;
                 }
                 path
+            }
+            Err(OnyxError::Cancelled) => {
+                send_progress(
+                    progress,
+                    OperationProgress {
+                        op_id,
+                        kind,
+                        current_item: src.display().to_string(),
+                        completed_items,
+                        total_items,
+                        bytes_copied,
+                        total_bytes,
+                        finished: true,
+                        cancelled: true,
+                        error: None,
+                    },
+                );
+                return Err(OnyxError::Cancelled);
             }
             Err(err) => {
                 report.failed.push((src.clone(), err.to_string()));
@@ -795,11 +934,13 @@ fn remove_dir_safe_no_follow(dir: &Path) -> OnyxResult<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn move_items_blocking(
     op_id: u64,
     sources: &[PathBuf],
     destination_dir: &Path,
     conflict: ConflictPolicy,
+    mut resolver: Option<Box<dyn ConflictResolver>>,
     cancel: &CancellationToken,
     progress: Option<&mpsc::Sender<OperationProgress>>,
     space_checker: &dyn SpaceChecker,
@@ -826,6 +967,7 @@ fn move_items_blocking(
     let mut reverse_moves: Vec<(PathBuf, PathBuf)> = Vec::new();
     let mut bytes_copied = 0u64;
     let mut completed_items = 0usize;
+    let mut sticky_resolution: Option<ConflictResolution> = None;
 
     for src in sources {
         if cancel.is_cancelled() {
@@ -874,20 +1016,44 @@ fn move_items_blocking(
             continue;
         }
 
-        let target = match resolve_conflict(src, &desired_target, conflict, false) {
-            Ok(ConflictResolution::Skip) => {
+        let target = match resolve_item_conflict(
+            src,
+            &desired_target,
+            conflict,
+            &mut resolver,
+            &mut sticky_resolution,
+        ) {
+            Ok(PathConflictOutcome::Skip) => {
                 report.skipped.push(src.clone());
                 completed_items += 1;
                 continue;
             }
-            Ok(ConflictResolution::Proceed(path)) => path,
-            Ok(ConflictResolution::Overwrite(path)) => {
+            Ok(PathConflictOutcome::Proceed(path)) => path,
+            Ok(PathConflictOutcome::Overwrite(path)) => {
                 if let Err(err) = remove_existing_for_overwrite(&path) {
                     report.failed.push((src.clone(), err.to_string()));
                     completed_items += 1;
                     continue;
                 }
                 path
+            }
+            Err(OnyxError::Cancelled) => {
+                send_progress(
+                    progress,
+                    OperationProgress {
+                        op_id,
+                        kind: OperationKind::Move,
+                        current_item: src.display().to_string(),
+                        completed_items,
+                        total_items,
+                        bytes_copied,
+                        total_bytes,
+                        finished: true,
+                        cancelled: true,
+                        error: None,
+                    },
+                );
+                return Err(OnyxError::Cancelled);
             }
             Err(err) => {
                 report.failed.push((src.clone(), err.to_string()));
@@ -1012,12 +1178,12 @@ fn rename_item_blocking(
 
     let mut report = OperationReport::default();
     let target = match resolve_conflict(source, &desired, conflict, true)? {
-        ConflictResolution::Skip => {
+        PathConflictOutcome::Skip => {
             report.skipped.push(source.to_path_buf());
             return Ok(report);
         }
-        ConflictResolution::Proceed(path) => path,
-        ConflictResolution::Overwrite(path) => {
+        PathConflictOutcome::Proceed(path) => path,
+        PathConflictOutcome::Overwrite(path) => {
             remove_existing_for_overwrite(&path)?;
             path
         }
@@ -1846,5 +2012,221 @@ mod tests {
             assert_eq!(del.succeeded, vec![tree.clone()]);
             assert!(!tree.exists());
         }
+    }
+
+    #[tokio::test]
+    async fn copy_with_resolver_handles_overwrite_skip_keep_both_and_cancel() {
+        use crate::path_guard::generate_keep_both_path;
+        use crate::types::ConflictDecision;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let work = tempfile::TempDir::new().unwrap();
+        let trash = tempfile::TempDir::new().unwrap();
+        let (engine, _) = test_engine(&trash);
+
+        let src_dir = work.path().join("src");
+        let dst_dir = work.path().join("dst");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dst_dir).unwrap();
+
+        // Prepare colliding files: overwrite, skip, keep-both (with existing (2) so it jumps to (3)),
+        // and extensionless file.
+        let f_over = src_dir.join("overwrite.txt");
+        let f_skip = src_dir.join("skip.txt");
+        let f_keep = src_dir.join("report.pdf");
+        let f_noext = src_dir.join("README");
+        fs::write(&f_over, b"new-over").unwrap();
+        fs::write(&f_skip, b"new-skip").unwrap();
+        fs::write(&f_keep, b"new-pdf").unwrap();
+        fs::write(&f_noext, b"new-readme").unwrap();
+
+        fs::write(dst_dir.join("overwrite.txt"), b"old-over").unwrap();
+        fs::write(dst_dir.join("skip.txt"), b"old-skip").unwrap();
+        fs::write(dst_dir.join("report.pdf"), b"old-pdf-1").unwrap();
+        fs::write(dst_dir.join("report (2).pdf"), b"old-pdf-2").unwrap();
+        fs::write(dst_dir.join("README"), b"old-readme").unwrap();
+
+        assert_eq!(
+            generate_keep_both_path(&dst_dir.join("report.pdf")).unwrap(),
+            dst_dir.join("report (3).pdf")
+        );
+        assert_eq!(
+            generate_keep_both_path(&dst_dir.join("README")).unwrap(),
+            dst_dir.join("README (2)")
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let report = engine
+            .copy_items_with_resolver(
+                &[f_over, f_skip.clone(), f_keep, f_noext],
+                &dst_dir,
+                ConflictPolicy::Fail,
+                move |info: &ConflictInfo| {
+                    calls_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                    assert!(!info.is_dir);
+                    match info
+                        .destination
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                    {
+                        "overwrite.txt" => ConflictDecision::once(ConflictResolution::Overwrite),
+                        "skip.txt" => ConflictDecision::once(ConflictResolution::Skip),
+                        _ => ConflictDecision::once(ConflictResolution::KeepBoth),
+                    }
+                },
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 4);
+        assert_eq!(report.skipped, vec![f_skip]);
+        assert_eq!(
+            fs::read(dst_dir.join("overwrite.txt")).unwrap(),
+            b"new-over"
+        );
+        assert_eq!(fs::read(dst_dir.join("skip.txt")).unwrap(), b"old-skip");
+        assert_eq!(fs::read(dst_dir.join("report.pdf")).unwrap(), b"old-pdf-1");
+        assert_eq!(
+            fs::read(dst_dir.join("report (2).pdf")).unwrap(),
+            b"old-pdf-2"
+        );
+        assert_eq!(
+            fs::read(dst_dir.join("report (3).pdf")).unwrap(),
+            b"new-pdf"
+        );
+        assert_eq!(fs::read(dst_dir.join("README (2)")).unwrap(), b"new-readme");
+
+        // Cancel decision aborts operation cleanly.
+        let f_cancel = src_dir.join("cancel.txt");
+        let f_after = src_dir.join("after.txt");
+        fs::write(&f_cancel, b"c").unwrap();
+        fs::write(&f_after, b"a").unwrap();
+        fs::write(dst_dir.join("cancel.txt"), b"existing").unwrap();
+
+        let err = engine
+            .copy_items_with_resolver(
+                &[f_cancel, f_after],
+                &dst_dir,
+                ConflictPolicy::Fail,
+                |_: &ConflictInfo| ConflictDecision::once(ConflictResolution::Cancel),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OnyxError::Cancelled));
+        assert!(!dst_dir.join("after.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn resolver_apply_to_all_reuses_decision_across_copy_and_move() {
+        use crate::types::ConflictDecision;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let work = tempfile::TempDir::new().unwrap();
+        let trash = tempfile::TempDir::new().unwrap();
+        let (engine, _) = test_engine(&trash);
+
+        let src_dir = work.path().join("src");
+        let dst_dir = work.path().join("dst");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&dst_dir).unwrap();
+
+        let mut sources = Vec::new();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            let s = src_dir.join(name);
+            fs::write(&s, format!("new-{name}")).unwrap();
+            fs::write(dst_dir.join(name), format!("old-{name}")).unwrap();
+            sources.push(s);
+        }
+
+        let copy_calls = Arc::new(AtomicUsize::new(0));
+        let copy_calls_clone = Arc::clone(&copy_calls);
+        let rep = engine
+            .copy_items_with_resolver(
+                &sources,
+                &dst_dir,
+                ConflictPolicy::Fail,
+                move |_: &ConflictInfo| {
+                    copy_calls_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                    ConflictDecision::for_all(ConflictResolution::KeepBoth)
+                },
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(copy_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(rep.succeeded.len(), 3);
+        assert!(dst_dir.join("a (2).txt").exists());
+        assert!(dst_dir.join("b (2).txt").exists());
+        assert!(dst_dir.join("c (2).txt").exists());
+
+        // Move with apply_to_all = Skip invokes resolver only once and leaves all sources intact.
+        let move_calls = Arc::new(AtomicUsize::new(0));
+        let move_calls_clone = Arc::clone(&move_calls);
+        let move_rep = engine
+            .move_items_with_resolver(
+                &sources,
+                &dst_dir,
+                ConflictPolicy::Fail,
+                move |_: &ConflictInfo| {
+                    move_calls_clone.fetch_add(1, AtomicOrdering::SeqCst);
+                    ConflictDecision::for_all(ConflictResolution::Skip)
+                },
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(move_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(move_rep.skipped.len(), 3);
+        for s in &sources {
+            assert!(s.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn source_equals_destination_overwrite_preserves_data() {
+        use crate::types::ConflictDecision;
+
+        let work = tempfile::TempDir::new().unwrap();
+        let trash = tempfile::TempDir::new().unwrap();
+        let (engine, _) = test_engine(&trash);
+
+        let file = work.path().join("important.txt");
+        fs::write(&file, b"precious-data").unwrap();
+
+        let copy_rep = engine
+            .copy_items_with_resolver(
+                std::slice::from_ref(&file),
+                work.path(),
+                ConflictPolicy::Fail,
+                |_: &ConflictInfo| ConflictDecision::once(ConflictResolution::Overwrite),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(copy_rep.skipped, vec![file.clone()]);
+        assert_eq!(fs::read(&file).unwrap(), b"precious-data");
+
+        let move_rep = engine
+            .move_items_with_resolver(
+                std::slice::from_ref(&file),
+                work.path(),
+                ConflictPolicy::Fail,
+                |_: &ConflictInfo| ConflictDecision::once(ConflictResolution::Overwrite),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(move_rep.skipped, vec![file.clone()]);
+        assert_eq!(fs::read(&file).unwrap(), b"precious-data");
     }
 }

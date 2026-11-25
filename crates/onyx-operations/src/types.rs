@@ -19,6 +19,80 @@ pub enum ConflictPolicy {
     Cancel,
 }
 
+/// Interactive resolution chosen for an individual file or directory conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConflictResolution {
+    /// Replace the existing destination item (never deleting a source when source == destination).
+    Overwrite,
+    /// Leave the existing destination untouched and skip this item.
+    Skip,
+    /// Keep both items by generating a unique Windows-Explorer-style sibling name (`name (2).ext`).
+    KeepBoth,
+    /// Abort the running operation cleanly.
+    Cancel,
+}
+
+impl From<ConflictResolution> for ConflictPolicy {
+    fn from(value: ConflictResolution) -> Self {
+        match value {
+            ConflictResolution::Overwrite => Self::Overwrite,
+            ConflictResolution::Skip => Self::Skip,
+            ConflictResolution::KeepBoth => Self::AutoRename,
+            ConflictResolution::Cancel => Self::Cancel,
+        }
+    }
+}
+
+/// Decision returned by a [`ConflictResolver`] for a single conflict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ConflictDecision {
+    pub resolution: ConflictResolution,
+    pub apply_to_all: bool,
+}
+
+impl ConflictDecision {
+    /// Applies `resolution` only to the current conflict.
+    #[must_use]
+    pub const fn once(resolution: ConflictResolution) -> Self {
+        Self {
+            resolution,
+            apply_to_all: false,
+        }
+    }
+
+    /// Applies `resolution` to the current conflict and all remaining conflicts in this operation.
+    #[must_use]
+    pub const fn for_all(resolution: ConflictResolution) -> Self {
+        Self {
+            resolution,
+            apply_to_all: true,
+        }
+    }
+}
+
+/// Contextual details about a destination collision passed to a [`ConflictResolver`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictInfo {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub is_dir: bool,
+}
+
+/// Callback interface allowing callers (such as a UI dialog) to resolve copy/move conflicts
+/// dynamically per item.
+pub trait ConflictResolver: Send {
+    fn resolve(&mut self, info: &ConflictInfo) -> ConflictDecision;
+}
+
+impl<F> ConflictResolver for F
+where
+    F: FnMut(&ConflictInfo) -> ConflictDecision + Send,
+{
+    fn resolve(&mut self, info: &ConflictInfo) -> ConflictDecision {
+        self(info)
+    }
+}
+
 /// Kind of file operation tracked in progress notifications.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperationKind {

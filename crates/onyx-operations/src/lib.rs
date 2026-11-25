@@ -19,9 +19,12 @@ pub use archive::{
     list_archive_entries_with_limits,
 };
 pub use engine::FileOperationsEngine;
-pub use path_guard::{generate_auto_rename_path, is_same_or_descendant, validate_item_name};
+pub use path_guard::{
+    generate_auto_rename_path, generate_keep_both_path, is_same_or_descendant, validate_item_name,
+};
 pub use recycler::{Recycler, SpaceChecker, WindowsRecycler, WindowsSpaceChecker};
 pub use types::{
-    ConflictPolicy, OperationKind, OperationProgress, OperationReport, PermanentDeleteRequest,
+    ConflictDecision, ConflictInfo, ConflictPolicy, ConflictResolution, ConflictResolver,
+    OperationKind, OperationProgress, OperationReport, PermanentDeleteRequest,
 };
 pub use undo::{DEFAULT_UNDO_CAPACITY, UndoAction, UndoJournal};
