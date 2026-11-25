@@ -79,3 +79,29 @@ Nach jedem Meilenstein die Qualitätschecks aus [AGENTS.md](../AGENTS.md) ausfü
   - Grundlegende gestalterische Überarbeitung der Oberfläche (Farb-/Kontrastsystem, Typografie, Abstände/Dichte, Header-/Tab-/Toolbar-Aufbau, Seitenleiste, Dateiliste und Dark/Light-Theme), um ein wirklich stimmiges, eigenes und vertrautes Design zu finden.
   - Vor der Umsetzung gezielt Design-Entwürfe/Varianten abstimmen, statt blind umzubauen.
 - [ ] **Weitere Phase-8-Ideen** siehe [Roadmap](ROADMAP.md) (Inline-Filter & Gruppierung, Baumansicht, anpassbare Spalten, USB/Netzwerk-Hotplug, `.7z`/`.tar.gz`, RAM-Optimierung, USN-Journal, signierte Releases).
+
+## GPUI-Spike: Lücken bis zur Slint-Parität
+
+Stand: [onyx-ui-gpui](../crates/onyx-ui-gpui/src) deckt die Kernoberfläche bereits ab (Tabs, Dual-Pane, Seitenleiste, Vorschau, Quick-Look, Einstellungen, Command-Palette, natives Kontextmenü, ZIP-Overlay, internes Drag & Drop, Watcher, Sitzungspersistenz, Ordnergrößen, Thumbnails). Beide Oberflächen haben 31 Befehle, aber unterschiedliche Sätze: dem Spike fehlen `move-tab-pane`, `preview-side`, `powershell`, `command-prompt` und `index`, dafür hat er `up`, `view-mode`, `copy-path`, `system-files` und `folder-sizes` voraus. Die folgenden Pakete schließen die Lücke; sie sind Implementierungsarbeit, keine Framework-Grenze.
+
+- [ ] **1. Indexierte Suche anbinden (`onyx-search`, 1–2 Tage):**
+  - `onyx-search` als Dependency des Spike-Crates aufnehmen. Heute fehlt sie dort, die Suche filtert nur die bereits geladenen Einträge im Speicher und kennt keine Treffer außerhalb des aktuellen Ordners.
+  - Indexer-Lebenszyklus wie in der Slint-App übernehmen: Indexdatei, Update-Debounce auf Watcher-Ereignisse und sauberes Herunterfahren per `CancellationToken`.
+  - Treffer als eigenen Listenmodus einspeisen, mit eigener `GenerationId` pro Suchlauf und Abbruch beim Weitertippen; Ergebnisse über `Entity::update` auf den GPUI-Thread zustellen, nie blockierend.
+  - Befehl `index` (Indexer starten/anhalten/neu aufbauen) und einen Suchmodus in der Command-Palette ergänzen, dazu den Einstellungs-Schalter für die indexierte Suche an `AppConfig` anbinden.
+  - Abnahme: Suche über 50k Dateien liefert Treffer ohne Ruckeln, ein neuer Tastendruck bricht den alten Lauf ab, der Index übersteht einen Neustart.
+- [ ] **2. Drag-out über OLE (`DoDragDrop`, ~1 Tag):**
+  - `onyx_windows::start_external_file_drag` auslösen, sobald die Ziehgeste das Fenster verlässt. Heute gibt es nur internes Drag & Drop, Dateien lassen sich nicht in Explorer, Desktop oder andere Anwendungen ziehen.
+  - Den Drag auf einem eigenen STA-Thread starten und das `DragOutcome` zurückmelden (bei Move die Quelle nach Erfolg entfernen, bei Copy nichts), ohne den UI-Thread zu blockieren; einen laufenden internen Drag dabei sauber abbrechen.
+  - Abnahme: Ziehen in Explorer, Desktop und Outlook funktioniert, Move verschiebt tatsächlich, `Escape` bricht ab, ohne dass die Auswahl verloren geht.
+- [ ] **3. Barrierefreiheit nachziehen (2–3 Tage):**
+  - Rollen und Labels in Dateiliste (`list`/`list-item`), Tabellenkopf, Toolbar, Tableiste, Seitenleiste und allen Dialogen ergänzen. Vorbild ist die Slint-Oberfläche, die `accessible-label` in zwölf Dateien setzt; der Spike hat heute keine `aria`-Attribute.
+  - Fokusreihenfolge und Fokusfalle in den Modals (Command-Palette, Einstellungen, Prompt- und Konfliktdialog, Archive-Overlay), `Escape` und `Tab` überall gleich.
+  - Abnahme: Narrator liest Dateiliste, Auswahl und Dialoge sinnvoll vor; ein kompletter Durchlauf ist nur mit Tastatur und Screenreader möglich.
+- [x] **4. Kleinere Befehle für volle Command-Parität (0,5–1 Tag):**
+  - `reset-layout`, `compress-zip`, `extract-here`, `extract-to-folder` und `browse-archive` sind als Command-Palette-Einträge ergänzt; der Spike hat damit 31 Befehle wie die Slint-App.
+  - Offen bleiben `move-tab-pane` (braucht ein Tab-Modell pro Bereich, der Spike hat heute einen globalen `TabManager`) und `preview-side` (braucht ein Feld für die Vorschauseite plus Render-Reihenfolge in [splitter.rs](../crates/onyx-ui-gpui/src/components/splitter.rs)) — beides Modellarbeit, kein Paletten-Eintrag.
+
+Dateien: [Cargo.toml](../crates/onyx-ui-gpui/Cargo.toml), [explorer.rs](../crates/onyx-ui-gpui/src/explorer.rs), [file_pane.rs](../crates/onyx-ui-gpui/src/components/file_pane.rs), [command_palette.rs](../crates/onyx-ui-gpui/src/components/command_palette.rs), [settings_overlay.rs](../crates/onyx-ui-gpui/src/components/settings_overlay.rs) und [context_menu.rs](../crates/onyx-ui-gpui/src/components/context_menu.rs).
+
+Diese Pakete lohnen erst nach der Entscheidung aus „UI-Redesign & Frontend-Evaluation“ oben. Bis dahin bleibt der Spike ein Prototyp und wird von CI und Release nicht gebaut.
