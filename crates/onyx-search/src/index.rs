@@ -10,8 +10,9 @@ use onyx_core::{
 use rusqlite::{Connection, OptionalExtension, params, types::Value};
 use std::collections::VecDeque;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 const INDEX_BATCH_SIZE: usize = 512;
@@ -189,6 +190,82 @@ impl SearchIndex {
         Ok(())
     }
 
+    /// Reads filesystem metadata for `path` and inserts or updates it in the index.
+    ///
+    /// - If `path` matches [`Self::excluded_dirs`], ensures it is removed and returns `Ok(())`.
+    /// - If `path` no longer exists on disk, removes it (and any descendants) and returns `Ok(())`.
+    /// - If `path` is a directory, upserts the directory entry and recursively indexes its
+    ///   non-excluded descendants.
+    pub fn upsert_path(&self, path: &Path) -> OnyxResult<()> {
+        if self.is_excluded(path) {
+            return self.remove_path(path);
+        }
+
+        let ext_path = to_extended_length_path(path);
+        let meta = match std::fs::symlink_metadata(&ext_path) {
+            Ok(m) => m,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return self.remove_path(path);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                return Err(OnyxError::PermissionDenied {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(err) => return Err(OnyxError::Io(err)),
+        };
+
+        let root_entry = file_entry_from_metadata(path, &meta);
+        if !is_safe_traversable_dir(&meta) {
+            return self.upsert_entry(&root_entry);
+        }
+
+        let mut pending = Vec::with_capacity(INDEX_BATCH_SIZE);
+        pending.push(root_entry);
+
+        let mut queue = VecDeque::new();
+        queue.push_back(path.to_path_buf());
+
+        while let Some(dir) = queue.pop_front() {
+            if self.is_excluded(&dir) {
+                continue;
+            }
+            let dir_ext = to_extended_length_path(&dir);
+            let Ok(read_dir) = std::fs::read_dir(&dir_ext) else {
+                continue;
+            };
+
+            for entry_res in read_dir {
+                let Ok(dir_entry) = entry_res else {
+                    continue;
+                };
+                let child_path = dir.join(dir_entry.file_name());
+                if self.is_excluded(&child_path) {
+                    continue;
+                }
+                let child_ext = to_extended_length_path(&child_path);
+                let Ok(child_meta) = std::fs::symlink_metadata(&child_ext) else {
+                    continue;
+                };
+                let child_entry = file_entry_from_metadata(&child_path, &child_meta);
+                if is_safe_traversable_dir(&child_meta) {
+                    queue.push_back(child_path);
+                }
+                pending.push(child_entry);
+                if pending.len() >= INDEX_BATCH_SIZE {
+                    self.upsert_batch(&pending)?;
+                    pending.clear();
+                }
+            }
+        }
+
+        if !pending.is_empty() {
+            self.upsert_batch(&pending)?;
+        }
+        self.set_last_indexed_now()?;
+        Ok(())
+    }
+
     /// Removes `path` and any indexed descendants under `path` from the index.
     pub fn remove_path(&self, path: &Path) -> OnyxResult<()> {
         let mut conn = self.lock_conn()?;
@@ -202,15 +279,34 @@ impl SearchIndex {
             params![exact, like_pattern],
         )
         .map_err(db_err)?;
+        set_meta_in_tx(&tx, "last_indexed_at", &current_unix_secs().to_string())?;
 
         tx.commit().map_err(db_err)?;
         Ok(())
     }
 
-    /// Removes stale indexed entries under `root` whose files no longer exist on disk.
+    /// Removes stale or newly excluded indexed entries under `root` and indexes any current
+    /// non-excluded entries on disk.
     ///
     /// Returns the number of pruned entries.
     pub fn reconcile_directory(&self, root: &Path) -> OnyxResult<usize> {
+        self.reconcile_directory_with_cancel(root, &CancellationToken::new())
+    }
+
+    /// Cancellable variant of [`Self::reconcile_directory`] that respects `cancel` and
+    /// [`Self::excluded_dirs`].
+    ///
+    /// Prunes entries under `root` that no longer exist on disk or now match `excluded_dirs`,
+    /// and upserts any current non-excluded entries on disk. Returns the number of pruned entries.
+    pub fn reconcile_directory_with_cancel(
+        &self,
+        root: &Path,
+        cancel: &CancellationToken,
+    ) -> OnyxResult<usize> {
+        if cancel.is_cancelled() {
+            return Err(OnyxError::Cancelled);
+        }
+
         let root_str = canonical_db_path(root);
         let like_pattern = dir_descendants_like_pattern(&root_str);
 
@@ -235,29 +331,51 @@ impl SearchIndex {
         };
 
         let mut stale = Vec::new();
-        for p in paths {
-            let ext_path = to_extended_length_path(Path::new(&p));
+        for (idx, p) in paths.into_iter().enumerate() {
+            if idx.is_multiple_of(CANCEL_CHECK_INTERVAL) && cancel.is_cancelled() {
+                return Err(OnyxError::Cancelled);
+            }
+            let path_obj = Path::new(&p);
+            if self.is_excluded(path_obj) {
+                stale.push(p);
+                continue;
+            }
+            let ext_path = to_extended_length_path(path_obj);
             if std::fs::symlink_metadata(&ext_path).is_err() {
                 stale.push(p);
             }
         }
 
-        if stale.is_empty() {
-            return Ok(0);
+        let pruned_count = stale.len();
+        if !stale.is_empty() {
+            let mut conn = self.lock_conn()?;
+            let tx = conn.transaction().map_err(db_err)?;
+            {
+                let mut del_stmt = tx
+                    .prepare("DELETE FROM indexed_files WHERE path = ?1")
+                    .map_err(db_err)?;
+                for p in &stale {
+                    del_stmt.execute(params![p]).map_err(db_err)?;
+                }
+            }
+            set_meta_in_tx(&tx, "last_indexed_at", &current_unix_secs().to_string())?;
+            tx.commit().map_err(db_err)?;
         }
 
-        let mut conn = self.lock_conn()?;
-        let tx = conn.transaction().map_err(db_err)?;
-        {
-            let mut del_stmt = tx
-                .prepare("DELETE FROM indexed_files WHERE path = ?1")
-                .map_err(db_err)?;
-            for p in &stale {
-                del_stmt.execute(params![p]).map_err(db_err)?;
-            }
+        if cancel.is_cancelled() {
+            return Err(OnyxError::Cancelled);
         }
-        tx.commit().map_err(db_err)?;
-        Ok(stale.len())
+
+        // If `root` still exists on disk and is not excluded, walk and upsert current files.
+        let root_ext = to_extended_length_path(root);
+        if !self.is_excluded(root)
+            && let Ok(meta) = std::fs::symlink_metadata(&root_ext)
+            && meta.is_dir()
+        {
+            let _ = self.index_directory(root, cancel)?;
+        }
+
+        Ok(pruned_count)
     }
 
     /// Queries the SQLite FTS5 index with safe query escaping and SQL metadata filters.
@@ -451,15 +569,13 @@ impl SearchIndex {
         })
     }
 
-    fn is_excluded(&self, path: &Path) -> bool {
+    /// Returns whether `path` is inside or matches any configured excluded directory.
+    #[must_use]
+    pub fn is_excluded(&self, path: &Path) -> bool {
         if self.excluded_dirs.is_empty() {
             return false;
         }
         let candidate = canonical_db_path(path);
-        let file_name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
 
         for excluded in &self.excluded_dirs {
             if excluded.is_absolute() {
@@ -469,12 +585,17 @@ impl SearchIndex {
                 }
             } else {
                 let excluded_name = excluded.to_string_lossy();
-                #[cfg(windows)]
-                let matches = file_name.eq_ignore_ascii_case(&excluded_name);
-                #[cfg(not(windows))]
-                let matches = file_name == excluded_name.as_ref();
-                if matches {
-                    return true;
+                for comp in path.components() {
+                    if let Component::Normal(os_str) = comp {
+                        let comp_str = os_str.to_string_lossy();
+                        #[cfg(windows)]
+                        let matches = comp_str.eq_ignore_ascii_case(&excluded_name);
+                        #[cfg(not(windows))]
+                        let matches = comp_str == excluded_name.as_ref();
+                        if matches {
+                            return true;
+                        }
+                    }
                 }
             }
         }
@@ -507,6 +628,8 @@ impl SearchIndex {
 }
 
 fn configure_connection(conn: &Connection, enable_wal: bool) -> OnyxResult<()> {
+    conn.busy_timeout(Duration::from_millis(5000))
+        .map_err(db_err)?;
     if enable_wal {
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(db_err)?;

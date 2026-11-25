@@ -15,6 +15,8 @@ pub enum ConflictPolicy {
     AutoRename,
     /// Fail the conflicting item (or operation) with an `AlreadyExists` error.
     Fail,
+    /// Abort/cancel the operation immediately when a conflict is encountered.
+    Cancel,
 }
 
 /// Kind of file operation tracked in progress notifications.
@@ -27,6 +29,8 @@ pub enum OperationKind {
     Duplicate,
     Recycle,
     PermanentDelete,
+    ExtractArchive,
+    CreateArchive,
 }
 
 /// Explicit request required for irreversible permanent deletion.

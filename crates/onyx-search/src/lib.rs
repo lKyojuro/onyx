@@ -4,11 +4,13 @@ pub mod index;
 pub mod live;
 pub mod types;
 pub mod unified;
+pub mod updater;
 
 pub use index::SearchIndex;
 pub use live::LiveSearchEngine;
 pub use types::{DEFAULT_MAX_RESULTS, IndexStats, SearchQuery, SearchResult, SearchSource};
 pub use unified::UnifiedSearchEngine;
+pub use updater::{DEFAULT_INDEXER_DEBOUNCE, IncrementalIndexer};
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -420,5 +422,208 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entry.name, "mid.txt");
+    }
+
+    #[test]
+    fn sqlite_index_fts5_special_chars_and_prefix_matching() {
+        let temp = build_sample_tree();
+        fs::write(temp.path().join("parens (2026) [draft].txt"), "draft").unwrap();
+        let index = SearchIndex::open_in_memory().unwrap();
+        index
+            .index_directory(temp.path(), &CancellationToken::new())
+            .unwrap();
+
+        // Prefix wildcard and quoted queries must return expected matches without syntax errors
+        for q in ["alph*", "\"alpha\"", "alpha*"] {
+            let hits = index
+                .query(
+                    Some(temp.path()),
+                    &SearchQuery {
+                        text: q.to_string(),
+                        ..SearchQuery::default()
+                    },
+                )
+                .unwrap();
+            assert!(
+                hits.iter().any(|r| r.entry.name == "alpha.rs"),
+                "Expected alpha.rs in results for query {q:?}, got {hits:?}"
+            );
+        }
+
+        // Parentheses, brackets, dashes, dots, colons
+        let paren_hits = index
+            .query(
+                Some(temp.path()),
+                &SearchQuery {
+                    text: "parens (2026)".to_string(),
+                    ..SearchQuery::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(paren_hits.len(), 1);
+        assert_eq!(paren_hits[0].entry.name, "parens (2026) [draft].txt");
+    }
+
+    #[test]
+    fn sqlite_index_upsert_path_remove_path_and_reconcile_respect_exclusions_and_cancel() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path();
+
+        let sub = root.join("pkg");
+        fs::create_dir_all(&sub).unwrap();
+        let f1 = sub.join("lib.rs");
+        let f2 = sub.join("helper.rs");
+        fs::write(&f1, "pub fn lib() {}").unwrap();
+        fs::write(&f2, "pub fn helper() {}").unwrap();
+
+        let mut index = SearchIndex::open_in_memory().unwrap();
+
+        // upsert_path on a directory indexes both the directory and its descendants
+        index.upsert_path(&sub).unwrap();
+        let hits = index
+            .query(
+                Some(root),
+                &SearchQuery {
+                    text: "helper".to_string(),
+                    ..SearchQuery::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+
+        // remove_path on a directory removes the directory and all descendants
+        index.remove_path(&sub).unwrap();
+        let after_dir_remove = index
+            .query(
+                Some(root),
+                &SearchQuery {
+                    text: "helper".to_string(),
+                    ..SearchQuery::default()
+                },
+            )
+            .unwrap();
+        assert!(after_dir_remove.is_empty());
+
+        // Re-index root, then add "pkg" to excluded_dirs and verify reconcile_directory prunes it
+        index
+            .index_directory(root, &CancellationToken::new())
+            .unwrap();
+        index.add_excluded_dir(PathBuf::from("pkg"));
+        let pruned = index.reconcile_directory(root).unwrap();
+        assert!(pruned >= 3);
+
+        // Pre-cancelled token on reconcile_directory_with_cancel returns Cancelled
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = index
+            .reconcile_directory_with_cancel(root, &cancel)
+            .unwrap_err();
+        assert!(matches!(err, OnyxError::Cancelled));
+    }
+
+    #[test]
+    fn incremental_indexer_detects_create_rename_delete_and_concurrent_queries() {
+        use std::time::{Duration, Instant};
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().to_path_buf();
+        let excluded = root.join("ignored_dir");
+        fs::create_dir_all(&excluded).unwrap();
+
+        let index = SearchIndex::open_in_memory().unwrap();
+        index
+            .index_directory(&root, &CancellationToken::new())
+            .unwrap();
+        let shared = Arc::new(Mutex::new(index));
+
+        let indexer = IncrementalIndexer::start_with_debounce(
+            Arc::clone(&shared),
+            vec![PathBuf::from("ignored_dir")],
+            Duration::from_millis(30),
+        )
+        .unwrap();
+        indexer.watch_root(root.clone()).unwrap();
+        assert_eq!(indexer.watched_roots().len(), 1);
+
+        let wait_for_hit = |query_text: &str, expected_count: usize| -> bool {
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while Instant::now() < deadline {
+                if let Ok(guard) = shared.lock() {
+                    let res = guard
+                        .query(
+                            Some(&root),
+                            &SearchQuery {
+                                text: query_text.to_string(),
+                                ..SearchQuery::default()
+                            },
+                        )
+                        .unwrap();
+                    if res.len() == expected_count {
+                        return true;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            false
+        };
+
+        // 1. Create a file -> detected and indexed automatically
+        let created = root.join("live_created.txt");
+        fs::write(&created, "hello indexer").unwrap();
+        // Also write inside excluded dir -> must never be indexed
+        fs::write(excluded.join("live_created_ignored.txt"), "ignored").unwrap();
+
+        assert!(
+            wait_for_hit("live_created.txt", 1),
+            "IncrementalIndexer did not index newly created file"
+        );
+        assert!(
+            wait_for_hit("live_created_ignored", 0),
+            "Excluded directory file must not be indexed"
+        );
+
+        // 2. Rename the file -> old name removed, new name indexed
+        let renamed = root.join("live_renamed.txt");
+        fs::rename(&created, &renamed).unwrap();
+        assert!(
+            wait_for_hit("live_renamed.txt", 1),
+            "IncrementalIndexer did not index renamed file"
+        );
+        assert!(
+            wait_for_hit("live_created.txt", 0),
+            "IncrementalIndexer did not prune old renamed path"
+        );
+
+        // 3. Concurrent reader thread querying while files are created and deleted
+        let reader_shared = Arc::clone(&shared);
+        let reader_root = root.clone();
+        let reader_handle = std::thread::spawn(move || {
+            for _ in 0..40 {
+                let guard = reader_shared.lock().unwrap();
+                let _ = guard
+                    .query(
+                        Some(&reader_root),
+                        &SearchQuery {
+                            text: "live*".to_string(),
+                            ..SearchQuery::default()
+                        },
+                    )
+                    .unwrap();
+                drop(guard);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        // 4. Delete the file -> pruned automatically
+        fs::remove_file(&renamed).unwrap();
+        assert!(
+            wait_for_hit("live_renamed.txt", 0),
+            "IncrementalIndexer did not prune deleted file"
+        );
+
+        reader_handle.join().unwrap();
+        indexer.unwatch_root(&root);
+        assert!(indexer.watched_roots().is_empty());
+        indexer.shutdown();
     }
 }

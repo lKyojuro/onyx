@@ -240,6 +240,7 @@ pub(crate) fn resolve_conflict(
             ConflictPolicy::Fail => Err(OnyxError::AlreadyExists {
                 path: desired.to_path_buf(),
             }),
+            ConflictPolicy::Cancel => Err(OnyxError::Cancelled),
         };
     }
 
@@ -249,6 +250,7 @@ pub(crate) fn resolve_conflict(
         ConflictPolicy::Fail => Err(OnyxError::AlreadyExists {
             path: desired.to_path_buf(),
         }),
+        ConflictPolicy::Cancel => Err(OnyxError::Cancelled),
         ConflictPolicy::AutoRename => {
             let renamed = generate_auto_rename_path(desired)?;
             Ok(ConflictResolution::Proceed(renamed))
