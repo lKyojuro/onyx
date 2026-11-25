@@ -1,6 +1,7 @@
 //! Details & Grid file list with real Windows Shell icons, sortable column headers,
 //! proportional folder/file size bars, and virtualized scrolling (`uniform_list`).
 
+use crate::components::a11y;
 use crate::components::drag_drop::DropTarget;
 use crate::components::smooth_scroll::{
     DETAILS_ROW_HEIGHT, VIEWPORT_FALLBACK_PX, content_height, visible_rows,
@@ -10,8 +11,8 @@ use crate::icons::{OnyxGlyph, entry_icon_key, render_glyph};
 use crate::theme::{FONT_MD, FONT_SM, FONT_XS, OnyxTheme, RADIUS_LG, RADIUS_MD, RADIUS_SM};
 use gpui_kit::{
     Context, FontWeight, ImageSource, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ObjectFit, ParentElement, Pixels, RenderImage, ScrollEvent, StatefulInteractiveElement, Styled,
-    StyledImage, div, img, px, relative, uniform_list,
+    ObjectFit, ParentElement, Pixels, RenderImage, Role, ScrollEvent, StatefulInteractiveElement,
+    Styled, StyledImage, div, img, prelude::FluentBuilder, px, relative, uniform_list,
 };
 use onyx_core::{
     FileEntry, SortColumn, SortDirection, ViewMode, format_bytes, format_timestamp,
@@ -45,10 +46,29 @@ pub fn render_file_pane(
     let is_loading = view.pane_is_loading(pane_id);
     let error_message = view.pane_error_message(pane_id);
     let sort_spec = view.pane_sort_spec(pane_id);
+    let entry_count = entries.len();
+    let selection = view
+        .pane_selected_index(pane_id)
+        .and_then(|index| entries.get(index));
+    // Spoken list state: how many entries, what is selected, sort, view mode.
+    let list_description =
+        a11y::list_state_description(entry_count, selection, sort_spec, view.view_mode);
+    let list_label = if is_dual {
+        match pane_id {
+            PaneId::Primary => "Directory contents, primary pane",
+            PaneId::Secondary => "Directory contents, secondary pane",
+        }
+    } else {
+        "Directory contents"
+    };
 
     let pane_container_id = match pane_id {
         PaneId::Primary => "onyx-pane-primary",
         PaneId::Secondary => "onyx-pane-secondary",
+    };
+    let pane_index = match pane_id {
+        PaneId::Primary => 0usize,
+        PaneId::Secondary => 1usize,
     };
 
     let mut pane = div()
@@ -60,8 +80,8 @@ pub fn render_file_pane(
         .overflow_hidden()
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |explorer, _, _, cx| {
-                explorer.set_active_pane(pane_id, cx);
+            cx.listener(move |explorer, _, window, cx| {
+                explorer.set_active_pane(pane_id, window, cx);
             }),
         );
 
@@ -103,6 +123,11 @@ pub fn render_file_pane(
             .child(
                 div()
                     .id(header_id)
+                    .role(Role::Group)
+                    .aria_label(format!(
+                        "{} pane, {display_path}, {count_label}",
+                        pane_label
+                    ))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -189,6 +214,9 @@ pub fn render_file_pane(
     // Details column header row
     if view.view_mode != ViewMode::Grid && error_message.is_none() {
         let mut header_row = div()
+            .id(("col-header-row", pane_index))
+            .role(Role::Toolbar)
+            .aria_label("Column headers, sort the list")
             .flex()
             .flex_row()
             .items_center()
@@ -257,6 +285,10 @@ pub fn render_file_pane(
     // Body: Error / Initial Loading / Empty / Details List / Grid List
     let body = if let Some(err) = error_message {
         div()
+            .id(("pane-error", pane_index))
+            .role(Role::Alert)
+            .aria_label("Unable to open location")
+            .aria_description(err.to_string())
             .flex()
             .flex_1()
             .items_center()
@@ -290,6 +322,9 @@ pub fn render_file_pane(
             .into_any_element()
     } else if is_loading && entries.is_empty() {
         div()
+            .id(("pane-loading", pane_index))
+            .role(Role::Status)
+            .aria_label("Loading folder")
             .flex()
             .flex_col()
             .flex_1()
@@ -311,6 +346,13 @@ pub fn render_file_pane(
     } else if entries.is_empty() {
         let has_query = !view.search_query_text().trim().is_empty();
         div()
+            .id(("pane-empty", pane_index))
+            .role(Role::Status)
+            .aria_label(if has_query {
+                "No matching items"
+            } else {
+                "This folder is empty"
+            })
             .flex()
             .flex_col()
             .flex_1()
@@ -355,7 +397,7 @@ pub fn render_file_pane(
             PaneId::Primary => "onyx-file-grid-primary",
             PaneId::Secondary => "onyx-file-grid-secondary",
         };
-        uniform_list(
+        let grid_list = uniform_list(
             grid_id,
             row_count,
             cx.processor(move |explorer, range: std::ops::Range<usize>, _, cx| {
@@ -383,6 +425,7 @@ pub fn render_file_pane(
                             row_el = row_el.child(render_grid_card(
                                 pane_id,
                                 item_idx,
+                                total,
                                 entry,
                                 is_selected,
                                 is_drop_hover,
@@ -404,8 +447,21 @@ pub fn render_file_pane(
         )
         .track_scroll(view.pane_grid_scroll(pane_id))
         .flex_1()
-        .h_full()
-        .into_any_element()
+        .h_full();
+        div()
+            .id(("onyx-file-grid-host", pane_index))
+            .role(Role::List)
+            .aria_label(list_label)
+            .aria_description(list_description.clone())
+            .track_focus(view.pane_focus_handle(pane_id))
+            .focus_visible(|style| a11y::focus_ring_style(theme, style))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .w_full()
+            .child(grid_list)
+            .into_any_element()
     } else {
         let count = entries.len();
         let list_id = match pane_id {
@@ -434,6 +490,7 @@ pub fn render_file_pane(
             row_els.push(render_details_row(
                 pane_id,
                 idx,
+                count,
                 entry,
                 is_selected,
                 is_drop_hover,
@@ -450,6 +507,11 @@ pub fn render_file_pane(
         let first_row = (offset / DETAILS_ROW_HEIGHT).floor().max(0.0) as usize;
         div()
             .id(list_id)
+            .role(Role::List)
+            .aria_label(list_label)
+            .aria_description(list_description)
+            .track_focus(view.pane_focus_handle(pane_id))
+            .focus_visible(|style| a11y::focus_ring_style(theme, style))
             .flex_1()
             .h_full()
             .overflow_hidden()
@@ -485,9 +547,9 @@ pub fn render_file_pane(
             .w_full()
             .on_mouse_down(
                 MouseButton::Right,
-                cx.listener(move |explorer, ev: &MouseDownEvent, _, cx| {
-                    explorer.set_active_pane(pane_id, cx);
-                    explorer.open_background_context_menu(ev.position, cx);
+                cx.listener(move |explorer, ev: &MouseDownEvent, window, cx| {
+                    explorer.set_active_pane(pane_id, window, cx);
+                    explorer.open_background_context_menu(ev.position, window, cx);
                 }),
             )
             .on_mouse_move(cx.listener(move |explorer, _, _, cx| {
@@ -520,8 +582,20 @@ fn column_header_btn(
         PaneId::Primary => "p1-col-hdr",
         PaneId::Secondary => "p2-col-hdr",
     };
+    let direction_label = match direction {
+        SortDirection::Ascending => "ascending",
+        SortDirection::Descending => "descending",
+    };
+    let a11y_label = if is_active {
+        format!("Sort by {label}, currently {direction_label}")
+    } else {
+        format!("Sort by {label}")
+    };
     let mut btn = div()
         .id((col_prefix, column as usize))
+        .role(Role::ColumnHeader)
+        .aria_label(a11y_label)
+        .aria_selected(is_active)
         .flex()
         .flex_row()
         .items_center()
@@ -648,6 +722,7 @@ fn entry_glyph(
 fn render_details_row(
     pane_id: PaneId,
     idx: usize,
+    count: usize,
     entry: &FileEntry,
     is_selected: bool,
     is_drop_hover: bool,
@@ -670,8 +745,14 @@ fn render_details_row(
         PaneId::Secondary => "p2-details-row",
     };
 
+    let a11y_label = a11y::entry_label(entry, &size_label, &modified_text);
     let mut inner = div()
         .id((row_prefix, idx))
+        .role(Role::ListItem)
+        .aria_label(a11y_label)
+        .aria_selected(is_selected)
+        .aria_position_in_set(idx + 1)
+        .aria_size_of_set(count.max(1))
         .relative()
         .flex()
         .flex_row()
@@ -708,7 +789,7 @@ fn render_details_row(
         })
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |explorer, ev: &MouseDownEvent, _, cx| {
+            cx.listener(move |explorer, ev: &MouseDownEvent, window, cx| {
                 explorer.select_entry_in(pane_id, idx, cx);
                 explorer.begin_drag(
                     drag_path.clone(),
@@ -717,16 +798,16 @@ fn render_details_row(
                     cx,
                 );
                 if ev.click_count >= 2 {
-                    explorer.activate_entry_in(pane_id, idx, cx);
+                    explorer.activate_entry_in(pane_id, idx, window, cx);
                 }
             }),
         )
         .on_mouse_down(
             MouseButton::Right,
-            cx.listener(move |explorer, ev: &MouseDownEvent, _, cx| {
+            cx.listener(move |explorer, ev: &MouseDownEvent, window, cx| {
                 cx.stop_propagation();
-                explorer.set_active_pane(pane_id, cx);
-                explorer.open_item_context_menu(idx, ev.position, cx);
+                explorer.set_active_pane(pane_id, window, cx);
+                explorer.open_item_context_menu(idx, ev.position, window, cx);
             }),
         )
         .on_mouse_move(cx.listener(move |explorer, _, _, cx| {
@@ -833,6 +914,9 @@ fn render_details_row(
     );
 
     inner = inner.child(size_cell);
+    if is_selected {
+        inner = inner.aria_active_descendant();
+    }
 
     div()
         .flex()
@@ -847,6 +931,7 @@ fn render_details_row(
 fn render_grid_card(
     pane_id: PaneId,
     idx: usize,
+    count: usize,
     entry: &FileEntry,
     is_selected: bool,
     is_drop_hover: bool,
@@ -872,6 +957,7 @@ fn render_grid_card(
     let is_dir = entry.is_dir();
     let drag_path = entry.path.clone();
     let hover_path = entry.path.clone();
+    let a11y_label = a11y::entry_label(entry, &sub_label, "");
 
     let mut name_el = div()
         .w_full()
@@ -886,6 +972,12 @@ fn render_grid_card(
 
     div()
         .id((card_prefix, idx))
+        .role(Role::ListItem)
+        .aria_label(a11y_label)
+        .aria_selected(is_selected)
+        .aria_position_in_set(idx + 1)
+        .aria_size_of_set(count.max(1))
+        .when(is_selected, |card| card.aria_active_descendant())
         .flex()
         .flex_col()
         .items_center()
@@ -920,7 +1012,7 @@ fn render_grid_card(
         })
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(move |explorer, ev: &MouseDownEvent, _, cx| {
+            cx.listener(move |explorer, ev: &MouseDownEvent, window, cx| {
                 explorer.select_entry_in(pane_id, idx, cx);
                 explorer.begin_drag(
                     drag_path.clone(),
@@ -929,16 +1021,16 @@ fn render_grid_card(
                     cx,
                 );
                 if ev.click_count >= 2 {
-                    explorer.activate_entry_in(pane_id, idx, cx);
+                    explorer.activate_entry_in(pane_id, idx, window, cx);
                 }
             }),
         )
         .on_mouse_down(
             MouseButton::Right,
-            cx.listener(move |explorer, ev: &MouseDownEvent, _, cx| {
+            cx.listener(move |explorer, ev: &MouseDownEvent, window, cx| {
                 cx.stop_propagation();
-                explorer.set_active_pane(pane_id, cx);
-                explorer.open_item_context_menu(idx, ev.position, cx);
+                explorer.set_active_pane(pane_id, window, cx);
+                explorer.open_item_context_menu(idx, ev.position, window, cx);
             }),
         )
         .on_mouse_move(cx.listener(move |explorer, _, _, cx| {

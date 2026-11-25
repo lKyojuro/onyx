@@ -3,13 +3,15 @@
 //! path and summary, a virtualized entry table (name, size, compressed, date),
 //! loading/error states, and "Extract here" / "Extract to Folder" actions.
 
+use crate::components::a11y;
 use crate::components::{ActionButtonProps, fluent_action_button, vertical_divider};
 use crate::explorer::OnyxExplorer;
 use crate::icons::{OnyxGlyph, render_glyph};
 use crate::theme::{FONT_LG, FONT_SM, FONT_XS, RADIUS_LG, RADIUS_SM};
 use gpui_kit::{
-    Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, Styled,
-    UniformListScrollHandle, Window, deferred, div, px, uniform_list,
+    Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, Role,
+    StatefulInteractiveElement, Styled, UniformListScrollHandle, Window, deferred, div, px,
+    uniform_list,
 };
 use onyx_core::{format_bytes, normalize_display_path};
 use onyx_operations::ArchiveEntry;
@@ -160,9 +162,18 @@ pub fn render_archive_overlay(
 ) -> Option<impl IntoElement> {
     let state = view.archive.as_ref()?;
     let theme = view.theme;
+    // Reading order of the browser: close, entry list, then both actions.
+    let ring = &view.modals.archive;
+    ring.begin();
+    let close_focus = ring.slot();
+    let list_focus = ring.slot();
+    let extract_folder_focus = ring.slot();
+    let extract_here_focus = ring.slot();
     let title = archive_title(&state.path);
+    let card_label = title.clone();
     let path_label = normalize_display_path(&state.path);
     let summary = state.summary();
+    let card_summary = summary.clone();
     let is_loading = state.is_loading;
     let error = state.error.clone();
     let row_count = state.rows.len();
@@ -228,6 +239,9 @@ pub fn render_archive_overlay(
         );
     } else {
         let header = div()
+            .id("archive-column-header")
+            .role(Role::Group)
+            .aria_label("Archive columns: name, size, packed, modified")
             .flex()
             .flex_row()
             .items_center()
@@ -274,6 +288,11 @@ pub fn render_archive_overlay(
 
         let mut list = div()
             .id("archive-entry-list-host")
+            .role(Role::List)
+            .aria_label("Archive entries")
+            .aria_description(format!("{row_count} entries"))
+            .track_focus(&list_focus)
+            .focus_visible(|style| a11y::focus_ring_style(theme, style))
             .flex()
             .flex_col()
             .flex_1()
@@ -321,6 +340,13 @@ pub fn render_archive_overlay(
                             out.push(
                                 div()
                                     .id(("archive-row", index))
+                                    .role(Role::ListItem)
+                                    .aria_label(format!(
+                                        "{}, {}, packed {}, modified {}",
+                                        row.name, row.size, row.compressed, row.modified
+                                    ))
+                                    .aria_position_in_set(index + 1)
+                                    .aria_size_of_set(row_count.max(1))
                                     .flex()
                                     .flex_row()
                                     .items_center()
@@ -415,22 +441,27 @@ pub fn render_archive_overlay(
                 .child(summary),
         )
         .child(vertical_divider(theme, px(20.0)))
-        .child(fluent_action_button(
-            ActionButtonProps {
-                id: "archive-close".into(),
-                glyph: Some(OnyxGlyph::Close),
-                trailing_glyph: None,
-                label: None,
-                active: false,
-                primary: false,
-                danger: false,
-                enabled: true,
-                compact: true,
-                min_width: px(28.0),
-            },
-            theme,
-            cx.listener(|explorer, _, window, cx| explorer.close_archive(window, cx)),
-        ));
+        .child(
+            fluent_action_button(
+                ActionButtonProps {
+                    id: "archive-close".into(),
+                    glyph: Some(OnyxGlyph::Close),
+                    trailing_glyph: None,
+                    label: None,
+                    active: false,
+                    primary: false,
+                    danger: false,
+                    enabled: true,
+                    compact: true,
+                    min_width: px(28.0),
+                },
+                theme,
+                cx.listener(|explorer, _, window, cx| explorer.close_archive(window, cx)),
+            )
+            .aria_label("Close archive browser")
+            .track_focus(&close_focus)
+            .focus_visible(|style| a11y::focus_ring_style(theme, style)),
+        );
 
     let footer = div()
         .flex()
@@ -455,41 +486,52 @@ pub fn render_archive_overlay(
                     "Enter on a .zip, .tar.gz or .tgz opens this browser"
                 }),
         )
-        .child(fluent_action_button(
-            ActionButtonProps {
-                id: "archive-extract-folder".into(),
-                glyph: Some(OnyxGlyph::FolderPlus),
-                trailing_glyph: None,
-                label: Some("Extract to Folder"),
-                active: false,
-                primary: false,
-                danger: false,
-                enabled: !is_loading && error_is_none(view) && !is_extracting,
-                compact: false,
-                min_width: px(96.0),
-            },
-            theme,
-            cx.listener(|explorer, _, _, cx| explorer.extract_archive_to_folder(cx)),
-        ))
-        .child(fluent_action_button(
-            ActionButtonProps {
-                id: "archive-extract-here".into(),
-                glyph: Some(OnyxGlyph::Download),
-                trailing_glyph: None,
-                label: Some("Extract here"),
-                active: false,
-                primary: true,
-                danger: false,
-                enabled: !is_loading && error_is_none(view) && !is_extracting,
-                compact: false,
-                min_width: px(96.0),
-            },
-            theme,
-            cx.listener(|explorer, _, _, cx| explorer.extract_archive_here(cx)),
-        ));
+        .child(
+            fluent_action_button(
+                ActionButtonProps {
+                    id: "archive-extract-folder".into(),
+                    glyph: Some(OnyxGlyph::FolderPlus),
+                    trailing_glyph: None,
+                    label: Some("Extract to Folder"),
+                    active: false,
+                    primary: false,
+                    danger: false,
+                    enabled: !is_loading && error_is_none(view) && !is_extracting,
+                    compact: false,
+                    min_width: px(96.0),
+                },
+                theme,
+                cx.listener(|explorer, _, _, cx| explorer.extract_archive_to_folder(cx)),
+            )
+            .track_focus(&extract_folder_focus)
+            .focus_visible(|style| a11y::focus_ring_style(theme, style)),
+        )
+        .child(
+            fluent_action_button(
+                ActionButtonProps {
+                    id: "archive-extract-here".into(),
+                    glyph: Some(OnyxGlyph::Download),
+                    trailing_glyph: None,
+                    label: Some("Extract here"),
+                    active: false,
+                    primary: true,
+                    danger: false,
+                    enabled: !is_loading && error_is_none(view) && !is_extracting,
+                    compact: false,
+                    min_width: px(96.0),
+                },
+                theme,
+                cx.listener(|explorer, _, _, cx| explorer.extract_archive_here(cx)),
+            )
+            .track_focus(&extract_here_focus)
+            .focus_visible(|style| a11y::focus_ring_style(theme, style)),
+        );
 
     let card = div()
         .id("archive-card")
+        .role(Role::Dialog)
+        .aria_label(card_label)
+        .aria_description(card_summary)
         .flex()
         .flex_col()
         .w(px(CARD_WIDTH))

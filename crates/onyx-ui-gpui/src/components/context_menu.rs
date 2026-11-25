@@ -6,8 +6,8 @@ use crate::explorer::OnyxExplorer;
 use crate::icons::{OnyxGlyph, render_glyph};
 use crate::theme::{FONT_SM, FONT_XS, OnyxTheme, RADIUS_MD, RADIUS_SM};
 use gpui_kit::{
-    Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, Window, deferred, div, px,
+    Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, Role,
+    StatefulInteractiveElement, Styled, Window, deferred, div, prelude::FluentBuilder, px,
 };
 use std::path::PathBuf;
 
@@ -342,6 +342,10 @@ pub fn render_context_menu_overlay(
 ) -> Option<impl IntoElement> {
     let state = view.context_menu.as_ref()?;
     let theme = view.theme;
+    // The menu card owns the keyboard while open; arrow keys move the
+    // highlighted entry, which is reported as the active descendant.
+    view.modals.menu.begin();
+    let card_focus = view.modals.menu.slot();
     let entries = build_menu_entries(&state.target, state.can_paste);
     let menu_h = estimate_menu_height(&entries);
 
@@ -359,6 +363,9 @@ pub fn render_context_menu_overlay(
 
     let mut card = div()
         .id("onyx-context-menu-card")
+        .role(Role::Menu)
+        .aria_label("Context menu")
+        .track_focus(&card_focus)
         .absolute()
         .left(px(left_x))
         .top(px(top_y))
@@ -409,22 +416,22 @@ pub fn render_context_menu_overlay(
         .inset_0()
         .on_mouse_down(
             MouseButton::Left,
-            cx.listener(|explorer, _, _, cx| {
-                explorer.close_context_menu(cx);
+            cx.listener(|explorer, _, window, cx| {
+                explorer.close_context_menu(window, cx);
                 cx.stop_propagation();
             }),
         )
         .on_mouse_down(
             MouseButton::Right,
-            cx.listener(|explorer, _, _, cx| {
-                explorer.close_context_menu(cx);
+            cx.listener(|explorer, _, window, cx| {
+                explorer.close_context_menu(window, cx);
                 cx.stop_propagation();
             }),
         )
         .on_mouse_down(
             MouseButton::Middle,
-            cx.listener(|explorer, _, _, cx| {
-                explorer.close_context_menu(cx);
+            cx.listener(|explorer, _, window, cx| {
+                explorer.close_context_menu(window, cx);
                 cx.stop_propagation();
             }),
         )
@@ -466,6 +473,13 @@ fn render_menu_row(
 
     let mut row = div()
         .id(("ctx-menu-row", idx))
+        .role(Role::MenuItem)
+        .aria_label(spec.label)
+        .aria_selected(is_highlighted)
+        .when(is_highlighted, |row| row.aria_active_descendant())
+        .when_some(spec.shortcut, |row, shortcut| {
+            row.aria_keyshortcuts(shortcut)
+        })
         .flex()
         .flex_row()
         .items_center()

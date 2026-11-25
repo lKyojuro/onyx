@@ -3,14 +3,17 @@
 //! query field, a category-grouped command list with shortcuts, and
 //! arrow/Enter/Escape handling.
 
+use crate::components::a11y;
 use crate::explorer::OnyxExplorer;
 use crate::icons::{OnyxGlyph, render_glyph};
 use crate::theme::{FONT_SM, FONT_XS, RADIUS_LG, RADIUS_SM};
 use gpui_kit::{
-    Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Styled,
+    Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, Role,
+    StatefulInteractiveElement, Styled,
     component::input::{Input, InputState},
-    deferred, div, px,
+    deferred, div,
+    prelude::FluentBuilder,
+    px,
 };
 
 const CARD_WIDTH: f32 = 560.0;
@@ -301,8 +304,17 @@ pub fn render_command_palette(
         .collect();
     let count = matches.len();
 
+    // Tab order inside the palette: the result list, then back to the query field.
+    view.modals.palette.begin();
+    let list_focus = view.modals.palette.slot();
+
     let mut list = div()
         .id("palette-list")
+        .role(Role::List)
+        .aria_label("Command palette results")
+        .aria_description(format!("{count} of {} commands", COMMANDS.len()))
+        .track_focus(&list_focus)
+        .focus_visible(|style| a11y::focus_ring_style(theme, style))
         .flex()
         .flex_col()
         .w_full()
@@ -335,6 +347,14 @@ pub fn render_command_palette(
         list = list.child(
             div()
                 .id(("palette-row", position))
+                .role(Role::Button)
+                .aria_label(title.to_string())
+                .aria_description(format!("{category} command"))
+                .aria_keyshortcuts(shortcut.to_string())
+                .aria_selected(is_selected)
+                .aria_position_in_set(position + 1)
+                .aria_size_of_set(count.max(1))
+                .when(is_selected, |row| row.aria_active_descendant())
                 .flex()
                 .flex_row()
                 .items_center()
@@ -410,6 +430,9 @@ pub fn render_command_palette(
 
     let card = div()
         .id("palette-card")
+        .role(Role::Dialog)
+        .aria_label("Command palette")
+        .aria_description("Type to filter commands, Enter runs the selected command")
         .flex()
         .flex_col()
         .w(px(CARD_WIDTH))
@@ -445,7 +468,12 @@ pub fn render_command_palette(
                         .min_w(px(0.0))
                         .text_size(FONT_SM)
                         .text_color(theme.text_primary())
-                        .child(Input::new(&state.input).appearance(false)),
+                        .child(
+                            Input::new(&state.input)
+                                .appearance(false)
+                                .aria_label("Search commands")
+                                .accessibility_id("command-palette-input"),
+                        ),
                 )
                 .child(
                     div()

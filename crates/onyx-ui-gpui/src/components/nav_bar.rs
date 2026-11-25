@@ -7,8 +7,8 @@ use crate::icons::{OnyxGlyph, render_glyph};
 use crate::theme::{FONT_MD, FONT_SM, FONT_XS, RADIUS_MD, RADIUS_SM};
 use gpui_kit::{
     Context, Focusable, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, StatefulInteractiveElement, Styled, Window, component::input::Input, deferred,
-    div, px,
+    ParentElement, Role, StatefulInteractiveElement, Styled, Window, component::input::Input,
+    deferred, div, px,
 };
 use onyx_core::build_breadcrumbs;
 
@@ -38,63 +38,80 @@ pub fn render_nav_bar(
         .items_center()
         .flex_shrink_0()
         .gap(px(2.0))
-        .child(fluent_button(
-            FluentButtonProps {
-                id: "nav-back".into(),
-                glyph: Some(OnyxGlyph::Back),
-                label: None,
-                active: false,
-                enabled: can_back,
-                compact: false,
-                min_width: px(30.0),
-            },
-            theme,
-            cx.listener(|explorer, _, _, cx| explorer.go_back(cx)),
-        ))
-        .child(fluent_button(
-            FluentButtonProps {
-                id: "nav-forward".into(),
-                glyph: Some(OnyxGlyph::Forward),
-                label: None,
-                active: false,
-                enabled: can_forward,
-                compact: false,
-                min_width: px(30.0),
-            },
-            theme,
-            cx.listener(|explorer, _, _, cx| explorer.go_forward(cx)),
-        ))
-        .child(fluent_button(
-            FluentButtonProps {
-                id: "nav-up".into(),
-                glyph: Some(OnyxGlyph::Up),
-                label: None,
-                active: false,
-                enabled: can_up,
-                compact: false,
-                min_width: px(30.0),
-            },
-            theme,
-            cx.listener(|explorer, _, _, cx| explorer.go_up(cx)),
-        ))
-        .child(fluent_button(
-            FluentButtonProps {
-                id: "nav-refresh".into(),
-                glyph: Some(OnyxGlyph::Refresh),
-                label: None,
-                active: false,
-                enabled: true,
-                compact: false,
-                min_width: px(30.0),
-            },
-            theme,
-            cx.listener(|explorer, _, _, cx| explorer.refresh(cx)),
-        ));
+        .child(
+            fluent_button(
+                FluentButtonProps {
+                    id: "nav-back".into(),
+                    glyph: Some(OnyxGlyph::Back),
+                    label: None,
+                    active: false,
+                    enabled: can_back,
+                    compact: false,
+                    min_width: px(30.0),
+                },
+                theme,
+                cx.listener(|explorer, _, _, cx| explorer.go_back(cx)),
+            )
+            .aria_label("Back")
+            .aria_keyshortcuts("Alt+Left"),
+        )
+        .child(
+            fluent_button(
+                FluentButtonProps {
+                    id: "nav-forward".into(),
+                    glyph: Some(OnyxGlyph::Forward),
+                    label: None,
+                    active: false,
+                    enabled: can_forward,
+                    compact: false,
+                    min_width: px(30.0),
+                },
+                theme,
+                cx.listener(|explorer, _, _, cx| explorer.go_forward(cx)),
+            )
+            .aria_label("Forward")
+            .aria_keyshortcuts("Alt+Right"),
+        )
+        .child(
+            fluent_button(
+                FluentButtonProps {
+                    id: "nav-up".into(),
+                    glyph: Some(OnyxGlyph::Up),
+                    label: None,
+                    active: false,
+                    enabled: can_up,
+                    compact: false,
+                    min_width: px(30.0),
+                },
+                theme,
+                cx.listener(|explorer, _, _, cx| explorer.go_up(cx)),
+            )
+            .aria_label("Up one level")
+            .aria_keyshortcuts("Alt+Up"),
+        )
+        .child(
+            fluent_button(
+                FluentButtonProps {
+                    id: "nav-refresh".into(),
+                    glyph: Some(OnyxGlyph::Refresh),
+                    label: None,
+                    active: false,
+                    enabled: true,
+                    compact: false,
+                    min_width: px(30.0),
+                },
+                theme,
+                cx.listener(|explorer, _, _, cx| explorer.refresh(cx)),
+            )
+            .aria_label("Refresh")
+            .aria_keyshortcuts("F5"),
+        );
 
     // Breadcrumbs / Editable Address Bar
     let address_box = if view.address_editing {
         div()
             .id("address-box-edit")
+            .aria_label("Address bar")
             .relative()
             .flex()
             .flex_row()
@@ -116,13 +133,22 @@ pub fn render_nav_bar(
                     .min_w(px(0.0))
                     .text_size(FONT_MD)
                     .text_color(theme.text_primary())
-                    .child(Input::new(&view.address_input).appearance(false)),
+                    .child(
+                        Input::new(&view.address_input)
+                            .appearance(false)
+                            .aria_label("Address bar")
+                            .accessibility_id("address-bar-input"),
+                    ),
             )
             .into_any_element()
     } else {
         let breadcrumbs = build_breadcrumbs(view.current_path());
         let crumb_len = breadcrumbs.len();
+        let crumb_row_label = format!("Current path, {}", view.current_path().display());
         let mut crumb_row = div()
+            .id("address-breadcrumbs")
+            .role(Role::Group)
+            .aria_label(crumb_row_label)
             .flex()
             .flex_row()
             .items_center()
@@ -148,8 +174,11 @@ pub fn render_nav_bar(
             }
             let is_last = idx + 1 == crumb_len;
             let seg_path = seg.path;
+            let crumb_label = format!("Navigate to {}", seg.label);
             let mut seg_el = div()
                 .id(("nav-crumb", idx))
+                .role(Role::Button)
+                .aria_label(crumb_label)
                 .flex()
                 .items_center()
                 .h(px(24.0))
@@ -177,6 +206,8 @@ pub fn render_nav_bar(
             .child(
                 div()
                     .id("address-empty-click")
+                    .role(Role::Button)
+                    .aria_label("Edit address bar")
                     .flex_1()
                     .min_w(px(24.0))
                     .h_full()
@@ -192,6 +223,12 @@ pub fn render_nav_bar(
             .child(
                 div()
                     .id("address-fav-btn")
+                    .role(Role::Button)
+                    .aria_label(if is_fav {
+                        "Remove folder from favorites"
+                    } else {
+                        "Pin folder to favorites"
+                    })
                     .flex()
                     .items_center()
                     .justify_center()
@@ -224,6 +261,7 @@ pub fn render_nav_bar(
     // Search Bar (`w(280px)`, matching `nav_bar.slint`)
     let search_box = div()
         .id("nav-search-box")
+        .aria_label("Search")
         .flex()
         .flex_row()
         .items_center()
@@ -261,21 +299,33 @@ pub fn render_nav_bar(
                 .child(
                     Input::new(&view.search_input)
                         .appearance(false)
-                        .cleanable(true),
+                        .cleanable(true)
+                        .aria_label(if view.indexed_search {
+                            "Search the search index, Ctrl+F"
+                        } else {
+                            "Filter this folder, Ctrl+F"
+                        })
+                        .accessibility_id("folder-search-input"),
                 ),
         )
-        .child(fluent_chip(
-            "search-index-chip".into(),
-            "Index",
-            view.indexed_search,
-            true,
-            theme,
-            Some(Box::new(cx.listener(|explorer, _, _, cx| {
-                explorer.toggle_indexed_search(cx);
-            }))),
-        ));
+        .child(
+            fluent_chip(
+                "search-index-chip".into(),
+                "Index",
+                view.indexed_search,
+                true,
+                theme,
+                Some(Box::new(cx.listener(|explorer, _, _, cx| {
+                    explorer.toggle_indexed_search(cx);
+                }))),
+            )
+            .aria_label("Search the Windows search index instead of the folder"),
+        );
 
     div()
+        .id("onyx-nav-bar")
+        .role(Role::Toolbar)
+        .aria_label("Navigation")
         .relative()
         .flex()
         .flex_row()
@@ -305,6 +355,9 @@ pub fn render_address_suggestions_overlay(
     let theme = view.theme;
 
     let mut list = div()
+        .id("address-suggestion-list")
+        .role(Role::List)
+        .aria_label("Folder suggestions")
         .flex()
         .flex_col()
         .w_full()
@@ -321,6 +374,9 @@ pub fn render_address_suggestions_overlay(
         list = list.child(
             div()
                 .id(("addr-suggestion", idx))
+                .role(Role::ListItem)
+                .aria_label(format!("Navigate to {suggestion}"))
+                .aria_selected(is_highlighted)
                 .flex()
                 .flex_row()
                 .items_center()
