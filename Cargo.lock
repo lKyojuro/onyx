@@ -3370,6 +3370,7 @@ dependencies = [
  "onyx-ui",
  "onyx-windows",
  "raw-window-handle",
+ "rayon",
  "slint",
  "tempfile",
  "tokio",
@@ -3433,8 +3434,10 @@ name = "onyx-operations"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "flate2",
  "onyx-core",
  "onyx-windows",
+ "tar",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

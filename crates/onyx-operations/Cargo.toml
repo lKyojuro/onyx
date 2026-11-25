@@ -7,8 +7,10 @@ license.workspace = true
 
 [dependencies]
 chrono.workspace = true
+flate2.workspace = true
 onyx-core.workspace = true
 onyx-windows.workspace = true
+tar.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

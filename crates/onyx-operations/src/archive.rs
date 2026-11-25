@@ -1,5 +1,7 @@
-//! Safe ZIP archive listing, extraction (with strict Zip-Slip and zip-bomb guards),
-//! and atomic archive creation off the UI thread.
+//! Safe archive listing, extraction (with strict path-traversal, symlink-escape,
+//! and decompression-bomb guards), and atomic archive creation off the UI thread.
+//!
+//! Supports `.zip`, `.tar.gz`, and `.tgz` archives.
 
 use crate::path_guard::{
     generate_auto_rename_path, is_reparse_or_symlink, is_same_normalized_path,
@@ -8,12 +10,18 @@ use crate::path_guard::{
 use crate::types::{ConflictPolicy, OperationKind, OperationProgress, OperationReport};
 use crate::undo::UndoAction;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use flate2::Compression;
+use flate2::read::MultiGzDecoder;
+use flate2::write::GzEncoder;
 use onyx_core::{OnyxError, OnyxResult};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::UNIX_EPOCH;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zip::write::SimpleFileOptions;
@@ -28,14 +36,44 @@ pub const DEFAULT_MAX_ARCHIVE_ENTRIES: usize = 50_000;
 /// Default maximum total uncompressed bytes permitted when extracting an archive (4 GiB).
 pub const DEFAULT_MAX_ARCHIVE_UNCOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Default maximum uncompressed-to-compressed ratio allowed before triggering zip-bomb rejection.
+/// Default maximum uncompressed-to-compressed ratio allowed before triggering bomb rejection.
 pub const DEFAULT_MAX_COMPRESSION_RATIO: u64 = 200;
 
 /// Minimum uncompressed byte threshold (1 MiB) before applying the compression ratio guard,
 /// preventing false positives on small highly repetitive text files.
 pub const RATIO_GUARD_MIN_UNCOMPRESSED_BYTES: u64 = 1024 * 1024;
 
-/// Metadata for a single member inside a ZIP archive.
+/// Archive container formats supported by Onyx's archive engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArchiveFormat {
+    /// Standard ZIP archive (`.zip`).
+    Zip,
+    /// Gzip-compressed TAR archive (`.tar.gz`, `.tgz`).
+    TarGz,
+}
+
+impl ArchiveFormat {
+    /// Detects the archive format from a file path's extension (case-insensitive).
+    #[must_use]
+    pub fn from_path(path: &Path) -> Option<Self> {
+        let file_name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+        if file_name.ends_with(".tar.gz") || file_name.ends_with(".tgz") {
+            Some(Self::TarGz)
+        } else if file_name.ends_with(".zip") {
+            Some(Self::Zip)
+        } else {
+            None
+        }
+    }
+}
+
+/// Returns `true` if `path` has a supported archive extension (`.zip`, `.tar.gz`, or `.tgz`).
+#[must_use]
+pub fn is_supported_archive_path(path: &Path) -> bool {
+    ArchiveFormat::from_path(path).is_some()
+}
+
+/// Metadata for a single member inside an archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArchiveEntry {
     pub name: String,
@@ -178,15 +216,15 @@ fn send_progress(tx: Option<&mpsc::Sender<OperationProgress>>, snapshot: Operati
     }
 }
 
-fn open_zip_file(archive_path: &Path) -> OnyxResult<ZipArchive<File>> {
-    let file = match File::open(archive_path) {
+fn open_archive_file(archive_path: &Path) -> OnyxResult<(File, ArchiveFormat)> {
+    let mut file = match File::open(archive_path) {
         Ok(f) => f,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return Err(OnyxError::NotFound {
                 path: archive_path.to_path_buf(),
             });
         }
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
             return Err(OnyxError::PermissionDenied {
                 path: archive_path.to_path_buf(),
             });
@@ -194,12 +232,211 @@ fn open_zip_file(archive_path: &Path) -> OnyxResult<ZipArchive<File>> {
         Err(err) => return Err(OnyxError::Io(err)),
     };
 
+    if let Some(fmt) = ArchiveFormat::from_path(archive_path) {
+        return Ok((file, fmt));
+    }
+
+    // Fallback to magic-byte sniffing for archives without a standard extension.
+    let mut magic = [0u8; 4];
+    let n = file.read(&mut magic)?;
+    file.seek(SeekFrom::Start(0))?;
+
+    if n >= 2 && magic[0] == 0x1F && magic[1] == 0x8B {
+        Ok((file, ArchiveFormat::TarGz))
+    } else if n >= 4
+        && (magic == *b"PK\x03\x04" || magic == *b"PK\x05\x06" || magic == *b"PK\x07\x08")
+    {
+        Ok((file, ArchiveFormat::Zip))
+    } else {
+        Err(OnyxError::OperationFailed {
+            message: format!(
+                "Unsupported or unrecognized archive format: '{}'",
+                archive_path.display()
+            ),
+        })
+    }
+}
+
+fn open_zip_from_file(file: File, archive_path: &Path) -> OnyxResult<ZipArchive<File>> {
     ZipArchive::new(file).map_err(|err| OnyxError::OperationFailed {
         message: format!(
             "Invalid or corrupt ZIP archive '{}': {err}",
             archive_path.display()
         ),
     })
+}
+
+/// Bounded, ratio-checked, and cancellable gzip reader used for `.tar.gz` / `.tgz` streams.
+struct GuardedGzipReader<'a> {
+    decoder: MultiGzDecoder<File>,
+    archive_label: String,
+    compressed_archive_bytes: u64,
+    decompressed_bytes: u64,
+    max_stream_bytes: u64,
+    limits: ArchiveLimits,
+    cancel: &'a CancellationToken,
+    abort_error: Rc<RefCell<Option<OnyxError>>>,
+}
+
+impl<'a> GuardedGzipReader<'a> {
+    fn new(
+        file: File,
+        archive_path: &Path,
+        limits: ArchiveLimits,
+        cancel: &'a CancellationToken,
+    ) -> OnyxResult<(Self, Rc<RefCell<Option<OnyxError>>>)> {
+        let compressed_archive_bytes = file.metadata()?.len();
+        let abort_error = Rc::new(RefCell::new(None));
+        // Allow tar header/padding overhead above `max_total_uncompressed_bytes` while still
+        // capping runaway gzip streams (e.g., gigabytes of zero-block padding with zero entries).
+        let tar_overhead = (limits.max_entries.min(DEFAULT_MAX_ARCHIVE_ENTRIES) as u64)
+            .saturating_mul(2048)
+            .saturating_add(65_536);
+        let max_stream_bytes = limits
+            .max_total_uncompressed_bytes
+            .saturating_add(tar_overhead);
+
+        let reader = Self {
+            decoder: MultiGzDecoder::new(file),
+            archive_label: archive_path.display().to_string(),
+            compressed_archive_bytes,
+            decompressed_bytes: 0,
+            max_stream_bytes,
+            limits,
+            cancel,
+            abort_error: Rc::clone(&abort_error),
+        };
+        Ok((reader, abort_error))
+    }
+
+    fn record_abort(&self, err: OnyxError) {
+        let mut slot = self.abort_error.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(err);
+        }
+    }
+}
+
+impl Read for GuardedGzipReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            self.record_abort(OnyxError::Cancelled);
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Archive operation cancelled",
+            ));
+        }
+
+        let n = self.decoder.read(buf)?;
+        if n == 0 {
+            return Ok(0);
+        }
+
+        self.decompressed_bytes = self.decompressed_bytes.saturating_add(n as u64);
+        if self.decompressed_bytes > self.max_stream_bytes {
+            self.record_abort(OnyxError::OperationFailed {
+                message: format!(
+                    "Archive '{}' decompressed stream ({} bytes) exceeds maximum limit of {} bytes",
+                    self.archive_label,
+                    self.decompressed_bytes,
+                    self.limits.max_total_uncompressed_bytes
+                ),
+            });
+            return Err(io::Error::other("archive decompressed byte limit exceeded"));
+        }
+
+        if let Err(ratio_err) = check_entry_compression_ratio(
+            &self.archive_label,
+            self.decompressed_bytes,
+            self.compressed_archive_bytes,
+            self.limits,
+        ) {
+            self.record_abort(ratio_err);
+            return Err(io::Error::other("archive compression ratio exceeded"));
+        }
+
+        Ok(n)
+    }
+}
+
+fn take_abort_or_tar_error(
+    abort_error: &Rc<RefCell<Option<OnyxError>>>,
+    archive_path: &Path,
+    err: io::Error,
+) -> OnyxError {
+    if let Some(recorded) = abort_error.borrow_mut().take() {
+        return recorded;
+    }
+    OnyxError::OperationFailed {
+        message: format!(
+            "Invalid or corrupt TAR.GZ archive '{}': {err}",
+            archive_path.display()
+        ),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TarEntryKind {
+    File,
+    Dir,
+    SkipMetadata,
+}
+
+fn classify_tar_entry_type(raw_name: &str, entry_type: tar::EntryType) -> OnyxResult<TarEntryKind> {
+    match entry_type {
+        tar::EntryType::Regular | tar::EntryType::Continuous => Ok(TarEntryKind::File),
+        tar::EntryType::Directory => Ok(TarEntryKind::Dir),
+        tar::EntryType::Symlink => Err(OnyxError::InvalidPath {
+            message: format!("Refusing symlink entry '{raw_name}' in archive"),
+        }),
+        tar::EntryType::Link => Err(OnyxError::InvalidPath {
+            message: format!("Refusing hardlink entry '{raw_name}' in archive"),
+        }),
+        tar::EntryType::XGlobalHeader
+        | tar::EntryType::XHeader
+        | tar::EntryType::GNULongName
+        | tar::EntryType::GNULongLink => Ok(TarEntryKind::SkipMetadata),
+        other => Err(OnyxError::InvalidPath {
+            message: format!("Refusing unsupported special archive entry '{raw_name}' ({other:?})"),
+        }),
+    }
+}
+
+/// Validates a TAR member's raw path bytes against traversal, drive-prefix, and invalid-name attacks.
+///
+/// Returns `Ok(None)` for harmless archive-root directory markers (`.` or `./`), and
+/// `Ok(Some((normalized_raw_name, clean_relative_path)))` for valid entries.
+fn validate_tar_entry_path(
+    raw_bytes: &[u8],
+    is_dir: bool,
+) -> OnyxResult<Option<(String, PathBuf)>> {
+    if raw_bytes.is_empty() || raw_bytes.contains(&0) {
+        return Err(OnyxError::InvalidPath {
+            message: "Unsafe archive entry path: empty or contains NUL byte".to_string(),
+        });
+    }
+
+    let raw_name = std::str::from_utf8(raw_bytes).map_err(|_| OnyxError::InvalidPath {
+        message: "Archive entry path is not valid UTF-8".to_string(),
+    })?;
+
+    if is_dir && (raw_name == "." || raw_name == "./") {
+        return Ok(None);
+    }
+
+    // Real-world tarballs created with `tar -czf out.tar.gz .` commonly prefix entries with `./`.
+    let candidate = raw_name.strip_prefix("./").unwrap_or(raw_name);
+    let clean_rel = validate_safe_relative_path(candidate, Some(PathBuf::from(candidate)))?;
+    Ok(Some((candidate.to_string(), clean_rel)))
+}
+
+fn tar_mtime_to_utc(mtime: io::Result<u64>) -> Option<DateTime<Utc>> {
+    let secs = mtime.ok()?;
+    if secs == 0 {
+        return None;
+    }
+    let secs_i64 = i64::try_from(secs).ok()?;
+    DateTime::from_timestamp(secs_i64, 0)
 }
 
 /// Validates an archive member's raw name and enclosed path against Zip-Slip traversal attacks.
@@ -311,7 +548,20 @@ fn list_archive_entries_blocking(
         return Err(OnyxError::Cancelled);
     }
 
-    let mut archive = open_zip_file(archive_path)?;
+    let (file, format) = open_archive_file(archive_path)?;
+    match format {
+        ArchiveFormat::Zip => list_zip_entries_blocking(file, archive_path, limits, cancel),
+        ArchiveFormat::TarGz => list_tar_gz_entries_blocking(file, archive_path, limits, cancel),
+    }
+}
+
+fn list_zip_entries_blocking(
+    file: File,
+    archive_path: &Path,
+    limits: ArchiveLimits,
+    cancel: &CancellationToken,
+) -> OnyxResult<Vec<ArchiveEntry>> {
+    let mut archive = open_zip_from_file(file, archive_path)?;
     let count = archive.len();
     if count > limits.max_entries {
         return Err(OnyxError::OperationFailed {
@@ -372,6 +622,90 @@ fn list_archive_entries_blocking(
     Ok(entries)
 }
 
+fn list_tar_gz_entries_blocking(
+    file: File,
+    archive_path: &Path,
+    limits: ArchiveLimits,
+    cancel: &CancellationToken,
+) -> OnyxResult<Vec<ArchiveEntry>> {
+    let (reader, abort_error) = GuardedGzipReader::new(file, archive_path, limits, cancel)?;
+    let mut archive = tar::Archive::new(reader);
+
+    let tar_entries = archive
+        .entries()
+        .map_err(|err| take_abort_or_tar_error(&abort_error, archive_path, err))?;
+
+    let mut entries = Vec::new();
+    let mut cumulative_uncompressed = 0u64;
+
+    for entry_res in tar_entries {
+        if cancel.is_cancelled() {
+            return Err(OnyxError::Cancelled);
+        }
+
+        let entry =
+            entry_res.map_err(|err| take_abort_or_tar_error(&abort_error, archive_path, err))?;
+        let entry_type = entry.header().entry_type();
+        let raw_bytes = entry.path_bytes();
+        let raw_preview = String::from_utf8_lossy(&raw_bytes);
+
+        let is_dir = match classify_tar_entry_type(&raw_preview, entry_type)? {
+            TarEntryKind::File => false,
+            TarEntryKind::Dir => true,
+            TarEntryKind::SkipMetadata => continue,
+        };
+
+        let Some((raw_name, relative_path)) = validate_tar_entry_path(&raw_bytes, is_dir)? else {
+            continue;
+        };
+
+        if entries.len() >= limits.max_entries {
+            return Err(OnyxError::OperationFailed {
+                message: format!(
+                    "Archive contains more than {} entries, exceeding limit",
+                    limits.max_entries
+                ),
+            });
+        }
+
+        let size = if is_dir {
+            0
+        } else {
+            entry
+                .header()
+                .size()
+                .map_err(|err| take_abort_or_tar_error(&abort_error, archive_path, err))?
+        };
+
+        cumulative_uncompressed = cumulative_uncompressed.saturating_add(size);
+        if cumulative_uncompressed > limits.max_total_uncompressed_bytes {
+            return Err(OnyxError::OperationFailed {
+                message: format!(
+                    "Archive total uncompressed size ({cumulative_uncompressed} bytes) exceeds limit of {} bytes",
+                    limits.max_total_uncompressed_bytes
+                ),
+            });
+        }
+
+        let name = relative_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| raw_name.trim_end_matches(['/', '\\']).to_string());
+        let modified = tar_mtime_to_utc(entry.header().mtime());
+
+        entries.push(ArchiveEntry {
+            name,
+            relative_path,
+            size,
+            compressed_size: 0,
+            is_dir,
+            modified,
+        });
+    }
+
+    Ok(entries)
+}
+
 fn extract_archive_blocking(
     op_id: u64,
     archive_path: &Path,
@@ -385,7 +719,185 @@ fn extract_archive_blocking(
         return Err(OnyxError::Cancelled);
     }
 
-    let mut archive = open_zip_file(archive_path)?;
+    let (file, format) = open_archive_file(archive_path)?;
+    match format {
+        ArchiveFormat::Zip => extract_zip_archive_blocking(
+            op_id,
+            file,
+            archive_path,
+            dest_dir,
+            policy,
+            limits,
+            progress,
+            cancel,
+        ),
+        ArchiveFormat::TarGz => {
+            drop(file);
+            extract_tar_gz_archive_blocking(
+                op_id,
+                archive_path,
+                dest_dir,
+                policy,
+                limits,
+                progress,
+                cancel,
+            )
+        }
+    }
+}
+
+/// Resolves and creates a directory archive entry under `dest_dir`, enforcing conflict policy
+/// and symlink safety, without adding pre-existing directories to `report.succeeded`.
+fn extract_directory_entry(
+    dest_dir: &Path,
+    raw_name: &str,
+    rel_path: &Path,
+    policy: ConflictPolicy,
+    report: &mut OperationReport,
+    recorded_succeeded: &mut HashSet<PathBuf>,
+) -> OnyxResult<()> {
+    let desired_target = dest_dir.join(rel_path);
+    match fs::symlink_metadata(&desired_target) {
+        Ok(meta) => {
+            if is_reparse_or_symlink(&meta) {
+                return Err(OnyxError::InvalidPath {
+                    message: format!(
+                        "Refusing to extract into symlink/reparse directory '{}'",
+                        desired_target.display()
+                    ),
+                });
+            }
+            if !meta.is_dir() {
+                match policy {
+                    ConflictPolicy::Skip => {
+                        report.skipped.push(desired_target);
+                    }
+                    ConflictPolicy::Overwrite => {
+                        return Err(OnyxError::OperationFailed {
+                            message: format!(
+                                "Cannot overwrite existing file '{}' with directory archive entry '{raw_name}'",
+                                desired_target.display()
+                            ),
+                        });
+                    }
+                    ConflictPolicy::AutoRename => {
+                        if let Some(parent_rel) = rel_path.parent()
+                            && !parent_rel.as_os_str().is_empty()
+                        {
+                            create_missing_dirs_under(
+                                dest_dir,
+                                parent_rel,
+                                &mut report.succeeded,
+                                recorded_succeeded,
+                            )?;
+                        }
+                        let renamed = generate_auto_rename_path(&desired_target)?;
+                        fs::create_dir(&renamed)?;
+                        if recorded_succeeded.insert(renamed.clone()) {
+                            report.succeeded.push(renamed);
+                        }
+                    }
+                    ConflictPolicy::Cancel => return Err(OnyxError::Cancelled),
+                    ConflictPolicy::Fail => {
+                        return Err(OnyxError::AlreadyExists {
+                            path: desired_target,
+                        });
+                    }
+                }
+            }
+            // Pre-existing directory: never push to `report.succeeded` so Undo never recycles it.
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            create_missing_dirs_under(
+                dest_dir,
+                rel_path,
+                &mut report.succeeded,
+                recorded_succeeded,
+            )?;
+        }
+        Err(err) => return Err(OnyxError::Io(err)),
+    }
+    Ok(())
+}
+
+/// Resolves the final file target path for a file archive entry, applying `policy` and verifying
+/// that the resolved path (including any auto-renamed variant) remains strictly inside `canon_dest_dir`.
+///
+/// Returns `Ok(None)` if the entry should be skipped under `ConflictPolicy::Skip`.
+fn resolve_file_target_path(
+    dest_dir: &Path,
+    canon_dest_dir: &Path,
+    raw_name: &str,
+    rel_path: &Path,
+    policy: ConflictPolicy,
+    report: &mut OperationReport,
+) -> OnyxResult<Option<PathBuf>> {
+    let desired_target = dest_dir.join(rel_path);
+    let target_path = match fs::symlink_metadata(&desired_target) {
+        Ok(meta) => match policy {
+            ConflictPolicy::Skip => {
+                report.skipped.push(desired_target);
+                return Ok(None);
+            }
+            ConflictPolicy::Overwrite => {
+                if is_reparse_or_symlink(&meta) {
+                    return Err(OnyxError::InvalidPath {
+                        message: format!(
+                            "Refusing to overwrite symlink or reparse point '{}'",
+                            desired_target.display()
+                        ),
+                    });
+                }
+                if meta.is_dir() {
+                    return Err(OnyxError::OperationFailed {
+                        message: format!(
+                            "Cannot overwrite existing directory '{}' with file archive entry '{raw_name}'",
+                            desired_target.display()
+                        ),
+                    });
+                }
+                desired_target
+            }
+            ConflictPolicy::AutoRename => generate_auto_rename_path(&desired_target)?,
+            ConflictPolicy::Cancel => return Err(OnyxError::Cancelled),
+            ConflictPolicy::Fail => {
+                return Err(OnyxError::AlreadyExists {
+                    path: desired_target,
+                });
+            }
+        },
+        Err(err) if err.kind() == io::ErrorKind::NotFound => desired_target,
+        Err(err) => return Err(OnyxError::Io(err)),
+    };
+
+    // Final boundary check on resolved target path (including any auto-renamed variant).
+    if !is_same_or_descendant(canon_dest_dir, &target_path)
+        || is_same_normalized_path(canon_dest_dir, &target_path)
+    {
+        return Err(OnyxError::InvalidPath {
+            message: format!(
+                "Target path '{}' escaped destination directory '{}'",
+                target_path.display(),
+                dest_dir.display()
+            ),
+        });
+    }
+
+    Ok(Some(target_path))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_zip_archive_blocking(
+    op_id: u64,
+    file: File,
+    archive_path: &Path,
+    dest_dir: &Path,
+    policy: ConflictPolicy,
+    limits: ArchiveLimits,
+    progress: Option<&mpsc::Sender<OperationProgress>>,
+    cancel: &CancellationToken,
+) -> OnyxResult<OperationReport> {
+    let mut archive = open_zip_from_file(file, archive_path)?;
     let total_items = archive.len();
     if total_items > limits.max_entries {
         return Err(OnyxError::OperationFailed {
@@ -473,130 +985,34 @@ fn extract_archive_blocking(
             return Err(OnyxError::Cancelled);
         }
 
-        let desired_target = dest_dir.join(&rel_path);
-
-        // Ensure no ancestor directory between `dest_dir` and `desired_target` is a symlink/junction.
+        // Ensure no ancestor directory between `dest_dir` and target is a symlink/junction.
         ensure_safe_parent_chain(dest_dir, &rel_path)?;
 
         if is_dir {
-            match fs::symlink_metadata(&desired_target) {
-                Ok(meta) => {
-                    if is_reparse_or_symlink(&meta) {
-                        return Err(OnyxError::InvalidPath {
-                            message: format!(
-                                "Refusing to extract into symlink/reparse directory '{}'",
-                                desired_target.display()
-                            ),
-                        });
-                    }
-                    if !meta.is_dir() {
-                        match policy {
-                            ConflictPolicy::Skip => {
-                                report.skipped.push(desired_target);
-                                completed_items += 1;
-                                continue;
-                            }
-                            ConflictPolicy::Overwrite => {
-                                return Err(OnyxError::OperationFailed {
-                                    message: format!(
-                                        "Cannot overwrite existing file '{}' with directory archive entry '{raw_name}'",
-                                        desired_target.display()
-                                    ),
-                                });
-                            }
-                            ConflictPolicy::AutoRename => {
-                                if let Some(parent_rel) = rel_path.parent()
-                                    && !parent_rel.as_os_str().is_empty()
-                                {
-                                    create_missing_dirs_under(
-                                        dest_dir,
-                                        parent_rel,
-                                        &mut report.succeeded,
-                                        &mut recorded_succeeded,
-                                    )?;
-                                }
-                                let renamed = generate_auto_rename_path(&desired_target)?;
-                                fs::create_dir(&renamed)?;
-                                if recorded_succeeded.insert(renamed.clone()) {
-                                    report.succeeded.push(renamed);
-                                }
-                            }
-                            ConflictPolicy::Cancel => return Err(OnyxError::Cancelled),
-                            ConflictPolicy::Fail => {
-                                return Err(OnyxError::AlreadyExists {
-                                    path: desired_target,
-                                });
-                            }
-                        }
-                    }
-                    // Pre-existing directory: never push to `report.succeeded` so Undo never recycles it.
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    create_missing_dirs_under(
-                        dest_dir,
-                        &rel_path,
-                        &mut report.succeeded,
-                        &mut recorded_succeeded,
-                    )?;
-                }
-                Err(err) => return Err(OnyxError::Io(err)),
-            }
-
+            extract_directory_entry(
+                dest_dir,
+                &raw_name,
+                &rel_path,
+                policy,
+                &mut report,
+                &mut recorded_succeeded,
+            )?;
             completed_items += 1;
             continue;
         }
 
-        // File entry conflict resolution — never delete an existing directory or pre-delete target file.
-        let target_path = match fs::symlink_metadata(&desired_target) {
-            Ok(meta) => match policy {
-                ConflictPolicy::Skip => {
-                    report.skipped.push(desired_target);
-                    completed_items += 1;
-                    continue;
-                }
-                ConflictPolicy::Overwrite => {
-                    if is_reparse_or_symlink(&meta) {
-                        return Err(OnyxError::InvalidPath {
-                            message: format!(
-                                "Refusing to overwrite symlink or reparse point '{}'",
-                                desired_target.display()
-                            ),
-                        });
-                    }
-                    if meta.is_dir() {
-                        return Err(OnyxError::OperationFailed {
-                            message: format!(
-                                "Cannot overwrite existing directory '{}' with file archive entry '{raw_name}'",
-                                desired_target.display()
-                            ),
-                        });
-                    }
-                    desired_target
-                }
-                ConflictPolicy::AutoRename => generate_auto_rename_path(&desired_target)?,
-                ConflictPolicy::Cancel => return Err(OnyxError::Cancelled),
-                ConflictPolicy::Fail => {
-                    return Err(OnyxError::AlreadyExists {
-                        path: desired_target,
-                    });
-                }
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => desired_target,
-            Err(err) => return Err(OnyxError::Io(err)),
+        let Some(target_path) = resolve_file_target_path(
+            dest_dir,
+            &canon_dest_dir,
+            &raw_name,
+            &rel_path,
+            policy,
+            &mut report,
+        )?
+        else {
+            completed_items += 1;
+            continue;
         };
-
-        // Final boundary check on resolved target path (including any auto-renamed variant).
-        if !is_same_or_descendant(&canon_dest_dir, &target_path)
-            || is_same_normalized_path(&canon_dest_dir, &target_path)
-        {
-            return Err(OnyxError::InvalidPath {
-                message: format!(
-                    "Target path '{}' escaped destination directory '{}'",
-                    target_path.display(),
-                    dest_dir.display()
-                ),
-            });
-        }
 
         if let Some(parent_rel) = rel_path.parent()
             && !parent_rel.as_os_str().is_empty()
@@ -664,6 +1080,328 @@ fn extract_archive_blocking(
                     compressed_size,
                     limits,
                 )?;
+
+                out_file.write_all(&buf[..n])?;
+
+                send_progress(
+                    progress,
+                    OperationProgress {
+                        op_id,
+                        kind: OperationKind::ExtractArchive,
+                        current_item: raw_name.clone(),
+                        completed_items,
+                        total_items,
+                        bytes_copied: bytes_extracted,
+                        total_bytes: declared_total_bytes,
+                        finished: false,
+                        cancelled: false,
+                        error: None,
+                    },
+                );
+            }
+
+            out_file.flush()?;
+            out_file.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(err) = extract_res {
+            let _ = fs::remove_file(&temp_extract_path);
+            if matches!(err, OnyxError::Cancelled) {
+                send_progress(
+                    progress,
+                    OperationProgress {
+                        op_id,
+                        kind: OperationKind::ExtractArchive,
+                        current_item: raw_name,
+                        completed_items,
+                        total_items,
+                        bytes_copied: bytes_extracted,
+                        total_bytes: declared_total_bytes,
+                        finished: true,
+                        cancelled: true,
+                        error: None,
+                    },
+                );
+            }
+            return Err(err);
+        }
+
+        replace_file_atomically(&temp_extract_path, &target_path)?;
+
+        if recorded_succeeded.insert(target_path.clone()) {
+            report.succeeded.push(target_path);
+        }
+        completed_items += 1;
+
+        send_progress(
+            progress,
+            OperationProgress {
+                op_id,
+                kind: OperationKind::ExtractArchive,
+                current_item: raw_name,
+                completed_items,
+                total_items,
+                bytes_copied: bytes_extracted,
+                total_bytes: declared_total_bytes,
+                finished: false,
+                cancelled: false,
+                error: None,
+            },
+        );
+    }
+
+    if !report.succeeded.is_empty() {
+        report.undo_action = Some(UndoAction::RecycleCreatedCopies(report.succeeded.clone()));
+    }
+
+    send_progress(
+        progress,
+        OperationProgress {
+            op_id,
+            kind: OperationKind::ExtractArchive,
+            current_item: String::new(),
+            completed_items,
+            total_items,
+            bytes_copied: bytes_extracted,
+            total_bytes: declared_total_bytes,
+            finished: true,
+            cancelled: false,
+            error: None,
+        },
+    );
+
+    Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_tar_gz_archive_blocking(
+    op_id: u64,
+    archive_path: &Path,
+    dest_dir: &Path,
+    policy: ConflictPolicy,
+    limits: ArchiveLimits,
+    progress: Option<&mpsc::Sender<OperationProgress>>,
+    cancel: &CancellationToken,
+) -> OnyxResult<OperationReport> {
+    fs::create_dir_all(dest_dir)?;
+    let canon_dest_dir = fs::canonicalize(dest_dir)?;
+
+    // Pass 1 (Pre-flight): validate every entry's type, path containment, entry count,
+    // declared total uncompressed size, and gzip stream limits BEFORE writing any files to disk.
+    let (total_items, declared_total_bytes) = {
+        let (preflight_file, _) = open_archive_file(archive_path)?;
+        let (reader, abort_error) =
+            GuardedGzipReader::new(preflight_file, archive_path, limits, cancel)?;
+        let mut archive = tar::Archive::new(reader);
+        let tar_entries = archive
+            .entries()
+            .map_err(|err| take_abort_or_tar_error(&abort_error, archive_path, err))?;
+
+        let mut count = 0usize;
+        let mut total_bytes = 0u64;
+
+        for entry_res in tar_entries {
+            if cancel.is_cancelled() {
+                return Err(OnyxError::Cancelled);
+            }
+
+            let entry = entry_res
+                .map_err(|err| take_abort_or_tar_error(&abort_error, archive_path, err))?;
+            let entry_type = entry.header().entry_type();
+            let raw_bytes = entry.path_bytes();
+            let raw_preview = String::from_utf8_lossy(&raw_bytes);
+
+            let is_dir = match classify_tar_entry_type(&raw_preview, entry_type)? {
+                TarEntryKind::File => false,
+                TarEntryKind::Dir => true,
+                TarEntryKind::SkipMetadata => continue,
+            };
+
+            let Some((raw_name, rel_path)) = validate_tar_entry_path(&raw_bytes, is_dir)? else {
+                continue;
+            };
+
+            count += 1;
+            if count > limits.max_entries {
+                return Err(OnyxError::OperationFailed {
+                    message: format!(
+                        "Archive contains more than {} entries, exceeding limit",
+                        limits.max_entries
+                    ),
+                });
+            }
+
+            let candidate_target = canon_dest_dir.join(&rel_path);
+            if !is_same_or_descendant(&canon_dest_dir, &candidate_target)
+                || is_same_normalized_path(&canon_dest_dir, &candidate_target)
+            {
+                return Err(OnyxError::InvalidPath {
+                    message: format!(
+                        "Path-traversal guard blocked extraction outside destination directory: '{raw_name}'"
+                    ),
+                });
+            }
+
+            if !is_dir {
+                let size = entry
+                    .header()
+                    .size()
+                    .map_err(|err| take_abort_or_tar_error(&abort_error, archive_path, err))?;
+                total_bytes = total_bytes.saturating_add(size);
+                if total_bytes > limits.max_total_uncompressed_bytes {
+                    return Err(OnyxError::OperationFailed {
+                        message: format!(
+                            "Archive uncompressed total ({total_bytes} bytes) exceeds limit of {} bytes",
+                            limits.max_total_uncompressed_bytes
+                        ),
+                    });
+                }
+            }
+        }
+
+        (count, total_bytes)
+    };
+
+    // Pass 2 (Extraction): stream entries safely into `dest_dir` with atomic temp-file writes,
+    // runtime byte/ratio/cancellation guards, conflict resolution, and progress reporting.
+    let (extract_file, _) = open_archive_file(archive_path)?;
+    let (reader, abort_error) = GuardedGzipReader::new(extract_file, archive_path, limits, cancel)?;
+    let mut archive = tar::Archive::new(reader);
+    let tar_entries = archive
+        .entries()
+        .map_err(|err| take_abort_or_tar_error(&abort_error, archive_path, err))?;
+
+    let mut report = OperationReport::default();
+    let mut recorded_succeeded = HashSet::<PathBuf>::new();
+    let mut bytes_extracted = 0u64;
+    let mut completed_items = 0usize;
+    let mut entry_idx = 0usize;
+    let mut buf = vec![0u8; ARCHIVE_CHUNK_BYTES];
+
+    for entry_res in tar_entries {
+        if cancel.is_cancelled() {
+            send_progress(
+                progress,
+                OperationProgress {
+                    op_id,
+                    kind: OperationKind::ExtractArchive,
+                    current_item: String::new(),
+                    completed_items,
+                    total_items,
+                    bytes_copied: bytes_extracted,
+                    total_bytes: declared_total_bytes,
+                    finished: true,
+                    cancelled: true,
+                    error: None,
+                },
+            );
+            return Err(OnyxError::Cancelled);
+        }
+
+        let mut entry =
+            entry_res.map_err(|err| take_abort_or_tar_error(&abort_error, archive_path, err))?;
+        let entry_type = entry.header().entry_type();
+        let raw_bytes = entry.path_bytes();
+        let raw_preview = String::from_utf8_lossy(&raw_bytes);
+
+        let is_dir = match classify_tar_entry_type(&raw_preview, entry_type)? {
+            TarEntryKind::File => false,
+            TarEntryKind::Dir => true,
+            TarEntryKind::SkipMetadata => continue,
+        };
+
+        let Some((raw_name, rel_path)) = validate_tar_entry_path(&raw_bytes, is_dir)? else {
+            continue;
+        };
+
+        entry_idx += 1;
+        if entry_idx > limits.max_entries {
+            return Err(OnyxError::OperationFailed {
+                message: format!(
+                    "Archive contains more than {} entries, exceeding limit",
+                    limits.max_entries
+                ),
+            });
+        }
+
+        // Ensure no ancestor directory between `dest_dir` and target is a symlink/junction.
+        ensure_safe_parent_chain(dest_dir, &rel_path)?;
+
+        if is_dir {
+            extract_directory_entry(
+                dest_dir,
+                &raw_name,
+                &rel_path,
+                policy,
+                &mut report,
+                &mut recorded_succeeded,
+            )?;
+            completed_items += 1;
+            continue;
+        }
+
+        let Some(target_path) = resolve_file_target_path(
+            dest_dir,
+            &canon_dest_dir,
+            &raw_name,
+            &rel_path,
+            policy,
+            &mut report,
+        )?
+        else {
+            completed_items += 1;
+            continue;
+        };
+
+        if let Some(parent_rel) = rel_path.parent()
+            && !parent_rel.as_os_str().is_empty()
+        {
+            create_missing_dirs_under(
+                dest_dir,
+                parent_rel,
+                &mut report.succeeded,
+                &mut recorded_succeeded,
+            )?;
+        }
+
+        let target_parent = target_path.parent().ok_or_else(|| OnyxError::InvalidPath {
+            message: format!(
+                "Target file path '{}' has no parent directory",
+                target_path.display()
+            ),
+        })?;
+        let temp_extract_path = target_parent.join(format!(
+            ".onyx_extract_tmp_{}_{}_{}",
+            std::process::id(),
+            op_id,
+            entry_idx
+        ));
+
+        let extract_res = (|| -> OnyxResult<()> {
+            let mut out_file = File::create(&temp_extract_path)?;
+
+            loop {
+                if cancel.is_cancelled() {
+                    return Err(OnyxError::Cancelled);
+                }
+
+                let n = entry
+                    .read(&mut buf)
+                    .map_err(|err| take_abort_or_tar_error(&abort_error, archive_path, err))?;
+                if n == 0 {
+                    break;
+                }
+
+                bytes_extracted = bytes_extracted.saturating_add(n as u64);
+                if bytes_extracted > limits.max_total_uncompressed_bytes {
+                    return Err(OnyxError::OperationFailed {
+                        message: format!(
+                            "Archive extraction exceeded maximum uncompressed limit of {} bytes",
+                            limits.max_total_uncompressed_bytes
+                        ),
+                    });
+                }
 
                 out_file.write_all(&buf[..n])?;
 
@@ -1013,8 +1751,13 @@ fn create_archive_blocking(
         fs::create_dir_all(parent_dir)?;
     }
 
+    let format = ArchiveFormat::from_path(dest_zip).unwrap_or(ArchiveFormat::Zip);
+    let temp_ext = match format {
+        ArchiveFormat::Zip => "zip",
+        ArchiveFormat::TarGz => "tar.gz",
+    };
     let temp_zip = parent_dir.join(format!(
-        ".onyx_archive_tmp_{}_{}.zip",
+        ".onyx_archive_tmp_{}_{}.{temp_ext}",
         std::process::id(),
         op_id
     ));
@@ -1051,15 +1794,26 @@ fn create_archive_blocking(
     let total_items = items.len();
     let total_bytes: u64 = items.iter().map(|i| i.size).sum();
 
-    let result = write_archive_to_temp(
-        op_id,
-        &items,
-        &temp_zip,
-        total_items,
-        total_bytes,
-        progress,
-        cancel,
-    );
+    let result = match format {
+        ArchiveFormat::Zip => write_archive_to_temp(
+            op_id,
+            &items,
+            &temp_zip,
+            total_items,
+            total_bytes,
+            progress,
+            cancel,
+        ),
+        ArchiveFormat::TarGz => write_tar_gz_to_temp(
+            op_id,
+            &items,
+            &temp_zip,
+            total_items,
+            total_bytes,
+            progress,
+            cancel,
+        ),
+    };
 
     if let Err(err) = result {
         let _ = fs::remove_file(&temp_zip);
@@ -1306,6 +2060,179 @@ fn write_archive_to_temp(
 
     let mut finished_file = zip.finish().map_err(|err| OnyxError::OperationFailed {
         message: format!("Failed finalizing ZIP archive: {err}"),
+    })?;
+    finished_file.flush()?;
+    finished_file.sync_all()?;
+    Ok(())
+}
+
+struct ProgressCancelReader<'a, R> {
+    inner: R,
+    op_id: u64,
+    item_name: &'a str,
+    completed_items: usize,
+    total_items: usize,
+    bytes_written: &'a mut u64,
+    total_bytes: u64,
+    progress: Option<&'a mpsc::Sender<OperationProgress>>,
+    cancel: &'a CancellationToken,
+    cancelled: &'a mut bool,
+}
+
+impl<R: Read> Read for ProgressCancelReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            *self.cancelled = true;
+            send_progress(
+                self.progress,
+                OperationProgress {
+                    op_id: self.op_id,
+                    kind: OperationKind::CreateArchive,
+                    current_item: self.item_name.to_string(),
+                    completed_items: self.completed_items,
+                    total_items: self.total_items,
+                    bytes_copied: *self.bytes_written,
+                    total_bytes: self.total_bytes,
+                    finished: true,
+                    cancelled: true,
+                    error: None,
+                },
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Archive creation cancelled",
+            ));
+        }
+
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            *self.bytes_written = self.bytes_written.saturating_add(n as u64);
+            send_progress(
+                self.progress,
+                OperationProgress {
+                    op_id: self.op_id,
+                    kind: OperationKind::CreateArchive,
+                    current_item: self.item_name.to_string(),
+                    completed_items: self.completed_items,
+                    total_items: self.total_items,
+                    bytes_copied: *self.bytes_written,
+                    total_bytes: self.total_bytes,
+                    finished: false,
+                    cancelled: false,
+                    error: None,
+                },
+            );
+        }
+        Ok(n)
+    }
+}
+
+fn file_mtime_secs(path: &Path) -> u64 {
+    fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|sys| sys.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |dur| dur.as_secs())
+}
+
+fn write_tar_gz_to_temp(
+    op_id: u64,
+    items: &[PendingArchiveSource],
+    temp_tar_gz: &Path,
+    total_items: usize,
+    total_bytes: u64,
+    progress: Option<&mpsc::Sender<OperationProgress>>,
+    cancel: &CancellationToken,
+) -> OnyxResult<()> {
+    let temp_file = File::create(temp_tar_gz)?;
+    let encoder = GzEncoder::new(temp_file, Compression::default());
+    let mut builder = tar::Builder::new(encoder);
+
+    let mut bytes_written = 0u64;
+
+    for (completed_items, item) in items.iter().enumerate() {
+        if cancel.is_cancelled() {
+            send_progress(
+                progress,
+                OperationProgress {
+                    op_id,
+                    kind: OperationKind::CreateArchive,
+                    current_item: item.archive_name.clone(),
+                    completed_items,
+                    total_items,
+                    bytes_copied: bytes_written,
+                    total_bytes,
+                    finished: true,
+                    cancelled: true,
+                    error: None,
+                },
+            );
+            return Err(OnyxError::Cancelled);
+        }
+
+        let mtime = file_mtime_secs(&item.disk_path);
+
+        if item.is_dir {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_mtime(mtime);
+            header.set_cksum();
+
+            builder
+                .append_data(&mut header, &item.archive_name, io::empty())
+                .map_err(|err| OnyxError::OperationFailed {
+                    message: format!(
+                        "Failed adding directory '{}' to TAR.GZ archive: {err}",
+                        item.archive_name
+                    ),
+                })?;
+        } else {
+            let file = File::open(&item.disk_path)?;
+            let file_len = file.metadata()?.len();
+
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(file_len);
+            header.set_mode(0o644);
+            header.set_mtime(mtime);
+            header.set_cksum();
+
+            let mut was_cancelled = false;
+            let mut reader = ProgressCancelReader {
+                inner: file.take(file_len),
+                op_id,
+                item_name: &item.archive_name,
+                completed_items,
+                total_items,
+                bytes_written: &mut bytes_written,
+                total_bytes,
+                progress,
+                cancel,
+                cancelled: &mut was_cancelled,
+            };
+
+            let append_res = builder.append_data(&mut header, &item.archive_name, &mut reader);
+            if was_cancelled {
+                return Err(OnyxError::Cancelled);
+            }
+            append_res.map_err(|err| OnyxError::OperationFailed {
+                message: format!(
+                    "Failed adding file '{}' to TAR.GZ archive: {err}",
+                    item.archive_name
+                ),
+            })?;
+        }
+    }
+
+    let encoder = builder
+        .into_inner()
+        .map_err(|err| OnyxError::OperationFailed {
+            message: format!("Failed finalizing TAR stream: {err}"),
+        })?;
+    let mut finished_file = encoder.finish().map_err(|err| OnyxError::OperationFailed {
+        message: format!("Failed finalizing GZIP stream: {err}"),
     })?;
     finished_file.flush()?;
     finished_file.sync_all()?;
@@ -1850,5 +2777,681 @@ mod tests {
             !leftover_tmp2,
             "Temporary extraction file must be cleaned up on CRC failure"
         );
+    }
+
+    /// Writes a raw 512-byte tar header + padded payload directly into `tar_buf`,
+    /// bypassing `tar::Builder` path sanitization so tests can craft hostile paths.
+    fn push_raw_tar_entry(
+        tar_buf: &mut Vec<u8>,
+        raw_path: &str,
+        entry_type: tar::EntryType,
+        link_target: Option<&str>,
+        data: &[u8],
+    ) {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(entry_type);
+        header.set_size(data.len() as u64);
+        header.set_mode(if entry_type.is_dir() { 0o755 } else { 0o644 });
+        header.set_mtime(1_700_000_000);
+
+        let raw_bytes = header.as_mut_bytes();
+        let path_bytes = raw_path.as_bytes();
+        assert!(
+            path_bytes.len() <= 100,
+            "test path exceeds 100-byte header field"
+        );
+        raw_bytes[..100].fill(0);
+        raw_bytes[..path_bytes.len()].copy_from_slice(path_bytes);
+
+        if let Some(target) = link_target {
+            let target_bytes = target.as_bytes();
+            assert!(
+                target_bytes.len() <= 100,
+                "test link target exceeds 100-byte header field"
+            );
+            raw_bytes[157..257].fill(0);
+            raw_bytes[157..157 + target_bytes.len()].copy_from_slice(target_bytes);
+        }
+
+        header.set_cksum();
+        tar_buf.extend_from_slice(header.as_bytes());
+        tar_buf.extend_from_slice(data);
+        let rem = data.len() % 512;
+        if rem != 0 {
+            tar_buf.extend(std::iter::repeat_n(0u8, 512 - rem));
+        }
+    }
+
+    fn write_gzipped_tar(dest: &Path, tar_buf: &[u8]) {
+        let mut full_tar = tar_buf.to_vec();
+        // Standard 1024-byte EOF zero blocks
+        full_tar.extend(std::iter::repeat_n(0u8, 1024));
+        let file = File::create(dest).unwrap();
+        let mut encoder = GzEncoder::new(file, Compression::default());
+        encoder.write_all(&full_tar).unwrap();
+        encoder.finish().unwrap();
+    }
+
+    #[test]
+    fn archive_format_detection_recognizes_zip_tar_gz_and_tgz() {
+        assert_eq!(
+            ArchiveFormat::from_path(Path::new("bundle.zip")),
+            Some(ArchiveFormat::Zip)
+        );
+        assert_eq!(
+            ArchiveFormat::from_path(Path::new("BUNDLE.ZIP")),
+            Some(ArchiveFormat::Zip)
+        );
+        assert_eq!(
+            ArchiveFormat::from_path(Path::new("release.tar.gz")),
+            Some(ArchiveFormat::TarGz)
+        );
+        assert_eq!(
+            ArchiveFormat::from_path(Path::new("RELEASE.TAR.GZ")),
+            Some(ArchiveFormat::TarGz)
+        );
+        assert_eq!(
+            ArchiveFormat::from_path(Path::new("backup.tgz")),
+            Some(ArchiveFormat::TarGz)
+        );
+        assert_eq!(
+            ArchiveFormat::from_path(Path::new("BACKUP.TGZ")),
+            Some(ArchiveFormat::TarGz)
+        );
+        assert_eq!(ArchiveFormat::from_path(Path::new("notes.txt")), None);
+        assert!(is_supported_archive_path(Path::new("a.tar.gz")));
+        assert!(is_supported_archive_path(Path::new("a.tgz")));
+        assert!(is_supported_archive_path(Path::new("a.zip")));
+        assert!(!is_supported_archive_path(Path::new("a.rar")));
+    }
+
+    #[tokio::test]
+    async fn tar_gz_and_tgz_create_list_and_extract_round_trip_preserves_nested_tree() {
+        let temp = TempDir::new().unwrap();
+        let src_root = temp.path().join("project");
+        let nested = src_root.join("src").join("nested");
+        fs::create_dir_all(&nested).unwrap();
+
+        let top_file = temp.path().join("hello.txt");
+        fs::write(&top_file, b"hello tar.gz").unwrap();
+        fs::write(src_root.join("README.md"), b"# TarGz Test\n").unwrap();
+        fs::write(nested.join("lib.rs"), b"pub fn answer() -> u32 { 42 }\n").unwrap();
+
+        for ext in ["bundle.tar.gz", "bundle.tgz"] {
+            let archive_path = temp.path().join(ext);
+            let (prog_tx, mut prog_rx) = mpsc::channel(32);
+
+            let create_rep = create_archive(
+                vec![top_file.clone(), src_root.clone()],
+                archive_path.clone(),
+                Some(prog_tx),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(create_rep.succeeded, vec![archive_path.clone()]);
+            assert!(archive_path.is_file());
+
+            let mut saw_finished_create = false;
+            while let Ok(p) = prog_rx.try_recv() {
+                if p.finished {
+                    saw_finished_create = true;
+                }
+            }
+            assert!(saw_finished_create);
+
+            let entries = list_archive_entries(archive_path.clone(), CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| e.relative_path == Path::new("hello.txt")
+                        && !e.is_dir
+                        && e.size == 12)
+            );
+            assert!(entries.iter().any(|e| {
+                e.relative_path
+                    == Path::new("project")
+                        .join("src")
+                        .join("nested")
+                        .join("lib.rs")
+                    && !e.is_dir
+                    && e.size == 30
+            }));
+
+            let extract_dir = temp.path().join(format!("extracted_{ext}"));
+            let (ext_tx, mut ext_rx) = mpsc::channel(32);
+            let extract_rep = extract_archive(
+                archive_path.clone(),
+                extract_dir.clone(),
+                ConflictPolicy::Fail,
+                Some(ext_tx),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+            assert!(extract_rep.failed.is_empty());
+            assert!(extract_rep.undo_action.is_some());
+            assert_eq!(
+                fs::read(extract_dir.join("hello.txt")).unwrap(),
+                b"hello tar.gz"
+            );
+            assert_eq!(
+                fs::read(extract_dir.join("project").join("README.md")).unwrap(),
+                b"# TarGz Test\n"
+            );
+            assert_eq!(
+                fs::read(
+                    extract_dir
+                        .join("project")
+                        .join("src")
+                        .join("nested")
+                        .join("lib.rs")
+                )
+                .unwrap(),
+                b"pub fn answer() -> u32 { 42 }\n"
+            );
+
+            let mut saw_finished_extract = false;
+            while let Ok(p) = ext_rx.try_recv() {
+                if p.finished {
+                    saw_finished_extract = true;
+                }
+            }
+            assert!(saw_finished_extract);
+        }
+
+        // Verify magic-byte fallback works when a `.tar.gz` has a non-standard extension.
+        let renamed = temp.path().join("mystery.bin");
+        fs::copy(temp.path().join("bundle.tar.gz"), &renamed).unwrap();
+        let magic_entries = list_archive_entries(renamed, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(magic_entries.iter().any(|e| e.name == "hello.txt"));
+    }
+
+    #[tokio::test]
+    async fn tar_gz_handles_leading_dot_slash_and_root_dir_entries() {
+        let temp = TempDir::new().unwrap();
+        let archive_path = temp.path().join("dot_slash.tar.gz");
+
+        let mut tar_buf = Vec::new();
+        push_raw_tar_entry(&mut tar_buf, "./", tar::EntryType::Directory, None, b"");
+        push_raw_tar_entry(&mut tar_buf, "./dir/", tar::EntryType::Directory, None, b"");
+        push_raw_tar_entry(
+            &mut tar_buf,
+            "./dir/file.txt",
+            tar::EntryType::Regular,
+            None,
+            b"from dot slash",
+        );
+        write_gzipped_tar(&archive_path, &tar_buf);
+
+        let entries = list_archive_entries(archive_path.clone(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .any(|e| { e.relative_path == Path::new("dir").join("file.txt") && !e.is_dir })
+        );
+
+        let dest = temp.path().join("out");
+        extract_archive(
+            archive_path,
+            dest.clone(),
+            ConflictPolicy::Fail,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fs::read(dest.join("dir").join("file.txt")).unwrap(),
+            b"from dot slash"
+        );
+    }
+
+    #[tokio::test]
+    async fn tar_gz_rejects_path_traversal_absolute_and_windows_drive_paths() {
+        let temp = TempDir::new().unwrap();
+        let dest_dir = temp.path().join("safe_dest");
+        fs::create_dir_all(&dest_dir).unwrap();
+
+        let malicious_paths = [
+            "../evil.txt",
+            "sub/../../evil.txt",
+            r"sub\..\..\evil.txt",
+            "./../evil.txt",
+            "/etc/passwd",
+            r"\Windows\System32\evil.dll",
+            r"C:\evil.txt",
+            "C:evil.txt",
+            "CON",
+            "sub/NUL.txt",
+        ];
+
+        for (i, bad_path) in malicious_paths.iter().enumerate() {
+            let archive_path = temp.path().join(format!("malicious_{i}.tar.gz"));
+            let mut tar_buf = Vec::new();
+            // Include a benign entry BEFORE the malicious one to prove pre-flight blocks
+            // extraction before writing anything to disk.
+            push_raw_tar_entry(
+                &mut tar_buf,
+                "benign_first.txt",
+                tar::EntryType::Regular,
+                None,
+                b"should not be written",
+            );
+            push_raw_tar_entry(
+                &mut tar_buf,
+                bad_path,
+                tar::EntryType::Regular,
+                None,
+                b"pwned",
+            );
+            write_gzipped_tar(&archive_path, &tar_buf);
+
+            let list_res =
+                list_archive_entries(archive_path.clone(), CancellationToken::new()).await;
+            assert!(
+                matches!(list_res, Err(OnyxError::InvalidPath { .. })),
+                "Expected InvalidPath listing '{bad_path}', got: {list_res:?}"
+            );
+
+            let extract_res = extract_archive(
+                archive_path,
+                dest_dir.clone(),
+                ConflictPolicy::Overwrite,
+                None,
+                CancellationToken::new(),
+            )
+            .await;
+            assert!(
+                matches!(extract_res, Err(OnyxError::InvalidPath { .. })),
+                "Expected InvalidPath extracting '{bad_path}', got: {extract_res:?}"
+            );
+            assert!(
+                !dest_dir.join("benign_first.txt").exists(),
+                "Pre-flight must prevent partial extraction when '{bad_path}' is present"
+            );
+            assert!(!temp.path().join("evil.txt").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn tar_gz_rejects_symlink_and_hardlink_escape_entries() {
+        let temp = TempDir::new().unwrap();
+        let dest_dir = temp.path().join("safe_dest");
+        fs::create_dir_all(&dest_dir).unwrap();
+
+        // 1. Symlink escape attack (`escape_link -> ../`) followed by `escape_link/pwn.txt`
+        let symlink_archive = temp.path().join("symlink_escape.tar.gz");
+        {
+            let mut tar_buf = Vec::new();
+            push_raw_tar_entry(
+                &mut tar_buf,
+                "escape_link",
+                tar::EntryType::Symlink,
+                Some("../"),
+                b"",
+            );
+            push_raw_tar_entry(
+                &mut tar_buf,
+                "escape_link/pwn.txt",
+                tar::EntryType::Regular,
+                None,
+                b"escaped",
+            );
+            write_gzipped_tar(&symlink_archive, &tar_buf);
+        }
+
+        let list_res =
+            list_archive_entries(symlink_archive.clone(), CancellationToken::new()).await;
+        assert!(
+            matches!(list_res, Err(OnyxError::InvalidPath { .. })),
+            "Expected InvalidPath for symlink entry in list, got: {list_res:?}"
+        );
+
+        let extract_res = extract_archive(
+            symlink_archive,
+            dest_dir.clone(),
+            ConflictPolicy::Overwrite,
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(extract_res, Err(OnyxError::InvalidPath { .. })),
+            "Expected InvalidPath for symlink entry in extract, got: {extract_res:?}"
+        );
+        assert!(!temp.path().join("pwn.txt").exists());
+
+        // 2. Hardlink escape attack
+        let hardlink_archive = temp.path().join("hardlink_escape.tgz");
+        {
+            let mut tar_buf = Vec::new();
+            push_raw_tar_entry(
+                &mut tar_buf,
+                "hard_pwn.txt",
+                tar::EntryType::Link,
+                Some("../outside.txt"),
+                b"",
+            );
+            write_gzipped_tar(&hardlink_archive, &tar_buf);
+        }
+
+        let hard_res = extract_archive(
+            hardlink_archive,
+            dest_dir,
+            ConflictPolicy::Overwrite,
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(hard_res, Err(OnyxError::InvalidPath { .. })),
+            "Expected InvalidPath for hardlink entry, got: {hard_res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tar_gz_enforces_entry_count_size_and_compression_ratio_bomb_limits() {
+        let temp = TempDir::new().unwrap();
+
+        // 1. Max entries limit
+        let many_entries_archive = temp.path().join("many.tar.gz");
+        {
+            let mut tar_buf = Vec::new();
+            for i in 0..5 {
+                push_raw_tar_entry(
+                    &mut tar_buf,
+                    &format!("f_{i}.txt"),
+                    tar::EntryType::Regular,
+                    None,
+                    b"x",
+                );
+            }
+            write_gzipped_tar(&many_entries_archive, &tar_buf);
+        }
+
+        let entry_limit = ArchiveLimits {
+            max_entries: 3,
+            max_total_uncompressed_bytes: 1024 * 1024,
+            max_compression_ratio: 200,
+        };
+        assert!(
+            list_archive_entries_with_limits(
+                many_entries_archive.clone(),
+                entry_limit,
+                CancellationToken::new(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            extract_archive_with_limits(
+                many_entries_archive,
+                temp.path().join("out_entries"),
+                ConflictPolicy::Overwrite,
+                entry_limit,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .is_err()
+        );
+
+        // 2. Max total uncompressed bytes limit (and preserves existing files + leaves no temp files)
+        let size_archive = temp.path().join("size_bomb.tar.gz");
+        {
+            let mut tar_buf = Vec::new();
+            push_raw_tar_entry(
+                &mut tar_buf,
+                "target.txt",
+                tar::EntryType::Regular,
+                None,
+                &vec![b'A'; 4096],
+            );
+            write_gzipped_tar(&size_archive, &tar_buf);
+        }
+
+        let dest_dir = temp.path().join("dest_size");
+        fs::create_dir_all(&dest_dir).unwrap();
+        let existing = dest_dir.join("target.txt");
+        fs::write(&existing, b"keep intact").unwrap();
+
+        let size_limit = ArchiveLimits {
+            max_entries: 100,
+            max_total_uncompressed_bytes: 1024,
+            max_compression_ratio: 200,
+        };
+        assert!(
+            list_archive_entries_with_limits(
+                size_archive.clone(),
+                size_limit,
+                CancellationToken::new(),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            extract_archive_with_limits(
+                size_archive,
+                dest_dir.clone(),
+                ConflictPolicy::Overwrite,
+                size_limit,
+                None,
+                CancellationToken::new(),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(fs::read(&existing).unwrap(), b"keep intact");
+        let has_tmp = fs::read_dir(&dest_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".onyx_extract_tmp_")
+            });
+        assert!(!has_tmp);
+
+        // 3. Compression-ratio gzip bomb (2 MiB of zeroes compresses to ~2 KiB -> ratio ~1000:1 > 50:1)
+        let ratio_bomb = temp.path().join("ratio_bomb.tgz");
+        {
+            let mut tar_buf = Vec::new();
+            push_raw_tar_entry(
+                &mut tar_buf,
+                "zeros.bin",
+                tar::EntryType::Regular,
+                None,
+                &vec![0u8; 2 * 1024 * 1024],
+            );
+            write_gzipped_tar(&ratio_bomb, &tar_buf);
+        }
+        let ratio_limits = ArchiveLimits {
+            max_entries: 100,
+            max_total_uncompressed_bytes: 16 * 1024 * 1024,
+            max_compression_ratio: 50,
+        };
+        let ratio_list_res = list_archive_entries_with_limits(
+            ratio_bomb.clone(),
+            ratio_limits,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(ratio_list_res, Err(OnyxError::OperationFailed { .. })),
+            "Expected OperationFailed for gzip ratio bomb in list, got: {ratio_list_res:?}"
+        );
+        let ratio_extract_res = extract_archive_with_limits(
+            ratio_bomb,
+            temp.path().join("out_ratio"),
+            ConflictPolicy::Overwrite,
+            ratio_limits,
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            matches!(ratio_extract_res, Err(OnyxError::OperationFailed { .. })),
+            "Expected OperationFailed for gzip ratio bomb in extract, got: {ratio_extract_res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tar_gz_respects_conflict_policies_and_preserves_preexisting_dirs() {
+        let temp = TempDir::new().unwrap();
+        let src_file = temp.path().join("note.txt");
+        fs::write(&src_file, b"from-targz").unwrap();
+
+        let archive_path = temp.path().join("single.tgz");
+        create_archive(
+            vec![src_file],
+            archive_path.clone(),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let dest_dir = temp.path().join("out");
+        fs::create_dir_all(&dest_dir).unwrap();
+        let existing = dest_dir.join("note.txt");
+        fs::write(&existing, b"existing").unwrap();
+
+        // Skip
+        let skip_rep = extract_archive(
+            archive_path.clone(),
+            dest_dir.clone(),
+            ConflictPolicy::Skip,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(skip_rep.skipped, vec![existing.clone()]);
+        assert_eq!(fs::read(&existing).unwrap(), b"existing");
+
+        // AutoRename
+        let rename_rep = extract_archive(
+            archive_path.clone(),
+            dest_dir.clone(),
+            ConflictPolicy::AutoRename,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let renamed = dest_dir.join("note (2).txt");
+        assert_eq!(rename_rep.succeeded, vec![renamed.clone()]);
+        assert_eq!(fs::read(&renamed).unwrap(), b"from-targz");
+
+        // Fail
+        let fail_res = extract_archive(
+            archive_path.clone(),
+            dest_dir.clone(),
+            ConflictPolicy::Fail,
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(fail_res, Err(OnyxError::AlreadyExists { .. })));
+
+        // Cancel
+        let cancel_res = extract_archive(
+            archive_path.clone(),
+            dest_dir.clone(),
+            ConflictPolicy::Cancel,
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(matches!(cancel_res, Err(OnyxError::Cancelled)));
+
+        // Overwrite
+        let overwrite_rep = extract_archive(
+            archive_path,
+            dest_dir,
+            ConflictPolicy::Overwrite,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(overwrite_rep.succeeded, vec![existing.clone()]);
+        assert_eq!(fs::read(&existing).unwrap(), b"from-targz");
+    }
+
+    #[tokio::test]
+    async fn tar_gz_respects_cancellation_and_rejects_corrupt_streams() {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("data.bin");
+        fs::write(&src, vec![7u8; 4096]).unwrap();
+        let archive_path = temp.path().join("cancel.tar.gz");
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+
+        // Pre-cancelled create
+        let create_err = create_archive(
+            vec![src.clone()],
+            archive_path.clone(),
+            None,
+            cancelled.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(create_err, OnyxError::Cancelled));
+        assert!(!archive_path.exists());
+
+        // Create valid archive, then test cancelled list & extract
+        create_archive(
+            vec![src],
+            archive_path.clone(),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        let list_err = list_archive_entries(archive_path.clone(), cancelled.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(list_err, OnyxError::Cancelled));
+
+        let extract_err = extract_archive(
+            archive_path,
+            temp.path().join("cancel_out"),
+            ConflictPolicy::Overwrite,
+            None,
+            cancelled,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(extract_err, OnyxError::Cancelled));
+
+        // Corrupt gzip stream
+        let corrupt_path = temp.path().join("corrupt.tar.gz");
+        fs::write(&corrupt_path, b"not a valid gzip stream at all").unwrap();
+        let corrupt_list = list_archive_entries(corrupt_path.clone(), CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(corrupt_list, OnyxError::OperationFailed { .. }));
+        let corrupt_extract = extract_archive(
+            corrupt_path,
+            temp.path().join("corrupt_out"),
+            ConflictPolicy::Overwrite,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(corrupt_extract, OnyxError::OperationFailed { .. }));
     }
 }
