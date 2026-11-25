@@ -189,6 +189,7 @@ mod tests {
                 path: PathBuf::from(r"D:\Projects"),
             }],
             excluded_index_dirs: vec![PathBuf::from(r"C:\Windows")],
+            indexed_search: true,
             recent_locations: vec![PathBuf::from(r"D:\Onyx")],
         };
 

@@ -31,15 +31,7 @@ pub fn render_status_bar(view: &OnyxExplorer, cx: &mut Context<OnyxExplorer>) ->
         });
 
     let display_path = normalize_display_path(view.pane_path(view.active_pane));
-    let search_status = if !view.search_query_text().trim().is_empty() {
-        if active.is_loading {
-            Some("Searching…".to_string())
-        } else {
-            Some(format!("{count} matches"))
-        }
-    } else {
-        None
-    };
+    let search_status = view.search_status_label();
 
     let mut left_group = div()
         .flex()
@@ -111,6 +103,16 @@ pub fn render_status_bar(view: &OnyxExplorer, cx: &mut Context<OnyxExplorer>) ->
     }
 
     right_group = right_group
+        .child(fluent_chip(
+            "status-index-chip".into(),
+            "Indexed",
+            view.indexed_search,
+            true,
+            theme,
+            Some(Box::new(cx.listener(|explorer, _, _, cx| {
+                explorer.toggle_indexed_search(cx);
+            }))),
+        ))
         .child(fluent_chip(
             "status-dual-chip".into(),
             "Dual",

@@ -28,6 +28,8 @@ pub struct AppConfig {
     pub default_terminal: String,
     pub favorites: Vec<FavoriteItem>,
     pub excluded_index_dirs: Vec<PathBuf>,
+    /// Whether the persistent search index is enabled on startup.
+    pub indexed_search: bool,
     pub recent_locations: Vec<PathBuf>,
 }
 
@@ -53,6 +55,7 @@ impl Default for AppConfig {
             default_terminal: default_terminal_value(),
             favorites: Vec::new(),
             excluded_index_dirs: Vec::new(),
+            indexed_search: false,
             recent_locations: Vec::new(),
         }
     }

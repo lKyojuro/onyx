@@ -418,11 +418,27 @@ pub fn render_settings_overlay(
         ))
         .child(section("SEARCH INDEXING", theme))
         .child(settings_row(
+            "Indexed search",
+            "Keep a persistent index in the folder tree and search beyond the open folder.",
+            theme,
+            boolean_controls(
+                "settings-indexed-search",
+                view.indexed_search,
+                OnyxExplorer::set_indexed_search,
+            ),
+        ))
+        .child(settings_row(
             "Excluded index folders",
             "Folders the background indexer must skip.",
             theme,
             excluded_controls,
-        ));
+        ))
+        .child(
+            div()
+                .text_size(FONT_XS)
+                .text_color(theme.text_muted())
+                .child(view.index_status.label()),
+        );
 
     if !excluded_labels.is_empty() {
         let mut list = div().flex().flex_col().w_full().gap(px(4.0)).pl(px(4.0));
