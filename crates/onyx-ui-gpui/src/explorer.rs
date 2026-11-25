@@ -4141,6 +4141,16 @@ impl OnyxExplorer {
     /// handlers stop firing at the window edge. The internal drag is dropped
     /// without touching the selection, so a cancelled drop behaves like `Escape`.
     pub(crate) fn hand_drag_to_shell(&mut self, pointer: (f32, f32), cx: &mut Context<Self>) {
+        log_drag(format!(
+            "handover pointer=({:.0},{:.0}) viewport=({:.0},{:.0}) drag={} armed={} external={}",
+            pointer.0,
+            pointer.1,
+            self.viewport_size.0,
+            self.viewport_size.1,
+            self.drag.is_some(),
+            self.drag.as_ref().is_some_and(|drag| drag.armed),
+            self.external_drag_active,
+        ));
         if !drag_drop::should_start_external_drag(
             self.drag.as_ref(),
             self.external_drag_active,
@@ -4156,7 +4166,14 @@ impl OnyxExplorer {
         self.start_external_drag(drag.source, cx);
     }
 
-    /// Runs OLE `DoDragDrop` for one dragged item on a dedicated STA thread.
+    /// Runs the synchronous OLE `DoDragDrop` loop for one dragged item.
+    ///
+    /// It blocks until the drop target answers, which is exactly how a native
+    /// drag behaves, and it has to run on the UI thread: `DoDragDrop` routes the
+    /// mouse messages through the capture this thread holds, and the helper's
+    /// `ReleaseCapture` only releases capture owned by the calling thread. A
+    /// worker thread therefore hands the drag over and then waits forever for a
+    /// release it never sees.
     fn start_external_drag(&mut self, source: PathBuf, cx: &mut Context<Self>) {
         if self.external_drag_active {
             return;
@@ -4165,42 +4182,9 @@ impl OnyxExplorer {
         self.status_message = Some("Drag the selection into another application.".to_string());
         cx.notify();
 
-        let paths = vec![source.clone()];
-        let (tx, rx) = oneshot::channel::<Result<DragOutcome, String>>();
-
-        // `start_external_file_drag` blocks in `DoDragDrop` until the drop target
-        // answers and needs a fresh STA thread, so it runs off the UI thread like
-        // the native shell context menu does.
-        let spawn_res = std::thread::Builder::new()
-            .name("onyx-external-drag".to_string())
-            .spawn(move || {
-                let res = start_external_file_drag(&paths).map_err(|err| err.to_string());
-                let _ = tx.send(res);
-            });
-
-        if let Err(err) = spawn_res {
-            self.external_drag_active = false;
-            self.status_message = Some(format!("Failed to start the external drag: {err}"));
-            cx.notify();
-            return;
-        }
-
-        cx.spawn(async move |this, cx| {
-            let Ok(result) = rx.await else {
-                // The drag thread died without reporting, so the guard has to be
-                // released here or no further external drag would ever start.
-                let _ = this.update(cx, |explorer, cx| {
-                    explorer.external_drag_active = false;
-                    explorer.status_message = Some("The external drag aborted.".to_string());
-                    cx.notify();
-                });
-                return;
-            };
-            let _ = this.update(cx, |explorer, cx| {
-                explorer.finish_external_drag(result, &source, cx);
-            });
-        })
-        .detach();
+        let result =
+            start_external_file_drag(std::slice::from_ref(&source)).map_err(|err| err.to_string());
+        self.finish_external_drag(result, &source, cx);
     }
 
     /// Reports the OLE outcome and keeps the panes in sync with the shell.
@@ -4211,6 +4195,11 @@ impl OnyxExplorer {
         cx: &mut Context<Self>,
     ) {
         self.external_drag_active = false;
+        log_drag(format!(
+            "finished source={} outcome={:?}",
+            source.display(),
+            result.as_ref().map(|outcome| format!("{outcome:?}"))
+        ));
         let mut affected = Vec::new();
         add_parent(&mut affected, source);
 
@@ -4740,10 +4729,9 @@ impl OnyxExplorer {
                     return;
                 }
                 "enter" if list_focused => {
-                    let selected = self.palette_selected_id();
-                    if let Some(id) = selected {
-                        self.run_palette_command(id, window, cx);
-                    }
+                    // Both modes: commands run, file hits open. Going through
+                    // `palette_selected_id` alone dropped Enter in search mode.
+                    self.activate_palette_selection(window, cx);
                     cx.stop_propagation();
                     return;
                 }
@@ -4984,8 +4972,10 @@ impl OnyxExplorer {
             }
         } else {
             match key {
-                "up" => self.move_selection(-1, cx),
-                "down" => self.move_selection(1, cx),
+                // Slint moves the selection with the horizontal arrows too in the
+                // details view (`main.slint`); history stays on Alt+Left/Right.
+                "up" | "left" => self.move_selection(-1, cx),
+                "down" | "right" => self.move_selection(1, cx),
                 "enter" => {
                     if let Some(idx) = self.pane_selected_index(self.active_pane) {
                         self.activate_entry(idx, window, cx);
@@ -5089,7 +5079,11 @@ impl Render for OnyxExplorer {
                 } else if explorer.drag.is_some() {
                     if ev.pressed_button == Some(MouseButton::Left) {
                         explorer.update_drag(pointer, ev.modifiers.control, cx);
-                    } else {
+                    } else if !drag_drop::pointer_left_window(pointer, explorer.viewport_size) {
+                        // Windows drops the button state once the pointer is
+                        // outside the client area, so a missing button only ends
+                        // the gesture inside the window; outside, the drag has to
+                        // survive so the raw listener can hand it to the shell.
                         explorer.cancel_drag(cx);
                     }
                 }
@@ -5113,13 +5107,18 @@ impl Render for OnyxExplorer {
             .child(toolbar::render_toolbar(self, window, cx))
             .child(workspace)
             .child(status_bar::render_status_bar(self, cx))
-            // Zero-sized, so it only registers the pointer listener that turns a
-            // drag leaving the window into a native OLE drag.
+            // Only there to register the pointer listener that turns a drag
+            // leaving the window into a native OLE drag. It must have bounds
+            // (GPUI does not paint a zero-sized element, and the listener is
+            // registered in the paint callback), so it is a one-pixel strip along
+            // the top edge that no interactive element relies on.
             .child(
                 div()
                     .absolute()
                     .top(px(0.0))
                     .left(px(0.0))
+                    .w_full()
+                    .h(px(1.0))
                     .child(external_drag_watcher(cx)),
             );
 
@@ -5228,6 +5227,35 @@ fn external_drag_watcher(cx: &mut Context<OnyxExplorer>) -> impl IntoElement {
             });
         },
     )
+}
+
+/// Appends a line to `%APPDATA%\onyx\logs\drag-debug.log` when `ONYX_DEBUG_DRAG`
+/// is set.
+///
+/// Handing a drag to the shell depends on platform behaviour no unit test can
+/// reach (capture, out-of-bounds coordinates, OLE apartment), so the path stays
+/// inspectable on a real window without logging in normal operation.
+fn log_drag(message: impl AsRef<str>) {
+    if std::env::var_os("ONYX_DEBUG_DRAG").is_none() {
+        return;
+    }
+    let Some(dir) = dirs::data_dir().map(|dir| dir.join("onyx").join("logs")) else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("drag-debug.log"))
+    else {
+        return;
+    };
+    use std::io::Write as _;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    let _ = writeln!(file, "{stamp} {}", message.as_ref());
 }
 
 fn extract_window_hwnd(window: &Window) -> Option<isize> {
