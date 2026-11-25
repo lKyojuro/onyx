@@ -680,6 +680,10 @@ pub(crate) fn is_definitely_missing_io_error(err: &std::io::Error) -> bool {
     )
 }
 
+/// Upper bound for the FTS5 search index SQLite page cache, in KiB
+/// (negative `cache_size` semantics). Caps idle RAM while staying fast for FTS5 queries.
+const MAX_PAGE_CACHE_KIB: i64 = -2048;
+
 fn configure_connection(conn: &Connection, enable_wal: bool) -> OnyxResult<()> {
     conn.busy_timeout(Duration::from_millis(5000))
         .map_err(db_err)?;
@@ -692,6 +696,8 @@ fn configure_connection(conn: &Connection, enable_wal: bool) -> OnyxResult<()> {
     conn.pragma_update(None, "temp_store", "MEMORY")
         .map_err(db_err)?;
     conn.pragma_update(None, "busy_timeout", 5000)
+        .map_err(db_err)?;
+    conn.pragma_update(None, "cache_size", MAX_PAGE_CACHE_KIB)
         .map_err(db_err)?;
     Ok(())
 }
@@ -854,5 +860,21 @@ fn dir_descendants_like_pattern(root_str: &str) -> String {
 fn db_err(err: rusqlite::Error) -> OnyxError {
     OnyxError::Database {
         message: err.to_string(),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_page_cache_is_bounded() {
+        let index = SearchIndex::open_in_memory().unwrap();
+        let conn = index.conn.lock().unwrap();
+        let cache_size: i64 = conn
+            .query_row("PRAGMA cache_size;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cache_size, MAX_PAGE_CACHE_KIB);
     }
 }

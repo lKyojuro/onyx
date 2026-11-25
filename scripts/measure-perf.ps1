@@ -34,11 +34,39 @@ Write-Host "=== Onyx Release Performance Measurement ===" -ForegroundColor Cyan
 Write-Host "Binary: $exePath"
 Write-Host "Size:   $sizeMB MB ($sizeBytes bytes)"
 
-$versionOutput = & $exePath --version
-if ($LASTEXITCODE -ne 0) {
-    throw "onyx.exe --version failed with exit code $LASTEXITCODE"
+# Onyx is a GUI-subsystem executable: PowerShell's `&` invocation neither waits for it
+# reliably nor sets `$LASTEXITCODE`. Invoke it through Start-Process with explicit waits
+# and stdout capture so exit codes and timings are trustworthy.
+function Invoke-OnyxCli {
+    param(
+        [string[]]$CliArgs
+    )
+    $tmpOut = New-TemporaryFile
+    $tmpErr = New-TemporaryFile
+    try {
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $p = Start-Process -FilePath $script:exePath -ArgumentList $CliArgs -Wait -PassThru `
+            -WindowStyle Hidden -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
+        $sw.Stop()
+        $stdoutText = (Get-Content $tmpOut -Raw -ErrorAction SilentlyContinue)
+        $stderrText = (Get-Content $tmpErr -Raw -ErrorAction SilentlyContinue)
+        return [PSCustomObject]@{
+            ExitCode   = $p.ExitCode
+            Stdout     = "$stdoutText"
+            Stderr     = "$stderrText"
+            DurationMs = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+        }
+    }
+    finally {
+        Remove-Item $tmpOut, $tmpErr -Force -ErrorAction SilentlyContinue
+    }
 }
-Write-Host "Version: $versionOutput"
+
+$versionResult = Invoke-OnyxCli @('--version')
+if ($versionResult.ExitCode -ne 0) {
+    throw "onyx.exe --version failed with exit code $($versionResult.ExitCode): $($versionResult.Stderr)"
+}
+Write-Host ("Version: {0}" -f ($versionResult.Stdout.Trim()))
 
 # System metadata
 $os = Get-CimInstance Win32_OperatingSystem
@@ -51,13 +79,11 @@ Write-Host ""
 Write-Host "==> Measuring --smoke-test ($Runs runs)..." -ForegroundColor Cyan
 $smokeTimings = @()
 for ($i = 1; $i -le $Runs; $i++) {
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    $out = & $exePath --smoke-test 2>&1
-    $sw.Stop()
-    if ($LASTEXITCODE -ne 0) {
-        throw "Smoke test run $i failed: $out"
+    $result = Invoke-OnyxCli @('--smoke-test')
+    if ($result.ExitCode -ne 0) {
+        throw ("Smoke test run {0} failed: {1}" -f $i, "$($result.Stdout) $($result.Stderr)")
     }
-    $ms = [math]::Round($sw.Elapsed.TotalMilliseconds, 2)
+    $ms = $result.DurationMs
     $smokeTimings += $ms
     Write-Host ("  Run {0}: {1} ms" -f $i, $ms)
 }

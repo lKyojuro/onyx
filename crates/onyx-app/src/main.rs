@@ -65,12 +65,57 @@ fn main() -> AppResult<()> {
 }
 
 fn run(mode: Launch) -> AppResult<()> {
-    let runtime = Arc::new(Builder::new_multi_thread().enable_all().build()?);
+    configure_runtime_parallelism()?;
+    let runtime = Arc::new(
+        Builder::new_multi_thread()
+            .worker_threads(async_worker_threads())
+            .max_blocking_threads(MAX_BLOCKING_THREADS)
+            .enable_all()
+            .build()?,
+    );
     match mode {
         Launch::Version => Ok(()),
         Launch::Smoke => runtime.block_on(smoke_test()),
         Launch::Window(path) => controller::run(runtime, path),
     }
+}
+
+/// Lower bound for Tokio async workers. A file manager's event loop does not benefit
+/// from more.
+const MIN_ASYNC_WORKERS: usize = 2;
+
+/// Upper bound for Tokio async workers, chosen for low idle RAM instead of pegging
+/// every logical CPU (Tokio defaults to one worker per logical core).
+const MAX_ASYNC_WORKERS: usize = 4;
+
+/// Bound for Tokio's on-demand blocking pool (default 512). 32 covers the folder-size
+/// scanning semaphore, thumbnails, and archive/operation workers with headroom.
+const MAX_BLOCKING_THREADS: usize = 32;
+
+/// Bound for the Rayon global pool used by parallel directory-entry sorting (default:
+/// one thread per logical core).
+const MAX_RAYON_THREADS: usize = 4;
+
+fn async_worker_threads() -> usize {
+    clamp_worker_threads(
+        std::thread::available_parallelism().map_or(MIN_ASYNC_WORKERS, |n| n.get()),
+    )
+}
+
+fn clamp_worker_threads(parallelism: usize) -> usize {
+    parallelism.clamp(MIN_ASYNC_WORKERS, MAX_ASYNC_WORKERS)
+}
+
+fn configure_runtime_parallelism() -> AppResult<()> {
+    // The Rayon global pool must be sized before the first `par_*` call (entry sorting in
+    // `onyx-fs`), so configure it as the very first startup step.
+    if let Err(error) = rayon::ThreadPoolBuilder::new()
+        .num_threads(MAX_RAYON_THREADS)
+        .build_global()
+    {
+        tracing::warn!(%error, "Rayon global pool already initialized; using its size");
+    }
+    Ok(())
 }
 
 struct SmokeDir(PathBuf);
@@ -160,4 +205,29 @@ async fn smoke_test() -> AppResult<()> {
 
 fn is_directory(path: &Path) -> bool {
     to_extended_length_path(path).is_dir()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_thread_count_is_clamped_to_desktop_range() {
+        assert_eq!(clamp_worker_threads(1), MIN_ASYNC_WORKERS);
+        assert_eq!(clamp_worker_threads(MIN_ASYNC_WORKERS), MIN_ASYNC_WORKERS);
+        assert_eq!(clamp_worker_threads(3), 3);
+        assert_eq!(clamp_worker_threads(MAX_ASYNC_WORKERS), MAX_ASYNC_WORKERS);
+        assert_eq!(clamp_worker_threads(16), MAX_ASYNC_WORKERS);
+        assert!(clamp_worker_threads(usize::MAX) <= MAX_ASYNC_WORKERS);
+    }
+
+    #[test]
+    fn async_worker_threads_stays_within_bounds_on_any_host() {
+        let workers = async_worker_threads();
+        assert!(
+            (MIN_ASYNC_WORKERS..=MAX_ASYNC_WORKERS).contains(&workers),
+            "async worker count {workers} outside desktop bounds"
+        );
+    }
 }
