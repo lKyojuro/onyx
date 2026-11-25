@@ -1,0 +1,90 @@
+name: Onyx Windows Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  windows-release:
+    name: Windows x64 Release Build & Package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run unit & integration tests
+        run: cargo test --workspace
+
+      - name: Build release binary
+        run: cargo build --release --bin onyx
+
+      - name: Verify release binary (--version and --smoke-test)
+        run: |
+          .\target\release\onyx.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\target\release\onyx.exe --smoke-test
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package portable ZIP
+        run: .\scripts\package-portable.ps1 -SkipBuild
+
+      - name: Verify portable ZIP SHA-256 checksum
+        run: |
+          $expected = ((Get-Content .\dist\onyx-portable-win64.zip.sha256) -split '\s+' | Select-Object -First 1).ToUpperInvariant()
+          $actual = (Get-FileHash .\dist\onyx-portable-win64.zip -Algorithm SHA256).Hash.ToUpperInvariant()
+          if ($actual -ne $expected) {
+            throw "SHA-256 mismatch: expected $expected, got $actual"
+          }
+          Write-Host "SHA-256 verified: $actual"
+
+      - name: Build WiX MSI installer (optional)
+        run: |
+          if (Get-Command wix -ErrorAction SilentlyContinue) {
+            .\scripts\package-wix.ps1 -SkipBuild
+          } else {
+            Write-Host "WiX CLI not available on runner; skipping MSI packaging."
+          }
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: onyx-windows-x64-dist
+          path: |
+            dist/onyx-portable-win64.zip
+            dist/onyx-portable-win64.zip.sha256
+            dist/*.msi
+            dist/*.msi.sha256
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/onyx-portable-win64.zip
+            dist/onyx-portable-win64.zip.sha256
+            dist/*.msi
+            dist/*.msi.sha256

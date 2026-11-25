@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <?ifndef ProductVersion ?>
+    <?define ProductVersion = "0.1.0" ?>
+  <?endif?>
+  <?ifndef ExePath ?>
+    <?define ExePath = "..\..\target\release\onyx.exe" ?>
+  <?endif?>
+  <?ifndef RepoRoot ?>
+    <?define RepoRoot = "..\.." ?>
+  <?endif?>
+  <?ifndef IconPath ?>
+    <?define IconPath = "..\..\assets\branding\onyx.ico" ?>
+  <?endif?>
+
+  <Package
+    Name="Onyx"
+    Manufacturer="Onyx Contributors"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="E4A8F1C2-7B3D-4E9A-9F12-3C8D5E6A7B89"
+    Scope="perUserOrMachine"
+    InstallerVersion="500">
+
+    <SummaryInformation Description="Onyx — Native Windows 11 File Explorer" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="OnyxIcon.ico" SourceFile="$(var.IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="OnyxIcon.ico" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="Onyx">
+        <Directory Id="AssetsFolder" Name="assets">
+          <Directory Id="BrandingFolder" Name="branding" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Onyx" />
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="Onyx" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentRef Id="StartMenuShortcutComponent" />
+    </Feature>
+
+    <ComponentGroup Id="ProductComponents">
+      <Component Id="OnyxExecutableComponent" Directory="INSTALLFOLDER" Guid="7D9B41E0-3A2C-48B5-A1D7-9E4F6C2B8011">
+        <File Id="OnyxExe" Source="$(var.ExePath)" />
+        <RegistryValue Root="HKCU" Key="Software\Onyx\Install" Name="Executable" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="OnyxDocsComponent" Directory="INSTALLFOLDER" Guid="3B6E2A94-8C1F-4D7E-B2A5-6F8C1D3E9402">
+        <File Id="ReadmeFile" Source="$(var.RepoRoot)\README.md" />
+        <File Id="LicenseFile" Source="$(var.RepoRoot)\LICENSE" />
+        <RegistryValue Root="HKCU" Key="Software\Onyx\Install" Name="Docs" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="OnyxBrandingComponent" Directory="BrandingFolder" Guid="A91C5D72-4E8B-40A6-93C1-2D7F8E4B6103">
+        <File Id="OnyxIconFile" Source="$(var.IconPath)" />
+        <File Id="OnyxSvgFile" Source="$(var.RepoRoot)\assets\branding\onyx-icon.svg" />
+        <RegistryValue Root="HKCU" Key="Software\Onyx\Install" Name="Branding" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="StartMenuShortcutComponent" Directory="ApplicationProgramsFolder" Guid="F2C8E4A1-6B9D-43E7-8A54-1C9E7D3F5204">
+      <Shortcut
+        Id="OnyxStartMenuShortcut"
+        Name="Onyx"
+        Description="Onyx — Native Windows 11 File Explorer"
+        Target="[INSTALLFOLDER]onyx.exe"
+        WorkingDirectory="INSTALLFOLDER"
+        Icon="OnyxIcon.ico" />
+      <RemoveFolder Id="CleanUpStartMenuFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\Onyx\Install" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+  </Package>
+</Wix>
