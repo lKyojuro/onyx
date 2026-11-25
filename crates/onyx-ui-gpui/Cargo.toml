@@ -19,11 +19,15 @@ onyx-core = { path = "../onyx-core" }
 onyx-fs = { path = "../onyx-fs" }
 onyx-operations = { path = "../onyx-operations" }
 onyx-preview = { path = "../onyx-preview" }
+onyx-search = { path = "../onyx-search" }
 onyx-windows = { path = "../onyx-windows" }
 raw-window-handle = "0.6"
 rayon = "1.12"
 tokio = { version = "1.54", features = ["rt-multi-thread", "sync", "time", "fs", "macros"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

@@ -1,17 +1,20 @@
 //! Command Palette modal (`Ctrl+K`) matching `CommandPaletteModal` in
 //! `crates/onyx-ui/ui/components/overlays.slint`: a top-centered card with a
 //! query field, a category-grouped command list with shortcuts, and
-//! arrow/Enter/Escape handling.
+//! arrow/Enter/Escape handling. A query that starts with [`FILE_SEARCH_PREFIX`]
+//! switches the card to the indexed file search mode.
 
 use crate::explorer::OnyxExplorer;
 use crate::icons::{OnyxGlyph, render_glyph};
-use crate::theme::{FONT_SM, FONT_XS, RADIUS_LG, RADIUS_SM};
+use crate::search_index::{SearchRun, SearchStatus};
+use crate::theme::{FONT_SM, FONT_XS, OnyxTheme, RADIUS_LG, RADIUS_SM};
 use gpui_kit::{
     Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
     Styled,
     component::input::{Input, InputState},
     deferred, div, px,
 };
+use onyx_core::{FileEntry, normalize_display_path};
 
 const CARD_WIDTH: f32 = 560.0;
 const CARD_HEIGHT: f32 = 420.0;
@@ -24,6 +27,41 @@ const PALETTE_LAYER: usize = 25;
 /// Maximum number of matches shown at once; the list scrolls by re-filtering
 /// instead of scrolling, which keeps arrow-key navigation unambiguous.
 pub const MAX_VISIBLE_MATCHES: usize = 9;
+
+/// Maximum number of file hits the palette renders for one search run.
+pub const MAX_VISIBLE_HITS: usize = 12;
+
+/// Query prefix that switches the palette to the indexed file search.
+pub const FILE_SEARCH_PREFIX: char = '?';
+
+/// What the palette lists for the current query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PaletteMode {
+    #[default]
+    Commands,
+    /// Indexed file search: every row is a search hit of the open folder tree.
+    Files,
+}
+
+/// Palette mode selected by `query`'s prefix.
+#[must_use]
+pub fn palette_mode(query: &str) -> PaletteMode {
+    if query.trim_start().starts_with(FILE_SEARCH_PREFIX) {
+        PaletteMode::Files
+    } else {
+        PaletteMode::Commands
+    }
+}
+
+/// The file query of a [`PaletteMode::Files`] palette text, without the prefix.
+#[must_use]
+pub fn file_search_query(query: &str) -> &str {
+    query
+        .trim_start()
+        .strip_prefix(FILE_SEARCH_PREFIX)
+        .unwrap_or(query)
+        .trim()
+}
 
 /// Static metadata of one palette entry. The dispatch for `id` lives in
 /// [`crate::explorer::OnyxExplorer::run_palette_command`].
@@ -223,6 +261,18 @@ pub const COMMANDS: &[PaletteCommand] = &[
         shortcut: "",
         category: "Archive",
     },
+    PaletteCommand {
+        id: "index",
+        title: "Toggle Indexed Search",
+        shortcut: "",
+        category: "Search",
+    },
+    PaletteCommand {
+        id: "index-rebuild",
+        title: "Rebuild Search Index",
+        shortcut: "",
+        category: "Search",
+    },
 ];
 
 /// Returns the indices of all commands matching every whitespace-separated
@@ -298,10 +348,68 @@ impl PaletteFilter {
     }
 }
 
+/// Indexed file search of the palette's `?` mode. Keeps its own run, hits and
+/// selection next to the command filter, so switching modes never mixes rows.
+#[derive(Debug, Default)]
+pub struct PaletteSearch {
+    pub run: SearchRun,
+    pub hits: Vec<FileEntry>,
+    pub selected: usize,
+}
+
+impl PaletteSearch {
+    /// Replaces the hits of the current run and focuses the first one.
+    pub fn set_hits(&mut self, hits: Vec<FileEntry>) {
+        self.hits = hits;
+        self.selected = 0;
+    }
+
+    /// Reports why a file search could not run at all.
+    pub fn fail(&mut self, message: String) {
+        self.hits.clear();
+        self.selected = 0;
+        self.run.fail(message);
+    }
+
+    /// Cancels the run in flight and clears the rows.
+    pub fn cancel(&mut self) {
+        self.run.cancel();
+        self.hits.clear();
+        self.selected = 0;
+    }
+
+    /// Moves the hit selection by `delta`, clamping to the visible hits.
+    pub fn move_focus(&mut self, delta: isize) {
+        if self.hits.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let last = self.hits.len().min(MAX_VISIBLE_HITS) - 1;
+        let next = self.selected.saturating_add_signed(delta);
+        self.selected = next.min(last);
+    }
+
+    #[must_use]
+    pub fn selected_hit(&self) -> Option<&FileEntry> {
+        self.hits.get(self.selected)
+    }
+
+    /// Empty-list text for the current run state.
+    #[must_use]
+    pub fn empty_note(&self) -> &'static str {
+        match self.run.status() {
+            SearchStatus::Running => "Searching files…",
+            SearchStatus::Failed { .. } => "File search unavailable",
+            SearchStatus::Done { .. } | SearchStatus::Idle => "No matching files",
+        }
+    }
+}
+
 /// Open state of the command palette modal.
 pub struct CommandPaletteState {
     pub filter: PaletteFilter,
     pub input: Entity<InputState>,
+    pub search: PaletteSearch,
 }
 
 impl CommandPaletteState {
@@ -310,8 +418,198 @@ impl CommandPaletteState {
         Self {
             filter: PaletteFilter::new(),
             input,
+            search: PaletteSearch::default(),
         }
     }
+
+    /// Mode of the current query.
+    #[must_use]
+    pub fn mode(&self) -> PaletteMode {
+        palette_mode(&self.filter.query)
+    }
+}
+
+/// Centered placeholder shown when the current mode has no rows.
+fn empty_row(text: &str, theme: OnyxTheme) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w_full()
+        .h(px(64.0))
+        .text_size(FONT_SM)
+        .text_color(theme.text_muted())
+        .child(text.to_string())
+}
+
+/// One command row: category, title and shortcut.
+fn render_command_row(
+    command: &PaletteCommand,
+    position: usize,
+    is_selected: bool,
+    theme: OnyxTheme,
+    cx: &mut Context<OnyxExplorer>,
+) -> impl IntoElement {
+    let id = command.id;
+    let title = command.title;
+    let shortcut = command.shortcut;
+    let category = command.category;
+
+    div()
+        .id(("palette-row", position))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .flex_shrink_0()
+        .px(px(10.0))
+        .rounded(RADIUS_SM)
+        .border_1()
+        .border_color(if is_selected {
+            theme.accent_border()
+        } else {
+            gpui_kit::transparent_black()
+        })
+        .bg(if is_selected {
+            theme.bg_selected()
+        } else {
+            gpui_kit::transparent_black()
+        })
+        .cursor_pointer()
+        .hover(move |style| {
+            if is_selected {
+                style
+            } else {
+                style.bg(theme.bg_hover())
+            }
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |explorer, _, window, cx| {
+                explorer.run_palette_command(id, window, cx);
+            }),
+        )
+        .child(
+            div()
+                .w(px(92.0))
+                .flex_shrink_0()
+                .text_size(FONT_XS)
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(if is_selected {
+                    theme.accent_bright()
+                } else {
+                    theme.text_muted()
+                })
+                .child(category),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_size(FONT_SM)
+                .text_color(theme.text_primary())
+                .child(title),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(FONT_XS)
+                .text_color(theme.text_secondary())
+                .child(shortcut),
+        )
+}
+
+/// One file-search hit: icon, file name and the folder that contains it.
+fn render_hit_row(
+    entry: &FileEntry,
+    position: usize,
+    is_selected: bool,
+    theme: OnyxTheme,
+    cx: &mut Context<OnyxExplorer>,
+) -> impl IntoElement {
+    let name = entry.name.clone();
+    let location = entry
+        .path
+        .parent()
+        .map_or_else(String::new, normalize_display_path);
+
+    div()
+        .id(("palette-hit", position))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .w_full()
+        .h(px(ROW_HEIGHT))
+        .flex_shrink_0()
+        .px(px(10.0))
+        .rounded(RADIUS_SM)
+        .border_1()
+        .border_color(if is_selected {
+            theme.accent_border()
+        } else {
+            gpui_kit::transparent_black()
+        })
+        .bg(if is_selected {
+            theme.bg_selected()
+        } else {
+            gpui_kit::transparent_black()
+        })
+        .cursor_pointer()
+        .hover(move |style| {
+            if is_selected {
+                style
+            } else {
+                style.bg(theme.bg_hover())
+            }
+        })
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |explorer, _, window, cx| {
+                explorer.open_palette_hit(position, window, cx);
+            }),
+        )
+        .child(render_glyph(
+            if entry.is_dir() {
+                OnyxGlyph::Folder
+            } else {
+                OnyxGlyph::File
+            },
+            px(14.0),
+            if entry.is_dir() {
+                theme.folder_tint()
+            } else {
+                theme.text_muted()
+            },
+        ))
+        .child(
+            div()
+                .flex_shrink_0()
+                .max_w(px(200.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_size(FONT_SM)
+                .text_color(theme.text_primary())
+                .child(name),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_size(FONT_XS)
+                .text_color(if is_selected {
+                    theme.text_secondary()
+                } else {
+                    theme.text_muted()
+                })
+                .child(location),
+        )
 }
 
 /// Renders the deferred command palette overlay when open.
@@ -322,14 +620,7 @@ pub fn render_command_palette(
     let state = view.command_palette.as_ref()?;
     let theme = view.theme;
     let query = state.filter.query.clone();
-    let selected = state.filter.selected;
-    let matches: Vec<&'static PaletteCommand> = state
-        .filter
-        .matches
-        .iter()
-        .filter_map(|index| COMMANDS.get(*index))
-        .collect();
-    let count = matches.len();
+    let mode = state.mode();
 
     let mut list = div()
         .id("palette-list")
@@ -341,101 +632,67 @@ pub fn render_command_palette(
         .overflow_hidden()
         .py(px(6.0));
 
-    if matches.is_empty() {
-        list = list.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .w_full()
-                .h(px(64.0))
-                .text_size(FONT_SM)
-                .text_color(theme.text_muted())
-                .child("No matching commands"),
-        );
-    }
-
-    for (position, command) in matches.iter().enumerate() {
-        let is_selected = position == selected;
-        let id = command.id;
-        let title = command.title;
-        let shortcut = command.shortcut;
-        let category = command.category;
-
-        list = list.child(
-            div()
-                .id(("palette-row", position))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(10.0))
-                .w_full()
-                .h(px(ROW_HEIGHT))
-                .flex_shrink_0()
-                .px(px(10.0))
-                .rounded(RADIUS_SM)
-                .border_1()
-                .border_color(if is_selected {
-                    theme.accent_border()
-                } else {
-                    gpui_kit::transparent_black()
-                })
-                .bg(if is_selected {
-                    theme.bg_selected()
-                } else {
-                    gpui_kit::transparent_black()
-                })
-                .cursor_pointer()
-                .hover(move |style| {
-                    if is_selected {
-                        style
-                    } else {
-                        style.bg(theme.bg_hover())
-                    }
-                })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |explorer, _, window, cx| {
-                        explorer.run_palette_command(id, window, cx);
-                    }),
-                )
-                .child(
-                    div()
-                        .w(px(92.0))
-                        .flex_shrink_0()
-                        .text_size(FONT_XS)
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(if is_selected {
-                            theme.accent_bright()
-                        } else {
-                            theme.text_muted()
-                        })
-                        .child(category),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_size(FONT_SM)
-                        .text_color(theme.text_primary())
-                        .child(title),
-                )
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_size(FONT_XS)
-                        .text_color(theme.text_secondary())
-                        .child(shortcut),
-                ),
-        );
-    }
-
-    let header_note = if count > 0 {
-        format!("{count} of {} commands", COMMANDS.len())
-    } else {
-        "0 commands".to_string()
+    let (section_label, header_note) = match mode {
+        PaletteMode::Commands => {
+            let selected = state.filter.selected;
+            let matches: Vec<&'static PaletteCommand> = state
+                .filter
+                .matches
+                .iter()
+                .filter_map(|index| COMMANDS.get(*index))
+                .collect();
+            let count = matches.len();
+            if matches.is_empty() {
+                list = list.child(empty_row("No matching commands", theme));
+            }
+            for (position, command) in matches.iter().enumerate() {
+                list = list.child(render_command_row(
+                    command,
+                    position,
+                    position == selected,
+                    theme,
+                    cx,
+                ));
+            }
+            let note = if count > 0 {
+                format!("{count} of {} commands", COMMANDS.len())
+            } else {
+                "0 commands".to_string()
+            };
+            ("COMMANDS", note)
+        }
+        PaletteMode::Files => {
+            let selected = state.search.selected;
+            let hits: Vec<(usize, &FileEntry)> = state
+                .search
+                .hits
+                .iter()
+                .take(MAX_VISIBLE_HITS)
+                .enumerate()
+                .collect();
+            let count = hits.len();
+            if hits.is_empty() {
+                list = list.child(empty_row(state.search.empty_note(), theme));
+            }
+            for (position, entry) in hits {
+                list = list.child(render_hit_row(
+                    entry,
+                    position,
+                    position == selected,
+                    theme,
+                    cx,
+                ));
+            }
+            let note = match state.search.run.status() {
+                SearchStatus::Running => "searching…".to_string(),
+                SearchStatus::Failed { message } => message.clone(),
+                SearchStatus::Done { .. } | SearchStatus::Idle if count > 0 => {
+                    format!("{count} files")
+                }
+                SearchStatus::Done { .. } | SearchStatus::Idle => "0 files".to_string(),
+            };
+            ("FILES", note)
+        }
     };
 
     let card = div()
@@ -507,7 +764,7 @@ pub fn render_command_palette(
                         .text_size(FONT_XS)
                         .text_color(theme.accent_bright())
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("COMMANDS"),
+                        .child(section_label),
                 )
                 .child(
                     div()
@@ -656,5 +913,75 @@ mod tests {
         state.set_query("files".to_string());
         assert!(state.selected < state.matches.len().max(1));
         assert!(state.selected_id().is_some());
+    }
+
+    #[test]
+    fn question_mark_switches_to_the_file_search_mode() {
+        assert_eq!(palette_mode(""), PaletteMode::Commands);
+        assert_eq!(palette_mode("toggle sidebar"), PaletteMode::Commands);
+        assert_eq!(palette_mode("?"), PaletteMode::Files);
+        assert_eq!(palette_mode("  ?report"), PaletteMode::Files);
+
+        assert_eq!(file_search_query("?report"), "report");
+        assert_eq!(file_search_query("  ?  report "), "report");
+        assert_eq!(file_search_query("?"), "");
+        // Without the prefix the text is returned unchanged.
+        assert_eq!(file_search_query("report"), "report");
+    }
+
+    #[test]
+    fn index_commands_are_reachable_from_the_palette() {
+        let ids: Vec<&str> = matching_commands("search index")
+            .iter()
+            .filter_map(|index| COMMANDS.get(*index))
+            .map(|command| command.id)
+            .collect();
+        assert!(ids.contains(&"index"));
+        assert!(ids.contains(&"index-rebuild"));
+
+        let by_category: Vec<&str> = matching_commands("search")
+            .iter()
+            .filter_map(|index| COMMANDS.get(*index))
+            .filter(|command| command.category == "Search")
+            .map(|command| command.id)
+            .collect();
+        assert_eq!(by_category, vec!["index", "index-rebuild"]);
+    }
+
+    #[test]
+    fn hit_selection_stays_inside_the_visible_hits() {
+        let entry = |name: &str| FileEntry {
+            path: std::path::PathBuf::from(format!(r"C:\data\{name}")),
+            name: name.to_string(),
+            extension: None,
+            kind: onyx_core::FileKind::File,
+            size: 0,
+            modified: None,
+            created: None,
+            attributes: onyx_core::FileAttributes::default(),
+            is_symlink: false,
+            symlink_target: None,
+            type_label: "File".to_string(),
+        };
+
+        let mut search = PaletteSearch::default();
+        search.move_focus(3);
+        assert_eq!(search.selected, 0);
+        assert_eq!(search.empty_note(), "No matching files");
+
+        search.set_hits(vec![entry("a"), entry("b")]);
+        assert_eq!(search.selected, 0);
+        assert_eq!(
+            search.selected_hit().map(|hit| hit.name.as_str()),
+            Some("a")
+        );
+        search.move_focus(5);
+        assert_eq!(search.selected, 1);
+        search.move_focus(-9);
+        assert_eq!(search.selected, 0);
+
+        search.cancel();
+        assert!(search.hits.is_empty());
+        assert_eq!(search.selected_hit(), None);
     }
 }

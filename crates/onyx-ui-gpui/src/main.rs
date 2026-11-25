@@ -5,6 +5,7 @@ mod components;
 mod explorer;
 mod icons;
 mod led_pill;
+mod search_index;
 mod theme;
 
 use explorer::OnyxExplorer;
