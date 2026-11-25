@@ -49,5 +49,27 @@
 ## Phase 6 — Production Readiness
 - [x] Fault-injection & edge-case tests in isolated temporary directories
 - [x] Crash-safe atomic config & session recovery
-- [x] Release profile optimization (`LTO`, symbol stripping)
-- [x] Packaging & distribution documentation
+- [x] Release profile optimization (`LTO = "fat"`, `opt-level = "s"`, symbol stripping)
+- [x] Packaging & distribution documentation (Portable ZIP, WiX MSI, MSIX, GitHub Release workflow)
+
+## Phase 7 — v0.2 Power-User & Native Polish
+- [x] Native Settings overlay (`Ctrl+,`) with live apply & atomic TOML persistence
+- [x] Incremental SQLite FTS5 search index auto-updater (`notify` watcher + debounced reconciliation)
+- [x] Safe ZIP archive engine (Create, Extract Here/To Folder, Browse overlay, Zip-Slip & Zip-Bomb guards)
+- [x] Native Windows Drag & Drop (inbound `WM_DROPFILES`, outbound OLE `DoDragDrop`, compact internal drag preview)
+- [x] Async LRU image thumbnails in Grid view (with OneDrive cloud-placeholder hydration protection)
+- [x] Native Windows Shell icons for known folders and drives in the sidebar
+- [x] Onyx logo-derived color palette & responsive 960px toolbar / modal mutual-exclusion polish
+- [x] Asynchronous folder size calculation with LRU cache and proportional size bars in Details view
+- [x] `%ENV%` variable expansion (`%APPDATA%`, `%USERPROFILE%`, `%TEMP%`, …) and live address bar path autocomplete
+
+## Phase 8 — Path to v1.0 (Planned Ideas)
+- [ ] Inline filter & "Group By" view mode (fuzzy filter, flattened subtree view, grouping by type/date/size)
+- [ ] Inline collapsible Tree View in the file list (nested folder expansion with chevrons)
+- [ ] Multi-selection polish (marquee/rubber-band selection, `Ctrl+Click` & `Shift+Click` range selection, inline rename)
+- [ ] Resizable & reorderable metadata columns with per-folder view inheritance
+- [ ] Live USB/removable drive hotplug & network share detection
+- [ ] Extended archive formats (`.7z`, `.tar.gz`)
+- [ ] Idle memory footprint optimization (target `< 50 MB` working set)
+- [ ] Full NTFS USN Journal real-time indexing integration
+- [ ] Code-signed MSI/MSIX installers and official GitHub `v0.2.0` / `v1.0.0` release
