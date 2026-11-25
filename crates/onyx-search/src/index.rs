@@ -197,6 +197,19 @@ impl SearchIndex {
     /// - If `path` is a directory, upserts the directory entry and recursively indexes its
     ///   non-excluded descendants.
     pub fn upsert_path(&self, path: &Path) -> OnyxResult<()> {
+        self.upsert_path_with_cancel(path, &CancellationToken::new())
+    }
+
+    /// Cancellable variant of [`Self::upsert_path`] that aborts promptly when `cancel` is triggered.
+    pub fn upsert_path_with_cancel(
+        &self,
+        path: &Path,
+        cancel: &CancellationToken,
+    ) -> OnyxResult<()> {
+        if cancel.is_cancelled() {
+            return Err(OnyxError::Cancelled);
+        }
+
         if self.is_excluded(path) {
             return self.remove_path(path);
         }
@@ -204,7 +217,7 @@ impl SearchIndex {
         let ext_path = to_extended_length_path(path);
         let meta = match std::fs::symlink_metadata(&ext_path) {
             Ok(m) => m,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(err) if is_definitely_missing_io_error(&err) => {
                 return self.remove_path(path);
             }
             Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -227,6 +240,9 @@ impl SearchIndex {
         queue.push_back(path.to_path_buf());
 
         while let Some(dir) = queue.pop_front() {
+            if cancel.is_cancelled() {
+                return Err(OnyxError::Cancelled);
+            }
             if self.is_excluded(&dir) {
                 continue;
             }
@@ -236,6 +252,9 @@ impl SearchIndex {
             };
 
             for entry_res in read_dir {
+                if cancel.is_cancelled() {
+                    return Err(OnyxError::Cancelled);
+                }
                 let Ok(dir_entry) = entry_res else {
                     continue;
                 };
@@ -253,12 +272,18 @@ impl SearchIndex {
                 }
                 pending.push(child_entry);
                 if pending.len() >= INDEX_BATCH_SIZE {
+                    if cancel.is_cancelled() {
+                        return Err(OnyxError::Cancelled);
+                    }
                     self.upsert_batch(&pending)?;
                     pending.clear();
                 }
             }
         }
 
+        if cancel.is_cancelled() {
+            return Err(OnyxError::Cancelled);
+        }
         if !pending.is_empty() {
             self.upsert_batch(&pending)?;
         }
@@ -341,8 +366,16 @@ impl SearchIndex {
                 continue;
             }
             let ext_path = to_extended_length_path(path_obj);
-            if std::fs::symlink_metadata(&ext_path).is_err() {
-                stale.push(p);
+            if let Err(err) = std::fs::symlink_metadata(&ext_path) {
+                if is_definitely_missing_io_error(&err) {
+                    stale.push(p);
+                } else {
+                    tracing::debug!(
+                        path = %path_obj.display(),
+                        error = %err,
+                        "preserving indexed entry across transient/permission metadata error"
+                    );
+                }
             }
         }
 
@@ -625,6 +658,22 @@ impl SearchIndex {
             message: "search index database lock poisoned".to_string(),
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn total_db_changes(&self) -> OnyxResult<u64> {
+        let conn = self.lock_conn()?;
+        Ok(conn.total_changes())
+    }
+}
+
+/// Returns `true` only when `err` definitively indicates the path does not exist on disk
+/// (`NotFound` or `NotADirectory`), never for transient drive or permission errors.
+#[must_use]
+pub(crate) fn is_definitely_missing_io_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+    )
 }
 
 fn configure_connection(conn: &Connection, enable_wal: bool) -> OnyxResult<()> {
@@ -711,7 +760,12 @@ fn upsert_entry_in_tx(tx: &rusqlite::Transaction<'_>, entry: &FileEntry) -> Onyx
              extension = excluded.extension,
              size = excluded.size,
              modified = excluded.modified,
-             is_dir = excluded.is_dir",
+             is_dir = excluded.is_dir
+         WHERE excluded.size IS NOT size
+            OR excluded.modified IS NOT modified
+            OR excluded.is_dir IS NOT is_dir
+            OR excluded.name IS NOT name
+            OR excluded.extension IS NOT extension",
         params![
             path_str,
             parent_dir,

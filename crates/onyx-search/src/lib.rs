@@ -626,4 +626,151 @@ mod tests {
         assert!(indexer.watched_roots().is_empty());
         indexer.shutdown();
     }
+
+    #[test]
+    fn upsert_path_with_cancel_honours_cancellation_immediately() {
+        let temp = build_sample_tree();
+        let index = SearchIndex::open_in_memory().unwrap();
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let err = index
+            .upsert_path_with_cancel(temp.path(), &cancel)
+            .unwrap_err();
+        assert!(matches!(err, OnyxError::Cancelled));
+        assert_eq!(index.stats().unwrap().total_entries, 0);
+    }
+
+    #[test]
+    fn upsert_entry_skips_redundant_update_when_metadata_unchanged() {
+        let temp = TempDir::new().unwrap();
+        let file_path = temp.path().join("stable.rs");
+        let index = SearchIndex::open_in_memory().unwrap();
+
+        let mut entry = FileEntry {
+            path: file_path,
+            name: "stable.rs".to_string(),
+            extension: Some("rs".to_string()),
+            kind: FileKind::File,
+            size: 512,
+            modified: Some(1_700_000_123),
+            created: None,
+            attributes: FileAttributes::default(),
+            is_symlink: false,
+            symlink_target: None,
+            type_label: "Rust Source".to_string(),
+        };
+
+        index.upsert_entry(&entry).unwrap();
+        let changes_after_insert = index.total_db_changes().unwrap();
+
+        // Re-upserting identical metadata must only update `index_meta` (1 row), NOT `indexed_files` or `files_fts`!
+        index.upsert_entry(&entry).unwrap();
+        let changes_after_noop = index.total_db_changes().unwrap();
+        assert_eq!(
+            changes_after_noop - changes_after_insert,
+            1,
+            "Unchanged file entry should not update indexed_files or fire FTS5 triggers"
+        );
+
+        // Changing size MUST update `indexed_files` (+ FTS5 delete + insert + `index_meta` > 1 row).
+        entry.size = 1024;
+        index.upsert_entry(&entry).unwrap();
+        let changes_after_modify = index.total_db_changes().unwrap();
+        assert!(
+            changes_after_modify - changes_after_noop > 1,
+            "Modified file entry must update indexed_files"
+        );
+    }
+
+    #[test]
+    fn directory_modify_event_skips_recursive_subtree_walk_while_create_indexes_descendants() {
+        use crate::updater::{PathAction, apply_debounced_paths};
+        use std::collections::HashSet;
+
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().to_path_buf();
+        let sub = root.join("subdir");
+        fs::create_dir_all(&sub).unwrap();
+        let deep_file = sub.join("deep_child.rs");
+        fs::write(&deep_file, "pub fn x() {}").unwrap();
+
+        let shared = Arc::new(Mutex::new(SearchIndex::open_in_memory().unwrap()));
+        let watched_roots = Arc::new(Mutex::new({
+            let mut set = HashSet::new();
+            set.insert(root.clone());
+            set
+        }));
+        let cancel = CancellationToken::new();
+
+        // 1. Directory `ModifyOnly` event upserts `subdir` itself WITHOUT walking into `deep_child.rs`.
+        apply_debounced_paths(
+            &shared,
+            &watched_roots,
+            &[],
+            &[(sub.clone(), PathAction::ModifyOnly)],
+            &cancel,
+        );
+        {
+            let guard = shared.lock().unwrap();
+            let child_hits = guard
+                .query(
+                    Some(&root),
+                    &SearchQuery {
+                        text: "deep_child".to_string(),
+                        ..SearchQuery::default()
+                    },
+                )
+                .unwrap();
+            assert!(
+                child_hits.is_empty(),
+                "Directory ModifyOnly event must not recursively walk child files"
+            );
+        }
+
+        // 2. Directory `CreateOrRename` event DOES recursively index `deep_child.rs`.
+        apply_debounced_paths(
+            &shared,
+            &watched_roots,
+            &[],
+            &[(sub, PathAction::CreateOrRename)],
+            &cancel,
+        );
+        {
+            let guard = shared.lock().unwrap();
+            let child_hits = guard
+                .query(
+                    Some(&root),
+                    &SearchQuery {
+                        text: "deep_child".to_string(),
+                        ..SearchQuery::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(child_hits.len(), 1);
+        }
+    }
+
+    #[test]
+    fn is_definitely_missing_only_prunes_not_found_and_not_a_directory() {
+        use crate::index::is_definitely_missing_io_error;
+        use std::io::{Error, ErrorKind};
+
+        assert!(is_definitely_missing_io_error(&Error::from(
+            ErrorKind::NotFound
+        )));
+        assert!(is_definitely_missing_io_error(&Error::from(
+            ErrorKind::NotADirectory
+        )));
+        assert!(!is_definitely_missing_io_error(&Error::from(
+            ErrorKind::PermissionDenied
+        )));
+        assert!(!is_definitely_missing_io_error(&Error::from(
+            ErrorKind::Other
+        )));
+        assert!(!is_definitely_missing_io_error(&Error::from(
+            ErrorKind::TimedOut
+        )));
+    }
 }

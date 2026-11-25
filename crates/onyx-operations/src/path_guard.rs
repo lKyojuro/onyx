@@ -91,8 +91,50 @@ pub(crate) fn is_same_volume(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Returns `true` if `name` (with or without extensions) matches a Windows reserved DOS device name.
+fn is_windows_reserved_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "COM\u{00b9}"
+            | "COM\u{00b2}"
+            | "COM\u{00b3}"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+            | "LPT\u{00b9}"
+            | "LPT\u{00b2}"
+            | "LPT\u{00b3}"
+    )
+}
+
 /// Validates a single file or directory name (not a full path).
 pub fn validate_item_name(name: &str) -> OnyxResult<()> {
+    if name.chars().any(|ch| (ch as u32) < 0x20) {
+        return Err(OnyxError::InvalidPath {
+            message: format!("Name '{name}' contains ASCII control characters"),
+        });
+    }
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err(OnyxError::InvalidPath {
@@ -104,7 +146,7 @@ pub fn validate_item_name(name: &str) -> OnyxResult<()> {
             message: format!("Invalid reserved name '{name}'"),
         });
     }
-    if name.contains(['/', '\\', '\0', '<', '>', ':', '"', '|', '?', '*']) {
+    if name.contains(['/', '\\', '<', '>', ':', '"', '|', '?', '*']) {
         return Err(OnyxError::InvalidPath {
             message: format!("Name '{name}' contains invalid Windows filename characters"),
         });
@@ -112,6 +154,11 @@ pub fn validate_item_name(name: &str) -> OnyxResult<()> {
     if name.ends_with('.') || name.ends_with(' ') {
         return Err(OnyxError::InvalidPath {
             message: format!("Windows names cannot end with a trailing dot or space: '{name}'"),
+        });
+    }
+    if is_windows_reserved_device_name(trimmed) {
+        return Err(OnyxError::InvalidPath {
+            message: format!("Name '{name}' is a reserved Windows device name"),
         });
     }
     Ok(())
@@ -312,5 +359,52 @@ mod tests {
         assert!(validate_item_name("bad:name").is_err());
         assert!(validate_item_name("trailing.").is_err());
         assert!(validate_item_name("valid_file-1.rs").is_ok());
+    }
+
+    #[test]
+    fn validate_item_name_rejects_reserved_device_names_and_control_chars() {
+        for reserved in [
+            "CON",
+            "con",
+            "PRN",
+            "aux",
+            "NUL",
+            "nul.txt",
+            "NUL.tar.gz",
+            "NUL .txt",
+            "COM1",
+            "com1.log",
+            "COM9",
+            "LPT1",
+            "lpt9.bak",
+        ] {
+            assert!(
+                validate_item_name(reserved).is_err(),
+                "Expected reserved device name '{reserved}' to be rejected"
+            );
+        }
+
+        for ctrl in [
+            "bad\0name.txt",
+            "bad\x01name.txt",
+            "bad\tname.txt",
+            "bad\nname.txt",
+            "bad\rname.txt",
+            "bad\x1fname.txt",
+            "\x07",
+        ] {
+            assert!(
+                validate_item_name(ctrl).is_err(),
+                "Expected control-character name {ctrl:?} to be rejected"
+            );
+        }
+
+        // Non-reserved prefixes must remain valid.
+        for allowed in ["console.txt", "nul_device.rs", "com10.txt", "lpt10", ".nul"] {
+            assert!(
+                validate_item_name(allowed).is_ok(),
+                "Expected '{allowed}' to be accepted"
+            );
+        }
     }
 }
