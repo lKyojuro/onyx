@@ -6,12 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono.workspace = true
 onyx-core.workspace = true
 onyx-windows.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+zip.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

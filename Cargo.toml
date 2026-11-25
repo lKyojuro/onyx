@@ -57,6 +57,7 @@ notify = "9.0"
 rusqlite = { version = "0.43", features = ["bundled"] }
 lru = "0.19"
 dirs = "7.0"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Serialization & Time
 serde = { version = "1.0", features = ["derive"] }

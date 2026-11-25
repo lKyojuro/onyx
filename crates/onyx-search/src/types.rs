@@ -76,12 +76,31 @@ pub(crate) struct CompiledQuery {
 impl CompiledQuery {
     pub(crate) fn from_query(query: &SearchQuery) -> Self {
         let trimmed = query.text.trim();
-        let full_lower = trimmed.to_lowercase();
-        let tokens = trimmed
+        let cleaned_tokens: Vec<String> = trimmed
             .split_whitespace()
-            .map(str::to_lowercase)
-            .filter(|t| !t.is_empty())
+            .flat_map(|raw_tok| {
+                let unquoted = raw_tok.trim_matches('"');
+                unquoted
+                    .split('*')
+                    .map(|part| part.trim_matches('"').to_lowercase())
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+            })
             .collect();
+
+        let (full_lower, tokens) = if !trimmed.is_empty() && cleaned_tokens.is_empty() {
+            let raw_lower = trimmed.to_lowercase();
+            let raw_tokens = trimmed
+                .split_whitespace()
+                .map(str::to_lowercase)
+                .filter(|t| !t.is_empty())
+                .collect();
+            (raw_lower, raw_tokens)
+        } else {
+            let joined = cleaned_tokens.join(" ");
+            (joined, cleaned_tokens)
+        };
+
         let extensions = query
             .extensions
             .iter()
