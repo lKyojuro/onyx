@@ -28,6 +28,7 @@ use windows::Win32::System::Ole::{
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_RBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_LBUTTON};
 use windows::Win32::UI::Shell::{
     DROPFILES, DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW, DragQueryPoint, HDROP,
     RemoveWindowSubclass, SHCreateStdEnumFmtEtc, SetWindowSubclass,
@@ -522,10 +523,10 @@ struct FileDropSource;
 
 impl IDropSource_Impl for FileDropSource_Impl {
     fn QueryContinueDrag(&self, fescapepressed: BOOL, grfkeystate: MODIFIERKEYS_FLAGS) -> HRESULT {
-        if fescapepressed.as_bool() {
+        if fescapepressed.as_bool() || (grfkeystate & MK_RBUTTON) != MODIFIERKEYS_FLAGS(0) {
             return DRAGDROP_S_CANCEL;
         }
-        if (grfkeystate & (MK_LBUTTON | MK_RBUTTON)) == MODIFIERKEYS_FLAGS(0) {
+        if (grfkeystate & MK_LBUTTON) == MODIFIERKEYS_FLAGS(0) {
             return DRAGDROP_S_DROP;
         }
         S_OK
@@ -638,6 +639,13 @@ impl IDataObject_Impl for FileDataObject_Impl {
 pub fn start_external_file_drag(paths: &[PathBuf]) -> OnyxResult<DragOutcome> {
     let hdrop_payload = encode_cf_hdrop(paths)?;
     let _ole = OleGuard::init()?;
+    // SAFETY: VK_LBUTTON is a valid virtual-key code and this call reads the current input state.
+    if unsafe { GetAsyncKeyState(i32::from(VK_LBUTTON.0)) } >= 0 {
+        return Ok(DragOutcome::Cancelled);
+    }
+    // SAFETY: The caller uses the window's STA thread. ReleaseCapture only releases mouse capture
+    // owned by this thread, allowing OLE to take over the active drag.
+    let _ = unsafe { ReleaseCapture() };
 
     let data_object: IDataObject = FileDataObject { hdrop_payload }.into();
     let drop_source: IDropSource = FileDropSource.into();

@@ -3,7 +3,7 @@ use onyx_config::{AppConfig, ConfigStore, SessionState};
 use onyx_core::{FileEntry, GenerationId, PaneId, TabManager, TabState, ThemeMode};
 use onyx_operations::FileOperationsEngine;
 use onyx_preview::ThumbnailEngine;
-use onyx_search::{IncrementalIndexer, SearchIndex, UnifiedSearchEngine};
+use onyx_search::{SearchIndex, UnifiedSearchEngine};
 use onyx_ui::UiFileEntry;
 use onyx_windows::DropTargetGuard;
 use slint::VecModel;
@@ -70,7 +70,7 @@ pub(crate) struct State {
     pub preview_path: Option<PathBuf>,
     pub search: UnifiedSearchEngine,
     pub search_index: Option<Arc<Mutex<SearchIndex>>>,
-    pub incremental_indexer: Option<Arc<IncrementalIndexer>>,
+    pub indexer_generation: GenerationId,
     pub watched_index_roots: VecDeque<PathBuf>,
     pub index_path: PathBuf,
     pub indexed_search: bool,
@@ -82,6 +82,7 @@ pub(crate) struct State {
     pub archive_path: Option<PathBuf>,
     pub archive_cancel: CancellationToken,
     pub drop_target: Option<DropTargetGuard>,
+    pub external_drag_active: bool,
 }
 
 impl State {
@@ -130,7 +131,7 @@ impl State {
             preview_path: None,
             search: UnifiedSearchEngine::live_only(),
             search_index: None,
-            incremental_indexer: None,
+            indexer_generation: GenerationId::default(),
             watched_index_roots: VecDeque::new(),
             index_path,
             indexed_search: false,
@@ -142,6 +143,7 @@ impl State {
             archive_path: None,
             archive_cancel: CancellationToken::new(),
             drop_target: None,
+            external_drag_active: false,
         }
     }
 

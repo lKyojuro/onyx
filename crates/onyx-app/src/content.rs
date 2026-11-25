@@ -9,16 +9,16 @@ use onyx_search::{
 };
 use onyx_ui::OnyxWindow;
 use slint::Model;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::controller::{Controller, post};
 use crate::navigation::worker_error;
-use crate::state::MAX_WATCHED_INDEX_ROOTS;
+use crate::state::{MAX_WATCHED_INDEX_ROOTS, State};
 use crate::ui_sync;
 
 /// Target square pixel dimension for Grid View async image thumbnails.
@@ -26,6 +26,25 @@ pub(crate) const THUMBNAIL_TARGET_PX: u32 = 128;
 
 /// Maximum concurrent thumbnail worker tasks spawned per pane.
 const MAX_THUMBNAIL_WORKERS: usize = 4;
+
+#[derive(Clone)]
+pub(crate) struct IndexWatchRequest {
+    generation: GenerationId,
+    exclusions: Vec<PathBuf>,
+    roots: Vec<PathBuf>,
+    reconcile_roots: Vec<PathBuf>,
+}
+
+impl IndexWatchRequest {
+    pub(crate) fn from_state(state: &State) -> Self {
+        Self {
+            generation: state.indexer_generation,
+            exclusions: state.index_exclusions(),
+            roots: state.watched_index_roots.iter().cloned().collect(),
+            reconcile_roots: Vec::new(),
+        }
+    }
+}
 
 impl Controller {
     pub(crate) fn update_preview(&self, ui: &OnyxWindow) {
@@ -399,55 +418,94 @@ impl Controller {
         self.queue_thumbnails(id);
     }
 
-    /// Initializes the shared SQLite [`SearchIndex`] and starts [`IncrementalIndexer`] off the UI thread.
-    pub(crate) fn start_incremental_indexer(&self) {
-        let (db_path, exclusions) = {
-            let state = self.state.borrow();
-            (state.index_path.clone(), state.index_exclusions())
-        };
+    pub(crate) fn start_incremental_indexer(
+        &self,
+        db_path: PathBuf,
+        mut requests: watch::Receiver<IndexWatchRequest>,
+    ) -> tokio::task::JoinHandle<()> {
         let weak = self.ui.clone();
         let shutdown = self.shutdown.clone();
+        let handle = self.runtime.handle().clone();
+        self.watch_initial_search_roots();
         self.runtime.spawn_blocking(move || {
-            if shutdown.is_cancelled() {
-                return;
-            }
-            if let Some(parent) = db_path.parent()
-                && let Err(error) = std::fs::create_dir_all(parent)
-            {
-                tracing::warn!(%error, "could not create search index cache directory");
-                return;
-            }
-            let index = match SearchIndex::open(&db_path) {
-                Ok(idx) => idx.with_excluded_dirs(exclusions.clone()),
-                Err(error) => {
-                    tracing::warn!(%error, "could not open search index for IncrementalIndexer");
-                    return;
-                }
-            };
-            let shared_index = Arc::new(Mutex::new(index));
-            match IncrementalIndexer::start(Arc::clone(&shared_index), exclusions) {
-                Ok(indexer) => {
-                    let indexer = Arc::new(indexer);
-                    post(&weak, move |app, _| {
-                        {
-                            let mut state = app.state.borrow_mut();
-                            state.search_index = Some(Arc::clone(&shared_index));
-                            state.search = UnifiedSearchEngine::with_index(shared_index);
-                            state.incremental_indexer = Some(indexer);
+            let mut generation = None;
+            let mut indexer: Option<IncrementalIndexer> = None;
+            let mut watching = HashSet::<PathBuf>::new();
+
+            while !shutdown.is_cancelled() {
+                let request = requests.borrow_and_update().clone();
+                let restarting = generation != Some(request.generation);
+                if restarting {
+                    // The blocking worker owns the watcher, including its synchronous teardown.
+                    drop(indexer.take());
+                    watching.clear();
+                    generation = Some(request.generation);
+                    let opened = SearchIndex::open(&db_path).map(|index| {
+                        Arc::new(Mutex::new(
+                            index.with_excluded_dirs(request.exclusions.clone()),
+                        ))
+                    });
+                    match opened {
+                        Ok(index) => {
+                            match IncrementalIndexer::start(Arc::clone(&index), request.exclusions)
+                            {
+                                Ok(started) => indexer = Some(started),
+                                Err(error) => {
+                                    tracing::warn!(%error, "could not start search index watcher")
+                                }
+                            }
+                            post(&weak, move |app, ui| {
+                                let mut state = app.state.borrow_mut();
+                                if request.generation != state.indexer_generation {
+                                    return;
+                                }
+                                state.search_index = Some(Arc::clone(&index));
+                                state.search = UnifiedSearchEngine::with_index(index);
+                                drop(state);
+                                app.restart_searches(ui);
+                            });
                         }
-                        app.watch_initial_search_roots();
-                    });
+                        Err(error) => tracing::warn!(%error, "could not open search index"),
+                    }
                 }
-                Err(error) => {
-                    tracing::warn!(%error, "could not start IncrementalIndexer");
-                    post(&weak, move |app, _| {
-                        let mut state = app.state.borrow_mut();
-                        state.search_index = Some(Arc::clone(&shared_index));
-                        state.search = UnifiedSearchEngine::with_index(shared_index);
+
+                if let Some(indexer) = &indexer {
+                    watching.retain(|path| {
+                        if request.roots.contains(path) {
+                            true
+                        } else {
+                            indexer.unwatch_root(path);
+                            false
+                        }
                     });
+                    for root in request.roots {
+                        if !watching.contains(&root) {
+                            match indexer.watch_root(root.clone()) {
+                                Ok(()) => {
+                                    watching.insert(root);
+                                }
+                                Err(error) => {
+                                    tracing::debug!(%error, "could not watch search root")
+                                }
+                            }
+                        }
+                    }
+                    if restarting {
+                        for root in request.reconcile_roots {
+                            indexer.trigger_reconcile(root);
+                        }
+                    }
+                }
+                if !handle.block_on(async {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => false,
+                        changed = requests.changed() => changed.is_ok(),
+                    }
+                }) {
+                    break;
                 }
             }
-        });
+        })
     }
 
     fn watch_initial_search_roots(&self) {
@@ -464,110 +522,55 @@ impl Controller {
         }
     }
 
-    /// Registers `root` with the active [`IncrementalIndexer`] on a background worker,
-    /// avoiding redundant watches for already-covered subdirectories and bounding total watches.
+    /// Schedules a recursive watch without blocking the event loop.
     pub(crate) fn watch_search_root(&self, root: PathBuf) {
-        if root.as_os_str().is_empty() {
-            return;
-        }
-        let (indexer, evicted) = {
-            let mut state = self.state.borrow_mut();
-            let Some(indexer) = state.incremental_indexer.clone() else {
-                return;
-            };
-            let exclusions = state.index_exclusions();
-            if is_root_excluded(&root, &exclusions) {
-                return;
-            }
-            // Skip if `root` is already watched or is inside an existing recursively-watched root.
-            if state
+        let mut state = self.state.borrow_mut();
+        if root.as_os_str().is_empty()
+            || is_root_excluded(&root, &state.index_exclusions())
+            || state
                 .watched_index_roots
                 .iter()
                 .any(|existing| is_same_or_ancestor(existing, &root))
-            {
-                return;
-            }
-            let evicted = if state.watched_index_roots.len() >= MAX_WATCHED_INDEX_ROOTS {
-                // Keep home root watched when possible by evicting the oldest non-home root.
-                let evict_idx = state
-                    .watched_index_roots
-                    .iter()
-                    .position(|p| !ui_sync::same_path(p, &state.home))
-                    .unwrap_or(0);
-                state.watched_index_roots.remove(evict_idx)
-            } else {
-                None
-            };
-            state.watched_index_roots.push_back(root.clone());
-            (indexer, evicted)
-        };
-
-        let shutdown = self.shutdown.clone();
-        self.runtime.spawn_blocking(move || {
-            if shutdown.is_cancelled() {
-                return;
-            }
-            if let Some(old_root) = evicted {
-                indexer.unwatch_root(&old_root);
-            }
-            if let Err(error) = indexer.watch_root(root.clone()) {
-                tracing::debug!(root = %root.display(), %error, "IncrementalIndexer watch_root skipped");
-            }
+        {
+            return;
+        }
+        if state.watched_index_roots.len() >= MAX_WATCHED_INDEX_ROOTS {
+            let evict_idx = state
+                .watched_index_roots
+                .iter()
+                .position(|path| !ui_sync::same_path(path, &state.home))
+                .unwrap_or(0);
+            state.watched_index_roots.remove(evict_idx);
+        }
+        state.watched_index_roots.push_back(root);
+        self.index_requests.send_modify(|request| {
+            request.roots = state.watched_index_roots.iter().cloned().collect();
         });
     }
 
-    /// Restarts [`IncrementalIndexer`] with updated excluded directories after Settings changes.
-    pub(crate) fn restart_incremental_indexer(&self) {
-        let (old_indexer, db_path, exclusions, roots_to_watch) = {
-            let mut state = self.state.borrow_mut();
-            let old = state.incremental_indexer.take();
-            let roots: Vec<PathBuf> = state.watched_index_roots.iter().cloned().collect();
-            (
-                old,
-                state.index_path.clone(),
-                state.index_exclusions(),
-                roots,
-            )
-        };
-        let weak = self.ui.clone();
-        let shutdown = self.shutdown.clone();
-        self.runtime.spawn_blocking(move || {
-            if let Some(old_arc) = old_indexer
-                && let Ok(indexer) = Arc::try_unwrap(old_arc)
-            {
-                indexer.shutdown();
-            }
-            if shutdown.is_cancelled() {
-                return;
-            }
-            let index = match SearchIndex::open(&db_path) {
-                Ok(idx) => idx.with_excluded_dirs(exclusions.clone()),
-                Err(error) => {
-                    tracing::warn!(%error, "could not reopen search index after exclusion update");
-                    return;
-                }
-            };
-            let shared_index = Arc::new(Mutex::new(index));
-            match IncrementalIndexer::start(Arc::clone(&shared_index), exclusions.clone()) {
-                Ok(indexer) => {
-                    for root in &roots_to_watch {
-                        if !is_root_excluded(root, &exclusions) {
-                            let _ = indexer.watch_root(root.clone());
-                        }
-                    }
-                    let indexer = Arc::new(indexer);
-                    post(&weak, move |app, _| {
-                        let mut state = app.state.borrow_mut();
-                        state.search_index = Some(Arc::clone(&shared_index));
-                        state.search = UnifiedSearchEngine::with_index(shared_index);
-                        state.incremental_indexer = Some(indexer);
-                    });
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "could not restart IncrementalIndexer");
-                }
-            }
+    pub(crate) fn restart_incremental_indexer(&self, ui: &OnyxWindow) {
+        let mut state = self.state.borrow_mut();
+        let exclusions = state.index_exclusions();
+        let reconcile_roots = state.indexed_roots.iter().cloned().collect();
+        state
+            .watched_index_roots
+            .retain(|root| !is_root_excluded(root, &exclusions));
+        state
+            .indexed_roots
+            .retain(|root| !is_root_excluded(root, &exclusions));
+        if let Some((_, cancel)) = state.indexing.take() {
+            cancel.cancel();
+        }
+        state.indexer_generation = state.indexer_generation.next();
+        state.search_index = None;
+        state.search = UnifiedSearchEngine::live_only();
+        self.index_requests.send_replace(IndexWatchRequest {
+            reconcile_roots,
+            ..IndexWatchRequest::from_state(&state)
         });
+        drop(state);
+        self.watch_initial_search_roots();
+        self.restart_searches(ui);
     }
 
     pub(crate) fn toggle_index(&self, ui: &OnyxWindow) {
@@ -651,7 +654,7 @@ impl Controller {
                         if cancel.is_cancelled() {
                             return Err(OnyxError::Cancelled);
                         }
-                        guard.reconcile_directory(&root)?;
+                        guard.reconcile_directory_with_cancel(&root, &cancel)?;
                         count
                     };
                     Ok((count, shared))
@@ -667,18 +670,14 @@ impl Controller {
                 app.state.borrow_mut().indexing = None;
                 match indexed {
                     Ok((count, shared)) => {
-                        let needs_indexer = {
-                            let mut state = app.state.borrow_mut();
+                        let mut state = app.state.borrow_mut();
+                        if state.search_index.is_none() {
                             state.search_index = Some(Arc::clone(&shared));
                             state.search = UnifiedSearchEngine::with_index(shared);
-                            state.indexed_roots.insert(root.clone());
-                            state.incremental_indexer.is_none()
-                        };
-                        if needs_indexer {
-                            app.start_incremental_indexer();
-                        } else {
-                            app.watch_search_root(root);
                         }
+                        state.indexed_roots.insert(root.clone());
+                        drop(state);
+                        app.watch_search_root(root);
                         ui.set_status_message(format!("Indexed {count} items.").into());
                         app.restart_searches(ui);
                     }

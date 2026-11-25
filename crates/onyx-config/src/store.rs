@@ -3,10 +3,12 @@ use onyx_core::{OnyxError, OnyxResult};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::warn;
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const SESSION_FILE_NAME: &str = "session.json";
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Manages reading and atomically persisting [`AppConfig`] and [`SessionState`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,45 +123,27 @@ pub fn atomic_write(target: &Path, data: &[u8]) -> OnyxResult<()> {
     }
 
     let pid = std::process::id();
-    let tmp_path = append_suffix(target, &format!(".tmp.{pid}"));
+    let (tmp_path, mut file) = loop {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = append_suffix(target, &format!(".tmp.{pid}.{sequence}"));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => break (path, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
 
-    let write_res = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path)?;
-        file.write_all(data)?;
-        file.sync_all()?;
-        Ok(())
-    })();
+    let write_res = file.write_all(data).and_then(|()| file.sync_all());
+    drop(file);
 
     if let Err(err) = write_res {
         let _ = fs::remove_file(&tmp_path);
         return Err(OnyxError::Io(err));
     }
 
-    if let Err(primary_err) = fs::rename(&tmp_path, target) {
-        if target.exists() {
-            // Safe Windows fallback: move existing target to a backup file before renaming temp into place.
-            let backup_path = append_suffix(target, &format!(".bak.{pid}"));
-            let _ = fs::remove_file(&backup_path);
-            if fs::rename(target, &backup_path).is_ok() {
-                match fs::rename(&tmp_path, target) {
-                    Ok(()) => {
-                        let _ = fs::remove_file(&backup_path);
-                        return Ok(());
-                    }
-                    Err(replace_err) => {
-                        let _ = fs::rename(&backup_path, target);
-                        let _ = fs::remove_file(&tmp_path);
-                        return Err(OnyxError::Io(replace_err));
-                    }
-                }
-            }
-        }
+    if let Err(error) = fs::rename(&tmp_path, target) {
         let _ = fs::remove_file(&tmp_path);
-        return Err(OnyxError::Io(primary_err));
+        return Err(OnyxError::Io(error));
     }
 
     Ok(())

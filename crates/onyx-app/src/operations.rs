@@ -583,45 +583,40 @@ impl Controller {
         self.start_operation(ui, operation);
     }
 
-    /// Initiates an outbound Windows OLE file drag (`DoDragDrop`) on a dedicated STA thread.
+    /// Defers the native OLE drag until the Slint pointer callback has returned.
     pub(crate) fn external_drag(&self, ui: &OnyxWindow) {
-        let (paths, source_dir) = {
-            let state = self.state.borrow();
-            let active = state.active;
-            (
-                state.selected_paths(active),
-                state.path(active).to_path_buf(),
-            )
+        let paths = {
+            let mut state = self.state.borrow_mut();
+            if state.external_drag_active {
+                return;
+            }
+            let paths = state.selected_paths(state.active);
+            if paths.is_empty() {
+                return;
+            }
+            state.external_drag_active = true;
+            paths
         };
-        if paths.is_empty() {
-            ui.set_status_message("Select an item before dragging to an external app.".into());
-            return;
-        }
-        ui.set_status_message("External drag active… drop onto another application.".into());
-        let weak = self.ui.clone();
-        if let Err(error) = std::thread::Builder::new()
-            .name("onyx-ole-drag".into())
-            .spawn(move || {
-                let result = onyx_windows::start_external_file_drag(&paths);
-                post(&weak, move |app, ui| match result {
-                    Ok(DragOutcome::Copied) => {
-                        ui.set_status_message("Dragged item copied to external app.".into());
+
+        ui.set_status_message("Drag the selection into another application.".into());
+        post(&self.ui, move |app, ui| {
+            let result = onyx_windows::start_external_file_drag(&paths);
+            app.state.borrow_mut().external_drag_active = false;
+            let message = match result {
+                Ok(DragOutcome::Copied) => "Dragged selection copied.".into(),
+                Ok(DragOutcome::Moved) => {
+                    let mut affected = Vec::new();
+                    for path in &paths {
+                        add_parent(&mut affected, path);
                     }
-                    Ok(DragOutcome::Moved) => {
-                        app.refresh_paths(ui, &[source_dir]);
-                        ui.set_status_message("Dragged item moved to external app.".into());
-                    }
-                    Ok(DragOutcome::Cancelled) => {
-                        ui.set_status_message("External drag cancelled.".into());
-                    }
-                    Err(error) => {
-                        ui.set_status_message(format!("External drag failed · {error}").into());
-                    }
-                });
-            })
-        {
-            ui.set_status_message(format!("Could not start external drag: {error}").into());
-        }
+                    app.refresh_paths(ui, &affected);
+                    "Dragged selection moved.".into()
+                }
+                Ok(DragOutcome::Cancelled) => "External drag cancelled.".into(),
+                Err(error) => format!("External drag failed: {error}").into(),
+            };
+            ui.set_status_message(message);
+        });
     }
 
     /// Compresses the currently selected item(s) into a ZIP archive in the active directory.

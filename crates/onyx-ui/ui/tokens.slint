@@ -1,49 +1,44 @@
-// Onyx Nocturne (Nyx-inspired) & Clean Light Design Tokens
-// WCAG contrast ratios (primary / secondary / muted).
-// Dark translucent surfaces use white behind them for a conservative lower bound.
-// Theme   bg-surface          bg-sidebar          bg-chrome
-// Dark    14.78 / 6.83 / 4.69 14.48 / 6.69 / 4.59 17.64 / 8.15 / 5.59
-// Light   18.14 / 8.47 / 5.37 15.94 / 7.45 / 4.72 15.67 / 7.32 / 4.64
+// Slate surfaces and steel-blue accents sampled from the Onyx folder mark.
 
 export global OnyxTheme {
     in-out property <bool> dark-mode: true;
-    in-out property <color> accent-color: #8a7fe8;
+    in-out property <color> accent-color: #9eafc5;
 
-    // Core surface hierarchy (translucent midnight-obsidian over cosmic aurora in dark mode)
-    out property <color> bg-base: dark-mode ? #000000 : #f4f5fa;
-    out property <color> bg-chrome: dark-mode ? #080817 : #eceef7;
-    out property <color> bg-sidebar: dark-mode ? #090913e8 : #eef0f8;
-    out property <color> bg-surface: dark-mode ? #0d0c20ee : #ffffff;
-    out property <color> bg-surface-alt: dark-mode ? #0b0a1cd6 : #f8f9fd;
-    out property <color> bg-elevated: dark-mode ? #101024f5 : #ffffff;
-    out property <color> bg-hover: dark-mode ? #1a1840a8 : #e6e8f4;
-    out property <color> bg-pressed: dark-mode ? #242152cc : #dadcf0;
-    out property <color> bg-selected: dark-mode ? #1e1b48cc : #e3e0ff;
-    out property <color> bg-input: dark-mode ? #12102ae0 : #ffffff;
-    out property <color> bg-code: dark-mode ? #08071ae6 : #f5f6fb;
-    out property <color> bg-badge: dark-mode ? #17152ee0 : #e7e8f5;
-    out property <color> bg-backdrop: dark-mode ? #020208b8 : #0f122466;
+    // Core surfaces, from window chrome to raised panels.
+    out property <color> bg-base: dark-mode ? #101722 : #edf1f6;
+    out property <color> bg-chrome: dark-mode ? #141c29 : #e4eaf2;
+    out property <color> bg-sidebar: dark-mode ? #182230 : #e8edf4;
+    out property <color> bg-surface: dark-mode ? #202a38 : #ffffff;
+    out property <color> bg-surface-alt: dark-mode ? #1c2634 : #f5f7fa;
+    out property <color> bg-elevated: dark-mode ? #263242 : #ffffff;
+    out property <color> bg-hover: dark-mode ? #2c394b : #dfe7f1;
+    out property <color> bg-pressed: dark-mode ? #37475c : #cfdae8;
+    out property <color> bg-selected: dark-mode ? #35465d : #d5e0ee;
+    out property <color> bg-input: dark-mode ? #141e2b : #ffffff;
+    out property <color> bg-code: dark-mode ? #131d2b : #eef2f7;
+    out property <color> bg-badge: dark-mode ? #2b394b : #dfe7f1;
+    out property <color> bg-backdrop: dark-mode ? #0d1520c4 : #202a3870;
 
     // Borders & dividers
-    out property <color> border-subtle: dark-mode ? #1f1f2d : #d6d9e8;
-    out property <color> border-sidebar: dark-mode ? #161622 : #d6d9e8;
-    out property <color> border-strong: dark-mode ? #343062 : #bcc0d8;
+    out property <color> border-subtle: dark-mode ? #334154 : #cbd5e2;
+    out property <color> border-sidebar: dark-mode ? #2a384a : #cbd5e2;
+    out property <color> border-strong: dark-mode ? #586b83 : #8798ac;
     out property <color> border-specular: dark-mode ? #ffffff12 : #ffffffaa;
-    out property <color> border-focus: accent-color;
+    out property <color> border-focus: dark-mode ? accent-color : accent-bright;
 
     // Typography colors
-    out property <color> text-primary: dark-mode ? #f1f0ff : #141426;
-    out property <color> text-secondary: dark-mode ? #a6a3c0 : #4b4a68;
-    out property <color> text-muted: dark-mode ? #8884a8 : #696883;
-    out property <color> text-on-accent: dark-mode ? #06061a : #ffffff;
+    out property <color> text-primary: dark-mode ? #eef3f9 : #141c29;
+    out property <color> text-secondary: dark-mode ? #c0ccdc : #3f5065;
+    out property <color> text-muted: dark-mode ? #a4b3c6 : #516177;
+    out property <color> text-on-accent: dark-mode ? #141c29 : #ffffff;
 
     // Accent & semantic colors
-    out property <color> accent-effective: dark-mode ? accent-color : #6256d6;
-    out property <color> accent-bright: dark-mode ? #b4aaff : #5447cc;
-    out property <color> accent-subtle: dark-mode ? #8a7fe829 : #6256d61a;
-    out property <color> accent-border: dark-mode ? #b4aaff48 : #6256d655;
-    out property <color> folder-tint: dark-mode ? #b4aaff : #6b5ce7;
-    out property <color> file-tint: dark-mode ? #8d89b3 : #646885;
+    out property <color> accent-effective: dark-mode ? accent-color : #465c78;
+    out property <color> accent-bright: dark-mode ? #b4c2d4 : #3b516d;
+    out property <color> accent-subtle: dark-mode ? #9eafc529 : #465c781c;
+    out property <color> accent-border: dark-mode ? #9eafc56b : #465c7866;
+    out property <color> folder-tint: dark-mode ? #b4c2d4 : #465c78;
+    out property <color> file-tint: dark-mode ? #a4b3c6 : #516177;
     out property <color> symlink-tint: dark-mode ? #7cc8ff : #0284c7;
     out property <color> success: dark-mode ? #6ccb5f : #15803d;
     out property <color> warning: dark-mode ? #f4c95d : #d97706;
@@ -65,8 +60,8 @@ export global OnyxTheme {
     out property <length> space-lg: 16px;
 
     // Typography
-    in-out property <string> font-family: "Segoe UI Variable Text";
-    in-out property <string> font-brand: "Bahnschrift";
+    in-out property <string> font-family: "Bahnschrift";
+    in-out property <string> font-brand: font-family;
     in-out property <string> font-mono: "Cascadia Mono";
     out property <length> font-xs: 12px;
     out property <length> font-sm: 13px;

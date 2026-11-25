@@ -108,6 +108,7 @@ export component FilePane inherits Rectangle {
 
     // Shared internal drag-and-drop state
     in-out property <bool> dragging-active: false;
+    in property <int> drag-generation: 0;
     in-out property <string> drag-source-path: "";
     in-out property <string> drag-source-name: "";
     in-out property <string> drag-source-dir: "";
@@ -141,7 +142,7 @@ export component FilePane inherits Rectangle {
         && root.drag-x >= self.absolute-position.x
         && root.drag-x <= self.absolute-position.x + self.width
         && root.drag-y >= self.absolute-position.y
-        && root.drag-y <= self.absolute-position.y + self.height;
+        && root.drag-y < self.absolute-position.y + self.height;
 
     changed is-pane-drop-hovered => {
         if self.is-pane-drop-hovered {
@@ -153,8 +154,7 @@ export component FilePane inherits Rectangle {
         }
     }
 
-    // Transparent in dark mode so the cosmic dithered aurora background shines through
-    background: OnyxTheme.dark-mode ? transparent : OnyxTheme.bg-base;
+    background: OnyxTheme.bg-surface;
     clip: true;
 
     // Clicking empty pane space activates this pane
@@ -401,6 +401,9 @@ export component FilePane inherits Rectangle {
         // Virtualized Details ListView
         if root.error-message == "" && root.entries.length > 0 && root.view-mode == 0 : ListView {
             vertical-stretch: 1;
+            changed viewport-y => {
+                if root.dragging-active { root.cancel-internal-drag(); }
+            }
             accessible-role: list;
             accessible-label: "Directory contents";
 
@@ -415,7 +418,7 @@ export component FilePane inherits Rectangle {
                         && root.drag-x >= self.absolute-position.x
                         && root.drag-x <= self.absolute-position.x + self.width
                         && root.drag-y >= self.absolute-position.y
-                        && root.drag-y <= self.absolute-position.y + self.height;
+                        && root.drag-y < self.absolute-position.y + self.height;
 
                     changed is-drop-target => {
                         if self.is-drop-target {
@@ -458,7 +461,7 @@ export component FilePane inherits Rectangle {
                     }
 
                     row-ta := TouchArea {
-                        property <bool> drag-armed: false;
+                        property <int> armed-generation: -1;
                         property <length> press-x: 0px;
                         property <length> press-y: 0px;
 
@@ -473,28 +476,36 @@ export component FilePane inherits Rectangle {
                         }
                         pointer-event(event) => {
                             if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
-                                root.context-menu-requested(root.pane-index, idx);
+                                if root.dragging-active {
+                                    root.cancel-internal-drag();
+                                } else {
+                                    root.context-menu-requested(root.pane-index, idx);
+                                }
                             }
                             if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
-                                self.drag-armed = true;
+                                if root.dragging-active {
+                                    root.cancel-internal-drag();
+                                }
+                                self.armed-generation = root.drag-generation;
                                 self.press-x = self.mouse-x;
                                 self.press-y = self.mouse-y;
                             }
                             if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
-                                if root.dragging-active {
+                                if self.armed-generation == root.drag-generation && root.dragging-active
+                                    && root.drag-source-path == entry.path {
                                     root.finish-internal-drag(event.modifiers.control);
                                 }
-                                self.drag-armed = false;
+                                self.armed-generation = -1;
                             }
                             if event.kind == PointerEventKind.cancel {
                                 if root.dragging-active {
                                     root.cancel-internal-drag();
                                 }
-                                self.drag-armed = false;
+                                self.armed-generation = -1;
                             }
                         }
                         moved => {
-                            if self.drag-armed {
+                            if self.armed-generation == root.drag-generation {
                                 if !root.dragging-active && (Math.abs(self.mouse-x - self.press-x) + Math.abs(self.mouse-y - self.press-y) > 8px) {
                                     root.select-entry(root.pane-index, idx);
                                     root.dragging-active = true;
@@ -584,6 +595,9 @@ export component FilePane inherits Rectangle {
         // Virtualized Row-Chunked Grid ListView
         if root.error-message == "" && root.entries.length > 0 && root.view-mode == 1 : ListView {
             vertical-stretch: 1;
+            changed viewport-y => {
+                if root.dragging-active { root.cancel-internal-drag(); }
+            }
             accessible-role: list;
             accessible-label: "Directory grid";
 
@@ -609,7 +623,7 @@ export component FilePane inherits Rectangle {
                             && root.drag-x >= self.absolute-position.x
                             && root.drag-x <= self.absolute-position.x + self.width
                             && root.drag-y >= self.absolute-position.y
-                            && root.drag-y <= self.absolute-position.y + self.height;
+                            && root.drag-y < self.absolute-position.y + self.height;
 
                         changed is-drop-target => {
                             if self.is-drop-target {
@@ -643,7 +657,7 @@ export component FilePane inherits Rectangle {
                         animate background { duration: 90ms; }
 
                         tile-ta := TouchArea {
-                            property <bool> drag-armed: false;
+                            property <int> armed-generation: -1;
                             property <length> press-x: 0px;
                             property <length> press-y: 0px;
 
@@ -659,28 +673,36 @@ export component FilePane inherits Rectangle {
                             }
                             pointer-event(event) => {
                                 if event.button == PointerEventButton.right && event.kind == PointerEventKind.up {
-                                    root.context-menu-requested(root.pane-index, item-idx);
+                                    if root.dragging-active {
+                                        root.cancel-internal-drag();
+                                    } else {
+                                        root.context-menu-requested(root.pane-index, item-idx);
+                                    }
                                 }
                                 if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
-                                    self.drag-armed = true;
+                                    if root.dragging-active {
+                                        root.cancel-internal-drag();
+                                    }
+                                    self.armed-generation = root.drag-generation;
                                     self.press-x = self.mouse-x;
                                     self.press-y = self.mouse-y;
                                 }
                                 if event.button == PointerEventButton.left && event.kind == PointerEventKind.up {
-                                    if root.dragging-active {
+                                    if self.armed-generation == root.drag-generation && root.dragging-active
+                                        && root.drag-source-path == entry.path {
                                         root.finish-internal-drag(event.modifiers.control);
                                     }
-                                    self.drag-armed = false;
+                                    self.armed-generation = -1;
                                 }
                                 if event.kind == PointerEventKind.cancel {
                                     if root.dragging-active {
                                         root.cancel-internal-drag();
                                     }
-                                    self.drag-armed = false;
+                                    self.armed-generation = -1;
                                 }
                             }
                             moved => {
-                                if self.drag-armed {
+                                if self.armed-generation == root.drag-generation {
                                     if !root.dragging-active && (Math.abs(self.mouse-x - self.press-x) + Math.abs(self.mouse-y - self.press-y) > 8px) {
                                         root.select-entry(root.pane-index, item-idx);
                                         root.dragging-active = true;

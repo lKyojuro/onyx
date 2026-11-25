@@ -201,12 +201,6 @@ export component Toolbar inherits Rectangle {
                         }
                     }
 
-                    clicked => {
-                        if !self.fired {
-                            root.action-external-drag();
-                        }
-                        self.fired = false;
-                    }
                 }
             }
 

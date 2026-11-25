@@ -48,6 +48,7 @@ export component OnyxWindow inherits Window {
     preferred-width: 1320px;
     preferred-height: 820px;
     default-font-family: OnyxTheme.font-family;
+    default-font-size: OnyxTheme.font-md;
     background: OnyxTheme.bg-base;
 
     // Theme properties synced with OnyxTheme global and Slint Palette
@@ -127,6 +128,7 @@ export component OnyxWindow inherits Window {
 
     // Internal drag-and-drop state
     in-out property <bool> dragging-active: false;
+    property <int> drag-generation: 0;
     in-out property <string> drag-source-path: "";
     in-out property <string> drag-source-name: "";
     in-out property <string> drag-source-dir: "";
@@ -272,6 +274,7 @@ export component OnyxWindow inherits Window {
                 : ""));
 
     function clear-drag-state() {
+        root.drag-generation += 1;
         root.dragging-active = false;
         root.drag-source-path = "";
         root.drag-source-name = "";
@@ -304,6 +307,7 @@ export component OnyxWindow inherits Window {
 
     changed command-palette-open => {
         if root.command-palette-open {
+            root.clear-drag-state();
             palette-modal.focus-input();
         } else {
             key-handler.focus();
@@ -312,6 +316,7 @@ export component OnyxWindow inherits Window {
 
     changed modal-open => {
         if root.modal-open {
+            root.clear-drag-state();
             prompt-modal.focus-input();
         } else {
             key-handler.focus();
@@ -320,6 +325,7 @@ export component OnyxWindow inherits Window {
 
     changed settings-open => {
         if root.settings-open {
+            root.clear-drag-state();
             settings-modal.focus-panel();
         } else {
             key-handler.focus();
@@ -328,25 +334,28 @@ export component OnyxWindow inherits Window {
 
     changed archive-open => {
         if root.archive-open {
+            root.clear-drag-state();
             archive-modal.focus-panel();
         } else {
             key-handler.focus();
         }
     }
 
-    // Atmospheric pixel-dithered cosmic aurora backdrop in Dark Mode (Nyx-inspired)
-    if root.dark-mode : Image {
-        width: parent.width;
-        height: parent.height;
-        source: @image-url("../../../assets/themes/onyx-aurora.png");
-        image-fit: cover;
-        image-rendering: pixelated;
+    changed primary-path => { root.clear-drag-state(); }
+    changed secondary-path => { root.clear-drag-state(); }
+    changed view-mode => { root.clear-drag-state(); }
+    changed dual-pane => { root.clear-drag-state(); }
+    changed primary-loading => {
+        if root.primary-loading && root.dragging-active { root.clear-drag-state(); }
+    }
+    changed secondary-loading => {
+        if root.secondary-loading && root.dragging-active { root.clear-drag-state(); }
     }
 
     if root.dark-mode : Rectangle {
         width: parent.width;
         height: parent.height;
-        background: @linear-gradient(180deg, #02020896 0%, #05041278 48%, #020208aa 100%);
+        background: @linear-gradient(160deg, OnyxTheme.bg-surface 0%, OnyxTheme.bg-base 55%);
     }
 
     key-handler := FocusScope {
@@ -635,6 +644,7 @@ export component OnyxWindow inherits Window {
                     is-loading: root.primary-loading;
                     error-message: root.primary-error;
                     dragging-active <=> root.dragging-active;
+                    drag-generation: root.drag-generation;
                     drag-source-path <=> root.drag-source-path;
                     drag-source-name <=> root.drag-source-name;
                     drag-source-dir <=> root.drag-source-dir;
@@ -689,6 +699,7 @@ export component OnyxWindow inherits Window {
                     is-loading: root.secondary-loading;
                     error-message: root.secondary-error;
                     dragging-active <=> root.dragging-active;
+                    drag-generation: root.drag-generation;
                     drag-source-path <=> root.drag-source-path;
                     drag-source-name <=> root.drag-source-name;
                     drag-source-dir <=> root.drag-source-dir;

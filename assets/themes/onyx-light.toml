@@ -1,4 +1,4 @@
-# Onyx Light — Clean Lavender-Tinted Windows 11 Light Theme Tokens
+# Onyx Light — Steel-blue accents on cool paper
 [meta]
 id = "onyx-light"
 name = "Onyx Light"
@@ -6,39 +6,39 @@ appearance = "light"
 version = "1.1.0"
 
 [colors]
-accent = "#8a7fe8"
-accent_effective = "#6256d6"
-accent_bright = "#5447cc"
-accent_subtle = "#6256d61a"
-accent_border = "#6256d655"
+accent = "#9eafc5"
+accent_effective = "#465c78"
+accent_bright = "#3b516d"
+accent_subtle = "#465c781c"
+accent_border = "#465c7866"
 
-bg_base = "#f4f5fa"
-bg_chrome = "#eceef7"
-bg_sidebar = "#eef0f8"
+bg_base = "#edf1f6"
+bg_chrome = "#e4eaf2"
+bg_sidebar = "#e8edf4"
 bg_surface = "#ffffff"
-bg_surface_alt = "#f8f9fd"
+bg_surface_alt = "#f5f7fa"
 bg_elevated = "#ffffff"
-bg_hover = "#e6e8f4"
-bg_pressed = "#dadcf0"
-bg_selected = "#e3e0ff"
+bg_hover = "#dfe7f1"
+bg_pressed = "#cfdae8"
+bg_selected = "#d5e0ee"
 bg_input = "#ffffff"
-bg_code = "#f5f6fb"
-bg_badge = "#e7e8f5"
-bg_backdrop = "#0f122466"
+bg_code = "#eef2f7"
+bg_badge = "#dfe7f1"
+bg_backdrop = "#202a3870"
 
-border_subtle = "#d6d9e8"
-border_sidebar = "#d6d9e8"
-border_strong = "#bcc0d8"
+border_subtle = "#cbd5e2"
+border_sidebar = "#cbd5e2"
+border_strong = "#8798ac"
 border_specular = "#ffffffaa"
-border_focus = "#8a7fe8"
+border_focus = "#3b516d"
 
-text_primary = "#141426"
-text_secondary = "#4b4a68"
-text_muted = "#696883"
+text_primary = "#141c29"
+text_secondary = "#3f5065"
+text_muted = "#516177"
 text_on_accent = "#ffffff"
 
-folder_tint = "#6b5ce7"
-file_tint = "#646885"
+folder_tint = "#465c78"
+file_tint = "#516177"
 symlink_tint = "#0284c7"
 success = "#15803d"
 warning = "#d97706"
@@ -60,7 +60,7 @@ md = 12
 lg = 16
 
 [typography]
-font_family = "Segoe UI Variable Text"
+font_family = "Bahnschrift"
 font_mono = "Cascadia Mono"
 size_xs = 12
 size_sm = 13

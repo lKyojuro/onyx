@@ -139,13 +139,6 @@ pub(crate) const COMMANDS: &[Command] = &[
         run: Controller::undo,
     },
     Command {
-        id: "external-drag",
-        title: "Drag to External App",
-        shortcut: "",
-        category: "Files",
-        run: Controller::external_drag,
-    },
-    Command {
         id: "compress-zip",
         title: "Compress to ZIP",
         shortcut: "",
@@ -258,7 +251,6 @@ mod tests {
             "extract-here",
             "extract-to-folder",
             "browse-archive",
-            "external-drag",
         ] {
             assert!(
                 ids.contains(&required),

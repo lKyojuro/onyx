@@ -143,6 +143,29 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_query_hides_entries_indexed_before_an_exclusion_was_added() {
+        let dir = TempDir::new().unwrap();
+        let excluded = dir.path().join("private");
+        fs::create_dir(&excluded).unwrap();
+        fs::write(excluded.join("notes.txt"), "").unwrap();
+        fs::write(dir.path().join("notes.txt"), "").unwrap();
+        let mut index = SearchIndex::open_in_memory().unwrap();
+        index
+            .index_directory(dir.path(), &CancellationToken::new())
+            .unwrap();
+        let query = SearchQuery {
+            text: "notes".into(),
+            ..SearchQuery::default()
+        };
+        assert_eq!(index.query(Some(dir.path()), &query).unwrap().len(), 2);
+
+        index.add_excluded_dir(excluded);
+        let results = index.query(Some(dir.path()), &query).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].entry.path, dir.path().join("notes.txt"));
+    }
+
+    #[test]
     fn sqlite_index_excludes_dirs_and_escapes_fts5_special_chars() {
         let temp = build_sample_tree();
         let db_dir = TempDir::new().unwrap();

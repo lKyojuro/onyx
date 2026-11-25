@@ -6,7 +6,7 @@ Onyx is a native, high-performance, privacy-respecting file explorer for Windows
 
 ## Core Capabilities
 
-- **Native Windows 11 UI**: GPU-accelerated Slint interface styled in Fluent Design with Onyx Dark Graphite and Light themes, native Windows 11 Mica/dark titlebar integration, and system accent color detection.
+- **Native Windows 11 UI**: GPU-accelerated Slint interface with logo-inspired light and dark themes, Bahnschrift typography, and native Windows 11 title-bar integration.
 - **Non-Blocking Filesystem Engine**: Asynchronous directory enumeration with generation tokens, cancellation tokens, incremental updates, Rayon parallel metadata sorting, natural sorting, UNC & long-path (`\\?\`) normalization, hidden/system/symlink inspection, and live filesystem change notifications.
 - **Safe File Operations Engine**: Copy, move, rename, mkdir, duplicate, Windows Recycle Bin deletion (default), opt-in permanent delete, progress reporting, cancellation, conflict resolution, disk space checks, recursion guards, and undo journal.
 - **Multi-Tab & Dual-Pane Navigation**: Multi-tab bar, back/forward history, editable address bar with breadcrumbs, favorites/pins, known folders, drive enumeration with capacity bars, dual-pane split view, details & grid views, command palette (`Ctrl+K`), quick preview (`Space`), and Windows Terminal integration.

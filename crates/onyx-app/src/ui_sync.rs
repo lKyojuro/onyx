@@ -57,12 +57,8 @@ pub(crate) fn system_fonts() -> [&'static str; 3] {
         }
     }
 
-    let ui = preferred("Segoe UI Variable Text", "Segoe UI");
-    [
-        ui,
-        preferred("Bahnschrift", ui),
-        preferred("Cascadia Mono", "Consolas"),
-    ]
+    let ui = preferred("Bahnschrift", "Segoe UI");
+    [ui, ui, preferred("Cascadia Mono", "Consolas")]
 }
 
 pub(crate) fn apply_window_theme(hwnd: isize, ui: &OnyxWindow) {

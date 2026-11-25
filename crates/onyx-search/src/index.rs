@@ -516,6 +516,10 @@ impl SearchIndex {
             let (path_str, name, extension, size_i64, modified, is_dir) =
                 row_res.map_err(db_err)?;
 
+            let path = PathBuf::from(path_str);
+            if self.is_excluded(&path) {
+                continue;
+            }
             let hidden = name.starts_with('.');
             if !compiled.include_hidden && hidden {
                 continue;
@@ -534,7 +538,7 @@ impl SearchIndex {
             let type_label = infer_type_label(kind, extension.as_deref());
 
             let entry = FileEntry {
-                path: PathBuf::from(path_str),
+                path,
                 name,
                 extension,
                 kind,

@@ -1,4 +1,4 @@
-use onyx_config::ConfigStore;
+use onyx_config::{AppConfig, ConfigStore};
 use onyx_core::{FileEntry, KnownFolderKind, PaneId, ThemeMode, ViewMode};
 use onyx_fs::DirectoryWatcher;
 use onyx_ui::{OnyxTheme, OnyxWindow};
@@ -11,6 +11,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::content::IndexWatchRequest;
 use crate::state::{State, effective_theme, pane_id};
 use crate::{AppResult, commands, is_directory, ui_sync};
 
@@ -25,6 +26,8 @@ pub(crate) struct Controller {
     pub clipboard: mpsc::UnboundedSender<crate::operations::ClipboardCommand>,
     pub shutdown: CancellationToken,
     watched: watch::Sender<Vec<PathBuf>>,
+    config_updates: watch::Sender<AppConfig>,
+    pub index_requests: watch::Sender<IndexWatchRequest>,
     pub runtime: Arc<Runtime>,
 }
 
@@ -56,15 +59,7 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
             }
             session.secondary_path = session.secondary_path.filter(|path| is_directory(path));
             let dark = effective_theme(config.theme) == ThemeMode::Dark;
-            let accent = config
-                .accent_hex
-                .as_deref()
-                .and_then(ui_sync::accent_color)
-                .or_else(|| {
-                    onyx_windows::detect_system_accent_hex()
-                        .as_deref()
-                        .and_then(ui_sync::accent_color)
-                });
+            let accent = config.accent_hex.as_deref().and_then(ui_sync::accent_color);
             let fonts = ui_sync::system_fonts();
             Ok((
                 store, config, session, home, path, dark, accent, folders, fonts,
@@ -93,6 +88,10 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
     ui.set_secondary_entries(ModelRc::from(state.panes[1].model.clone()));
     let (watched, watch_requests) = watch::channel(Vec::new());
     let (clipboard, clipboard_commands) = mpsc::unbounded_channel();
+    let (config_updates, mut config_changes) = watch::channel(state.config.clone());
+    let config_store = state.store.clone();
+    let index_path = state.index_path.clone();
+    let (index_requests, index_changes) = watch::channel(IndexWatchRequest::from_state(&state));
     let controller = Rc::new(Controller {
         ui: ui.as_weak(),
         runtime,
@@ -100,12 +99,32 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
         clipboard,
         shutdown: CancellationToken::new(),
         watched,
+        config_updates,
+        index_requests,
+    });
+    let stop_config_writer = controller.shutdown.clone();
+    let config_writer = controller.runtime.spawn(async move {
+        loop {
+            let changed = tokio::select! {
+                _ = stop_config_writer.cancelled() => break,
+                changed = config_changes.changed() => changed,
+            };
+            if changed.is_err() {
+                break;
+            }
+            let config = config_changes.borrow_and_update().clone();
+            let store = config_store.clone();
+            match tokio::task::spawn_blocking(move || store.save_config(&config)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "could not persist Onyx configuration"),
+                Err(error) => tracing::warn!(%error, "Onyx configuration writer failed"),
+            }
+        }
     });
     CONTROLLER.with(|active| *active.borrow_mut() = Rc::downgrade(&controller));
     controller.bind(&ui);
     controller.start_watcher(watch_requests);
     controller.start_clipboard_monitor(clipboard_commands);
-    controller.start_incremental_indexer();
     controller.runtime.spawn_blocking({
         let weak = controller.ui.clone();
         move || {
@@ -114,6 +133,7 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
         }
     });
     ui.show()?;
+    let indexer_worker = controller.start_incremental_indexer(index_path, index_changes);
     // Winit creates the native window when the event loop starts.
     post(&controller.ui, |controller, ui| {
         if let Some(hwnd) = ui_sync::window_hwnd(ui) {
@@ -147,7 +167,7 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
     let event_result = slint::run_event_loop();
     controller.shutdown.cancel();
     let size = ui.window().size();
-    let (store, config, session, operation, indexer) = {
+    let (store, config, session, operation) = {
         let mut state = controller.state.borrow_mut();
         for pane in &state.panes {
             pane.cancel.cancel();
@@ -165,20 +185,16 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
             state.config.clone(),
             state.session(size.width, size.height),
             state.operation.take(),
-            state.incremental_indexer.take(),
         )
     };
     let completed = operation.map(|(cancel, operation)| {
         cancel.cancel();
         controller.runtime.block_on(operation)
     });
+    let writer_result = controller.runtime.block_on(config_writer);
+    let indexer_result = controller.runtime.block_on(indexer_worker);
     let saved = controller.runtime.block_on(async {
         tokio::task::spawn_blocking(move || {
-            if let Some(arc_indexer) = indexer
-                && let Ok(owned) = Arc::try_unwrap(arc_indexer)
-            {
-                owned.shutdown();
-            }
             let config_result = store.save_config(&config);
             let session_result = store.save_session(&session);
             config_result.and(session_result)
@@ -188,6 +204,8 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
     CONTROLLER.with(|active| *active.borrow_mut() = RcWeak::new());
     event_result?;
     saved??;
+    writer_result?;
+    indexer_result?;
     completed.transpose()?;
     Ok(())
 }
@@ -410,17 +428,10 @@ impl Controller {
         );
     }
 
-    /// Atomically persists the current `AppConfig` on a background worker thread.
+    /// Queues the latest settings for the single background writer.
     pub(crate) fn persist_config(&self) {
-        let (store, config) = {
-            let state = self.state.borrow();
-            (state.store.clone(), state.config.clone())
-        };
-        self.runtime.spawn_blocking(move || {
-            if let Err(error) = store.save_config(&config) {
-                tracing::warn!(%error, "could not persist Onyx configuration");
-            }
-        });
+        self.config_updates
+            .send_replace(self.state.borrow().config.clone());
     }
 
     pub(crate) fn sync_chrome(&self, ui: &OnyxWindow) {
@@ -612,7 +623,7 @@ impl Controller {
         };
         if added {
             self.persist_config();
-            self.restart_incremental_indexer();
+            self.restart_incremental_indexer(ui);
             ui.set_status_message(format!("Excluded from search index: {trimmed}").into());
         }
     }
@@ -628,7 +639,7 @@ impl Controller {
         };
         if removed {
             self.persist_config();
-            self.restart_incremental_indexer();
+            self.restart_incremental_indexer(ui);
             ui.set_status_message(format!("Removed search index exclusion: {raw}").into());
         }
     }
