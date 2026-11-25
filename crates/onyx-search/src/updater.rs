@@ -1,12 +1,12 @@
 //! Background filesystem watcher and debounced incremental updater for [`SearchIndex`].
 
-use crate::index::SearchIndex;
+use crate::index::{SearchIndex, is_definitely_missing_io_error};
 use crate::types::{
     canonical_db_path, file_entry_from_metadata, is_safe_traversable_dir, path_starts_with_dir,
 };
-use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind};
 use onyx_core::{OnyxError, OnyxResult, to_extended_length_path};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc as std_mpsc};
@@ -17,8 +17,19 @@ use tokio_util::sync::CancellationToken;
 /// Default debounce window for batching rapid filesystem events before updating the SQLite index.
 pub const DEFAULT_INDEXER_DEBOUNCE: Duration = Duration::from_millis(75);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathAction {
+    /// Metadata or content modification: never trigger recursive directory walks.
+    ModifyOnly,
+    /// Creation or rename: if target is a directory on disk, recursively index descendants.
+    CreateOrRename,
+}
+
 enum IndexerCommand {
-    FsEvents(Vec<PathBuf>),
+    FsEvents {
+        paths: Vec<PathBuf>,
+        action: PathAction,
+    },
     Reconcile(PathBuf),
     Shutdown,
 }
@@ -82,7 +93,11 @@ impl IncrementalIndexer {
                     return;
                 }
                 if !event.paths.is_empty() {
-                    let _ = event_tx.send(IndexerCommand::FsEvents(event.paths));
+                    let action = classify_event_kind(&event.kind);
+                    let _ = event_tx.send(IndexerCommand::FsEvents {
+                        paths: event.paths,
+                        action,
+                    });
                 }
             }
             Err(err) => {
@@ -257,6 +272,30 @@ impl Drop for IncrementalIndexer {
     }
 }
 
+fn classify_event_kind(kind: &EventKind) -> PathAction {
+    match kind {
+        EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(_)) => PathAction::CreateOrRename,
+        _ => PathAction::ModifyOnly,
+    }
+}
+
+fn merge_pending_action(
+    pending: &mut HashMap<PathBuf, PathAction>,
+    paths: Vec<PathBuf>,
+    action: PathAction,
+) {
+    for p in paths {
+        pending
+            .entry(p)
+            .and_modify(|existing| {
+                if action == PathAction::CreateOrRename {
+                    *existing = PathAction::CreateOrRename;
+                }
+            })
+            .or_insert(action);
+    }
+}
+
 fn run_indexer_loop(
     cmd_rx: std_mpsc::Receiver<IndexerCommand>,
     index: Arc<Mutex<SearchIndex>>,
@@ -265,7 +304,7 @@ fn run_indexer_loop(
     debounce: Duration,
     cancel: CancellationToken,
 ) {
-    let mut pending_paths = HashSet::<PathBuf>::new();
+    let mut pending_paths = HashMap::<PathBuf, PathAction>::new();
     let mut pending_reconciles = VecDeque::<PathBuf>::new();
 
     while !cancel.is_cancelled() {
@@ -276,10 +315,8 @@ fn run_indexer_loop(
 
         let mut should_shutdown = false;
         match first {
-            IndexerCommand::FsEvents(paths) => {
-                for p in paths {
-                    pending_paths.insert(p);
-                }
+            IndexerCommand::FsEvents { paths, action } => {
+                merge_pending_action(&mut pending_paths, paths, action);
             }
             IndexerCommand::Reconcile(root) => {
                 if !pending_reconciles.contains(&root) {
@@ -297,10 +334,8 @@ fn run_indexer_loop(
                 break;
             }
             match cmd_rx.recv_timeout(deadline.saturating_duration_since(now)) {
-                Ok(IndexerCommand::FsEvents(paths)) => {
-                    for p in paths {
-                        pending_paths.insert(p);
-                    }
+                Ok(IndexerCommand::FsEvents { paths, action }) => {
+                    merge_pending_action(&mut pending_paths, paths, action);
                 }
                 Ok(IndexerCommand::Reconcile(root)) => {
                     if !pending_reconciles.contains(&root) {
@@ -320,7 +355,7 @@ fn run_indexer_loop(
         }
 
         if !pending_paths.is_empty() {
-            let batch: Vec<PathBuf> = pending_paths.drain().collect();
+            let batch: Vec<(PathBuf, PathAction)> = pending_paths.drain().collect();
             apply_debounced_paths(&index, &watched_roots, &excluded_dirs, &batch, &cancel);
         }
 
@@ -333,11 +368,11 @@ fn run_indexer_loop(
     }
 }
 
-fn apply_debounced_paths(
+pub(crate) fn apply_debounced_paths(
     index: &Arc<Mutex<SearchIndex>>,
     watched_roots: &Arc<Mutex<HashSet<PathBuf>>>,
     excluded_dirs: &[PathBuf],
-    paths: &[PathBuf],
+    paths: &[(PathBuf, PathAction)],
     cancel: &CancellationToken,
 ) {
     let roots_snapshot: HashSet<String> = {
@@ -345,7 +380,7 @@ fn apply_debounced_paths(
         guard.iter().map(|p| canonical_db_path(p)).collect()
     };
 
-    for path in paths {
+    for (path, action) in paths {
         if cancel.is_cancelled() {
             return;
         }
@@ -370,24 +405,22 @@ fn apply_debounced_paths(
                     // Watched root directory mtime changed when a child changed; child events handle the child.
                     continue;
                 }
-                if !is_safe_traversable_dir(&meta) {
-                    // Build FileEntry outside the SearchIndex lock to keep lock hold times minimal.
+                if !is_safe_traversable_dir(&meta) || *action == PathAction::ModifyOnly {
+                    // For files and directory Modify events, only upsert this entry's own metadata
+                    // (never walk subtrees recursively on directory Modify events).
                     let entry = file_entry_from_metadata(path, &meta);
                     if let Some(guard) = lock_index_graceful(index)
                         && let Err(err) = guard.upsert_entry(&entry)
                     {
                         tracing::debug!(path = %path.display(), error = %err, "IncrementalIndexer upsert_entry failed");
                     }
-                } else if let Some(guard) = lock_index_graceful(index) {
-                    if let Err(err) = guard.upsert_path(path) {
-                        tracing::debug!(path = %path.display(), error = %err, "IncrementalIndexer dir upsert_path failed");
-                    }
-                    if let Err(err) = guard.reconcile_directory_with_cancel(path, cancel) {
-                        tracing::debug!(path = %path.display(), error = %err, "IncrementalIndexer dir reconcile failed");
-                    }
+                } else if let Some(guard) = lock_index_graceful(index)
+                    && let Err(err) = guard.upsert_path_with_cancel(path, cancel)
+                {
+                    tracing::debug!(path = %path.display(), error = %err, "IncrementalIndexer dir upsert_path_with_cancel failed");
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Err(err) if is_definitely_missing_io_error(&err) => {
                 if let Some(guard) = lock_index_graceful(index)
                     && let Err(db_err) = guard.remove_path(path)
                 {
@@ -405,24 +438,37 @@ fn apply_debounced_paths(
     }
 }
 
-fn apply_reconcile(index: &Arc<Mutex<SearchIndex>>, root: &Path, cancel: &CancellationToken) {
+pub(crate) fn apply_reconcile(
+    index: &Arc<Mutex<SearchIndex>>,
+    root: &Path,
+    cancel: &CancellationToken,
+) {
     if cancel.is_cancelled() {
         return;
     }
 
     let root_ext = to_extended_length_path(root);
-    let root_exists = std::fs::symlink_metadata(&root_ext).is_ok();
-
-    if let Some(guard) = lock_index_graceful(index) {
-        if !root_exists {
-            if let Err(err) = guard.remove_path(root) {
-                tracing::debug!(root = %root.display(), error = %err, "IncrementalIndexer remove missing root failed");
+    match std::fs::symlink_metadata(&root_ext) {
+        Ok(_) => {
+            if let Some(guard) = lock_index_graceful(index)
+                && let Err(err) = guard.reconcile_directory_with_cancel(root, cancel)
+            {
+                tracing::debug!(root = %root.display(), error = %err, "IncrementalIndexer reconcile_directory failed");
             }
-            return;
         }
-
-        if let Err(err) = guard.reconcile_directory_with_cancel(root, cancel) {
-            tracing::debug!(root = %root.display(), error = %err, "IncrementalIndexer reconcile_directory failed");
+        Err(err) if is_definitely_missing_io_error(&err) => {
+            if let Some(guard) = lock_index_graceful(index)
+                && let Err(db_err) = guard.remove_path(root)
+            {
+                tracing::debug!(root = %root.display(), error = %db_err, "IncrementalIndexer remove missing root failed");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                root = %root.display(),
+                error = %err,
+                "IncrementalIndexer skipping reconcile on temporarily inaccessible root"
+            );
         }
     }
 }

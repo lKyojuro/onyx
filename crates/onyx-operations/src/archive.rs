@@ -2,8 +2,8 @@
 //! and atomic archive creation off the UI thread.
 
 use crate::path_guard::{
-    generate_auto_rename_path, is_dir_reparse, is_reparse_or_symlink, is_same_normalized_path,
-    is_same_or_descendant, path_exists_any, validate_item_name,
+    generate_auto_rename_path, is_reparse_or_symlink, is_same_normalized_path,
+    is_same_or_descendant, validate_item_name,
 };
 use crate::types::{ConflictPolicy, OperationKind, OperationProgress, OperationReport};
 use crate::undo::UndoAction;
@@ -448,6 +448,7 @@ fn extract_archive_blocking(
     }
 
     let mut report = OperationReport::default();
+    let mut recorded_succeeded = HashSet::<PathBuf>::new();
     let mut bytes_extracted = 0u64;
     let mut completed_items = 0usize;
     let mut buf = vec![0u8; ARCHIVE_CHUNK_BYTES];
@@ -478,62 +479,98 @@ fn extract_archive_blocking(
         ensure_safe_parent_chain(dest_dir, &rel_path)?;
 
         if is_dir {
-            if path_exists_any(&desired_target) {
-                let meta = fs::symlink_metadata(&desired_target)?;
-                if is_reparse_or_symlink(&meta) {
-                    return Err(OnyxError::InvalidPath {
-                        message: format!(
-                            "Refusing to extract into symlink/reparse directory '{}'",
-                            desired_target.display()
-                        ),
-                    });
-                }
-                if !meta.is_dir() {
-                    match policy {
-                        ConflictPolicy::Skip => {
-                            report.skipped.push(desired_target);
-                            completed_items += 1;
-                            continue;
-                        }
-                        ConflictPolicy::Overwrite => {
-                            remove_existing_for_overwrite(&desired_target)?;
-                            fs::create_dir_all(&desired_target)?;
-                            report.succeeded.push(desired_target);
-                        }
-                        ConflictPolicy::AutoRename => {
-                            let renamed = generate_auto_rename_path(&desired_target)?;
-                            fs::create_dir_all(&renamed)?;
-                            report.succeeded.push(renamed);
-                        }
-                        ConflictPolicy::Cancel => return Err(OnyxError::Cancelled),
-                        ConflictPolicy::Fail => {
-                            return Err(OnyxError::AlreadyExists {
-                                path: desired_target,
-                            });
+            match fs::symlink_metadata(&desired_target) {
+                Ok(meta) => {
+                    if is_reparse_or_symlink(&meta) {
+                        return Err(OnyxError::InvalidPath {
+                            message: format!(
+                                "Refusing to extract into symlink/reparse directory '{}'",
+                                desired_target.display()
+                            ),
+                        });
+                    }
+                    if !meta.is_dir() {
+                        match policy {
+                            ConflictPolicy::Skip => {
+                                report.skipped.push(desired_target);
+                                completed_items += 1;
+                                continue;
+                            }
+                            ConflictPolicy::Overwrite => {
+                                return Err(OnyxError::OperationFailed {
+                                    message: format!(
+                                        "Cannot overwrite existing file '{}' with directory archive entry '{raw_name}'",
+                                        desired_target.display()
+                                    ),
+                                });
+                            }
+                            ConflictPolicy::AutoRename => {
+                                if let Some(parent_rel) = rel_path.parent()
+                                    && !parent_rel.as_os_str().is_empty()
+                                {
+                                    create_missing_dirs_under(
+                                        dest_dir,
+                                        parent_rel,
+                                        &mut report.succeeded,
+                                        &mut recorded_succeeded,
+                                    )?;
+                                }
+                                let renamed = generate_auto_rename_path(&desired_target)?;
+                                fs::create_dir(&renamed)?;
+                                if recorded_succeeded.insert(renamed.clone()) {
+                                    report.succeeded.push(renamed);
+                                }
+                            }
+                            ConflictPolicy::Cancel => return Err(OnyxError::Cancelled),
+                            ConflictPolicy::Fail => {
+                                return Err(OnyxError::AlreadyExists {
+                                    path: desired_target,
+                                });
+                            }
                         }
                     }
-                } else {
-                    report.succeeded.push(desired_target);
+                    // Pre-existing directory: never push to `report.succeeded` so Undo never recycles it.
                 }
-            } else {
-                fs::create_dir_all(&desired_target)?;
-                report.succeeded.push(desired_target);
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    create_missing_dirs_under(
+                        dest_dir,
+                        &rel_path,
+                        &mut report.succeeded,
+                        &mut recorded_succeeded,
+                    )?;
+                }
+                Err(err) => return Err(OnyxError::Io(err)),
             }
 
             completed_items += 1;
             continue;
         }
 
-        // File entry conflict resolution
-        let target_path = if path_exists_any(&desired_target) {
-            match policy {
+        // File entry conflict resolution — never delete an existing directory or pre-delete target file.
+        let target_path = match fs::symlink_metadata(&desired_target) {
+            Ok(meta) => match policy {
                 ConflictPolicy::Skip => {
                     report.skipped.push(desired_target);
                     completed_items += 1;
                     continue;
                 }
                 ConflictPolicy::Overwrite => {
-                    remove_existing_for_overwrite(&desired_target)?;
+                    if is_reparse_or_symlink(&meta) {
+                        return Err(OnyxError::InvalidPath {
+                            message: format!(
+                                "Refusing to overwrite symlink or reparse point '{}'",
+                                desired_target.display()
+                            ),
+                        });
+                    }
+                    if meta.is_dir() {
+                        return Err(OnyxError::OperationFailed {
+                            message: format!(
+                                "Cannot overwrite existing directory '{}' with file archive entry '{raw_name}'",
+                                desired_target.display()
+                            ),
+                        });
+                    }
                     desired_target
                 }
                 ConflictPolicy::AutoRename => generate_auto_rename_path(&desired_target)?,
@@ -543,13 +580,15 @@ fn extract_archive_blocking(
                         path: desired_target,
                     });
                 }
-            }
-        } else {
-            desired_target
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => desired_target,
+            Err(err) => return Err(OnyxError::Io(err)),
         };
 
         // Final boundary check on resolved target path (including any auto-renamed variant).
-        if !is_same_or_descendant(&canon_dest_dir, &target_path) {
+        if !is_same_or_descendant(&canon_dest_dir, &target_path)
+            || is_same_normalized_path(&canon_dest_dir, &target_path)
+        {
             return Err(OnyxError::InvalidPath {
                 message: format!(
                     "Target path '{}' escaped destination directory '{}'",
@@ -559,23 +598,100 @@ fn extract_archive_blocking(
             });
         }
 
-        if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)?;
+        if let Some(parent_rel) = rel_path.parent()
+            && !parent_rel.as_os_str().is_empty()
+        {
+            create_missing_dirs_under(
+                dest_dir,
+                parent_rel,
+                &mut report.succeeded,
+                &mut recorded_succeeded,
+            )?;
         }
 
-        let mut entry = archive
-            .by_index(idx)
-            .map_err(|err| OnyxError::OperationFailed {
-                message: format!("Failed to open archive entry '{raw_name}': {err}"),
-            })?;
+        let target_parent = target_path.parent().ok_or_else(|| OnyxError::InvalidPath {
+            message: format!(
+                "Target file path '{}' has no parent directory",
+                target_path.display()
+            ),
+        })?;
+        let temp_extract_path = target_parent.join(format!(
+            ".onyx_extract_tmp_{}_{}_{}",
+            std::process::id(),
+            op_id,
+            idx
+        ));
 
-        let mut out_file = File::create(&target_path)?;
-        let mut entry_bytes_written = 0u64;
+        let extract_res = (|| -> OnyxResult<()> {
+            let mut entry = archive
+                .by_index(idx)
+                .map_err(|err| OnyxError::OperationFailed {
+                    message: format!("Failed to open archive entry '{raw_name}': {err}"),
+                })?;
 
-        loop {
-            if cancel.is_cancelled() {
-                drop(out_file);
-                let _ = fs::remove_file(&target_path);
+            let mut out_file = File::create(&temp_extract_path)?;
+            let mut entry_bytes_written = 0u64;
+
+            loop {
+                if cancel.is_cancelled() {
+                    return Err(OnyxError::Cancelled);
+                }
+
+                let n = entry
+                    .read(&mut buf)
+                    .map_err(|err| OnyxError::OperationFailed {
+                        message: format!("Failed reading compressed data for '{raw_name}': {err}"),
+                    })?;
+                if n == 0 {
+                    break;
+                }
+
+                entry_bytes_written = entry_bytes_written.saturating_add(n as u64);
+                bytes_extracted = bytes_extracted.saturating_add(n as u64);
+
+                // Runtime streaming guards against spoofed ZIP headers / zip bombs
+                if bytes_extracted > limits.max_total_uncompressed_bytes {
+                    return Err(OnyxError::OperationFailed {
+                        message: format!(
+                            "Archive extraction exceeded maximum uncompressed limit of {} bytes",
+                            limits.max_total_uncompressed_bytes
+                        ),
+                    });
+                }
+                check_entry_compression_ratio(
+                    &raw_name,
+                    entry_bytes_written,
+                    compressed_size,
+                    limits,
+                )?;
+
+                out_file.write_all(&buf[..n])?;
+
+                send_progress(
+                    progress,
+                    OperationProgress {
+                        op_id,
+                        kind: OperationKind::ExtractArchive,
+                        current_item: raw_name.clone(),
+                        completed_items,
+                        total_items,
+                        bytes_copied: bytes_extracted,
+                        total_bytes: declared_total_bytes,
+                        finished: false,
+                        cancelled: false,
+                        error: None,
+                    },
+                );
+            }
+
+            out_file.flush()?;
+            out_file.sync_all()?;
+            Ok(())
+        })();
+
+        if let Err(err) = extract_res {
+            let _ = fs::remove_file(&temp_extract_path);
+            if matches!(err, OnyxError::Cancelled) {
                 send_progress(
                     progress,
                     OperationProgress {
@@ -591,64 +707,15 @@ fn extract_archive_blocking(
                         error: None,
                     },
                 );
-                return Err(OnyxError::Cancelled);
             }
-
-            let n = entry
-                .read(&mut buf)
-                .map_err(|err| OnyxError::OperationFailed {
-                    message: format!("Failed reading compressed data for '{raw_name}': {err}"),
-                })?;
-            if n == 0 {
-                break;
-            }
-
-            entry_bytes_written = entry_bytes_written.saturating_add(n as u64);
-            bytes_extracted = bytes_extracted.saturating_add(n as u64);
-
-            // Runtime streaming guards against spoofed ZIP headers / zip bombs
-            if bytes_extracted > limits.max_total_uncompressed_bytes {
-                drop(out_file);
-                let _ = fs::remove_file(&target_path);
-                return Err(OnyxError::OperationFailed {
-                    message: format!(
-                        "Archive extraction exceeded maximum uncompressed limit of {} bytes",
-                        limits.max_total_uncompressed_bytes
-                    ),
-                });
-            }
-            if let Err(err) = check_entry_compression_ratio(
-                &raw_name,
-                entry_bytes_written,
-                compressed_size,
-                limits,
-            ) {
-                drop(out_file);
-                let _ = fs::remove_file(&target_path);
-                return Err(err);
-            }
-
-            out_file.write_all(&buf[..n])?;
-
-            send_progress(
-                progress,
-                OperationProgress {
-                    op_id,
-                    kind: OperationKind::ExtractArchive,
-                    current_item: raw_name.clone(),
-                    completed_items,
-                    total_items,
-                    bytes_copied: bytes_extracted,
-                    total_bytes: declared_total_bytes,
-                    finished: false,
-                    cancelled: false,
-                    error: None,
-                },
-            );
+            return Err(err);
         }
 
-        out_file.flush()?;
-        report.succeeded.push(target_path);
+        replace_file_atomically(&temp_extract_path, &target_path)?;
+
+        if recorded_succeeded.insert(target_path.clone()) {
+            report.succeeded.push(target_path);
+        }
         completed_items += 1;
 
         send_progress(
@@ -723,6 +790,117 @@ fn ensure_safe_parent_chain(dest_dir: &Path, rel_path: &Path) -> OnyxResult<()> 
     Ok(())
 }
 
+/// Creates missing directory components under `dest_dir` for `rel_dir` one level at a time,
+/// refusing symlinks/reparse points and non-directory files, and recording ONLY newly created
+/// directories into `succeeded`.
+fn create_missing_dirs_under(
+    dest_dir: &Path,
+    rel_dir: &Path,
+    succeeded: &mut Vec<PathBuf>,
+    recorded: &mut HashSet<PathBuf>,
+) -> OnyxResult<()> {
+    let mut cur = dest_dir.to_path_buf();
+    for comp in rel_dir.components() {
+        if let Component::Normal(part) = comp {
+            cur.push(part);
+            match fs::symlink_metadata(&cur) {
+                Ok(meta) => {
+                    if is_reparse_or_symlink(&meta) {
+                        return Err(OnyxError::InvalidPath {
+                            message: format!(
+                                "Zip-Slip symlink directory rejected: '{}'",
+                                cur.display()
+                            ),
+                        });
+                    }
+                    if !meta.is_dir() {
+                        return Err(OnyxError::InvalidPath {
+                            message: format!(
+                                "Cannot extract through non-directory path '{}'",
+                                cur.display()
+                            ),
+                        });
+                    }
+                    // Pre-existing directory: never add to `succeeded`.
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    fs::create_dir(&cur)?;
+                    if recorded.insert(cur.clone()) {
+                        succeeded.push(cur.clone());
+                    }
+                }
+                Err(err) => return Err(OnyxError::Io(err)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Atomically moves a finalized sibling temporary file `temp_path` over `target_path`.
+///
+/// Never deletes `target_path` beforehand and refuses to overwrite directories or symlinks/reparse points.
+fn replace_file_atomically(temp_path: &Path, target_path: &Path) -> OnyxResult<()> {
+    match fs::symlink_metadata(target_path) {
+        Ok(meta) => {
+            if is_reparse_or_symlink(&meta) {
+                let _ = fs::remove_file(temp_path);
+                return Err(OnyxError::InvalidPath {
+                    message: format!(
+                        "Refusing to overwrite symlink or reparse point '{}'",
+                        target_path.display()
+                    ),
+                });
+            }
+            if meta.is_dir() {
+                let _ = fs::remove_file(temp_path);
+                return Err(OnyxError::InvalidPath {
+                    message: format!(
+                        "Refusing to overwrite existing directory '{}' with a file",
+                        target_path.display()
+                    ),
+                });
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            let _ = fs::remove_file(temp_path);
+            return Err(OnyxError::Io(err));
+        }
+    }
+
+    if let Err(primary_err) = fs::rename(temp_path, target_path) {
+        if let Ok(meta) = fs::symlink_metadata(target_path)
+            && meta.is_file()
+            && !is_reparse_or_symlink(&meta)
+            && let Some(parent) = target_path.parent()
+        {
+            let backup_path = parent.join(format!(
+                ".onyx_replace_bak_{}_{}",
+                std::process::id(),
+                alloc_archive_op_id()
+            ));
+            let _ = fs::remove_file(&backup_path);
+            if fs::rename(target_path, &backup_path).is_ok() {
+                match fs::rename(temp_path, target_path) {
+                    Ok(()) => {
+                        let _ = fs::remove_file(&backup_path);
+                        return Ok(());
+                    }
+                    Err(replace_err) => {
+                        let _ = fs::rename(&backup_path, target_path);
+                        let _ = fs::remove_file(temp_path);
+                        return Err(OnyxError::Io(replace_err));
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_file(temp_path);
+        return Err(OnyxError::Io(primary_err));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug)]
 struct PendingArchiveSource {
     disk_path: PathBuf,
@@ -748,17 +926,65 @@ fn create_archive_blocking(
         });
     }
 
+    let dest_name = dest_zip
+        .file_name()
+        .ok_or_else(|| OnyxError::InvalidPath {
+            message: format!(
+                "Destination archive path '{}' has no file name",
+                dest_zip.display()
+            ),
+        })?
+        .to_string_lossy();
+    validate_item_name(&dest_name)?;
+
     let parent_dir = dest_zip.parent().ok_or_else(|| OnyxError::InvalidPath {
         message: format!(
             "Destination archive path '{}' has no parent directory",
             dest_zip.display()
         ),
     })?;
-    if !parent_dir.as_os_str().is_empty() {
-        fs::create_dir_all(parent_dir)?;
+
+    // Validate `dest_zip` BEFORE creating any directories or touching disk:
+    // 1. Reject if `dest_zip` is an ancestor of (or identical to) any source path.
+    for src in sources {
+        if is_same_or_descendant(dest_zip, src) {
+            return Err(OnyxError::RecursiveOperation {
+                source_path: src.clone(),
+                target_path: dest_zip.to_path_buf(),
+            });
+        }
     }
 
-    // Refuse archiving `dest_zip` into itself or archiving a directory that contains `dest_zip`.
+    // 2. Reject if `dest_zip` already exists as a directory or symlink/reparse point.
+    match fs::symlink_metadata(dest_zip) {
+        Ok(dest_meta) => {
+            if is_reparse_or_symlink(&dest_meta) {
+                return Err(OnyxError::InvalidPath {
+                    message: format!(
+                        "Destination archive path '{}' cannot be a symlink or reparse point",
+                        dest_zip.display()
+                    ),
+                });
+            }
+            if dest_meta.is_dir() {
+                return Err(OnyxError::InvalidPath {
+                    message: format!(
+                        "Destination archive path '{}' is an existing directory",
+                        dest_zip.display()
+                    ),
+                });
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(OnyxError::PermissionDenied {
+                path: dest_zip.to_path_buf(),
+            });
+        }
+        Err(err) => return Err(OnyxError::Io(err)),
+    }
+
+    // 3. Validate all sources exist and refuse archiving a directory that contains `dest_zip`.
     for src in sources {
         let meta = match fs::symlink_metadata(src) {
             Ok(m) => m,
@@ -781,6 +1007,10 @@ fn create_archive_blocking(
                 target_path: dest_zip.to_path_buf(),
             });
         }
+    }
+
+    if !parent_dir.as_os_str().is_empty() {
+        fs::create_dir_all(parent_dir)?;
     }
 
     let temp_zip = parent_dir.join(format!(
@@ -836,18 +1066,8 @@ fn create_archive_blocking(
         return Err(err);
     }
 
-    // Atomically replace or move temp archive to `dest_zip`.
-    if path_exists_any(dest_zip)
-        && let Err(err) = remove_existing_for_overwrite(dest_zip)
-    {
-        let _ = fs::remove_file(&temp_zip);
-        return Err(err);
-    }
-
-    if let Err(err) = fs::rename(&temp_zip, dest_zip) {
-        let _ = fs::remove_file(&temp_zip);
-        return Err(OnyxError::Io(err));
-    }
+    // Atomically replace or move finalized temp archive to `dest_zip` without pre-deleting `dest_zip`.
+    replace_file_atomically(&temp_zip, dest_zip)?;
 
     let report = OperationReport {
         succeeded: vec![dest_zip.to_path_buf()],
@@ -1088,48 +1308,7 @@ fn write_archive_to_temp(
         message: format!("Failed finalizing ZIP archive: {err}"),
     })?;
     finished_file.flush()?;
-    Ok(())
-}
-
-fn remove_existing_for_overwrite(path: &Path) -> OnyxResult<()> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(OnyxError::Io(err)),
-    };
-
-    if is_reparse_or_symlink(&meta) {
-        if is_dir_reparse(&meta) {
-            fs::remove_dir(path)?;
-        } else {
-            fs::remove_file(path)?;
-        }
-    } else if meta.is_dir() {
-        remove_dir_safe_no_follow(path)?;
-    } else {
-        fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
-fn remove_dir_safe_no_follow(dir: &Path) -> OnyxResult<()> {
-    for entry_res in fs::read_dir(dir)? {
-        let entry = entry_res?;
-        let path = entry.path();
-        let meta = fs::symlink_metadata(&path)?;
-        if is_reparse_or_symlink(&meta) {
-            if is_dir_reparse(&meta) {
-                fs::remove_dir(&path)?;
-            } else {
-                fs::remove_file(&path)?;
-            }
-        } else if meta.is_dir() {
-            remove_dir_safe_no_follow(&path)?;
-        } else {
-            fs::remove_file(&path)?;
-        }
-    }
-    fs::remove_dir(dir)?;
+    finished_file.sync_all()?;
     Ok(())
 }
 
@@ -1406,5 +1585,270 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(extract_err, OnyxError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn create_archive_rejects_existing_directory_dest_without_deleting_it() {
+        let temp = TempDir::new().unwrap();
+        let src_file = temp.path().join("source.txt");
+        fs::write(&src_file, b"important source").unwrap();
+
+        // Existing directory with user files inside must NEVER be deleted when passed as `dest_zip`.
+        let existing_dir = temp.path().join("important_dir.zip");
+        fs::create_dir_all(existing_dir.join("sub")).unwrap();
+        let canary = existing_dir.join("sub").join("do_not_delete.txt");
+        fs::write(&canary, b"precious user data").unwrap();
+
+        let err = create_archive(
+            vec![src_file],
+            existing_dir.clone(),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, OnyxError::InvalidPath { .. }),
+            "Expected InvalidPath when dest_zip is an existing directory, got: {err:?}"
+        );
+        assert!(existing_dir.is_dir());
+        assert_eq!(fs::read(&canary).unwrap(), b"precious user data");
+    }
+
+    #[tokio::test]
+    async fn create_archive_rejects_dest_zip_that_is_ancestor_of_source() {
+        let temp = TempDir::new().unwrap();
+        let ancestor = temp.path().join("workspace_dir");
+        let nested_dir = ancestor.join("sub");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let src_file = nested_dir.join("code.rs");
+        fs::write(&src_file, b"fn main() {}").unwrap();
+
+        let err = create_archive(
+            vec![src_file.clone()],
+            ancestor.clone(),
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, OnyxError::RecursiveOperation { .. }),
+            "Expected RecursiveOperation when dest_zip is an ancestor of a source, got: {err:?}"
+        );
+        assert!(ancestor.is_dir());
+        assert_eq!(fs::read(&src_file).unwrap(), b"fn main() {}");
+    }
+
+    #[tokio::test]
+    async fn create_archive_atomically_replaces_existing_archive_file() {
+        let temp = TempDir::new().unwrap();
+        let f1 = temp.path().join("v1.txt");
+        let f2 = temp.path().join("v2.txt");
+        fs::write(&f1, b"version 1").unwrap();
+        fs::write(&f2, b"version 2").unwrap();
+
+        let zip_path = temp.path().join("atomic.zip");
+        create_archive(vec![f1], zip_path.clone(), None, CancellationToken::new())
+            .await
+            .unwrap();
+
+        create_archive(vec![f2], zip_path.clone(), None, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let entries = list_archive_entries(zip_path, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "v2.txt");
+    }
+
+    #[tokio::test]
+    async fn extract_archive_overwrite_refuses_to_wipe_existing_dir_and_excludes_preexisting_dirs_from_succeeded()
+     {
+        let temp = TempDir::new().unwrap();
+
+        // 1. Archive containing a file entry `collision` must NEVER wipe an existing directory `collision/`.
+        let collision_zip = temp.path().join("collision.zip");
+        {
+            let file = File::create(&collision_zip).unwrap();
+            let mut zip = ZipWriter::new(file);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zip.start_file("collision", opts).unwrap();
+            zip.write_all(b"file payload").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let dest_dir = temp.path().join("dest");
+        let existing_collision_dir = dest_dir.join("collision");
+        fs::create_dir_all(&existing_collision_dir).unwrap();
+        let canary = existing_collision_dir.join("keep_me.txt");
+        fs::write(&canary, b"user folder content").unwrap();
+
+        let err = extract_archive(
+            collision_zip,
+            dest_dir.clone(),
+            ConflictPolicy::Overwrite,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(err, OnyxError::OperationFailed { .. }),
+            "Expected OperationFailed on file-vs-directory collision, got: {err:?}"
+        );
+        assert!(existing_collision_dir.is_dir());
+        assert_eq!(fs::read(&canary).unwrap(), b"user folder content");
+
+        // 2. Pre-existing directories in `dest_dir` must NEVER be added to `report.succeeded` (or Undo).
+        let nested_zip = temp.path().join("nested.zip");
+        {
+            let file = File::create(&nested_zip).unwrap();
+            let mut zip = ZipWriter::new(file);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zip.add_directory("preexisting_dir/", opts).unwrap();
+            zip.start_file("preexisting_dir/new_from_zip.txt", opts)
+                .unwrap();
+            zip.write_all(b"extracted child").unwrap();
+            zip.add_directory("brand_new_dir/", opts).unwrap();
+            zip.start_file("brand_new_dir/inside.txt", opts).unwrap();
+            zip.write_all(b"inside brand new").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let dest_dir2 = temp.path().join("dest2");
+        let preexisting_dir = dest_dir2.join("preexisting_dir");
+        fs::create_dir_all(&preexisting_dir).unwrap();
+        let existing_user_file = preexisting_dir.join("user_keep.txt");
+        fs::write(&existing_user_file, b"keep").unwrap();
+
+        let rep = extract_archive(
+            nested_zip,
+            dest_dir2.clone(),
+            ConflictPolicy::Overwrite,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !rep.succeeded.contains(&preexisting_dir),
+            "Pre-existing directory must never be recorded in report.succeeded: {:?}",
+            rep.succeeded
+        );
+        assert!(
+            rep.succeeded
+                .contains(&preexisting_dir.join("new_from_zip.txt"))
+        );
+        assert!(rep.succeeded.contains(&dest_dir2.join("brand_new_dir")));
+        assert!(
+            rep.succeeded
+                .contains(&dest_dir2.join("brand_new_dir").join("inside.txt"))
+        );
+        assert_eq!(fs::read(&existing_user_file).unwrap(), b"keep");
+    }
+
+    #[tokio::test]
+    async fn extract_archive_overwrite_preserves_original_file_and_cleans_temp_on_limit_error() {
+        let temp = TempDir::new().unwrap();
+        let zip_path = temp.path().join("bomb_like.zip");
+        {
+            let file = File::create(&zip_path).unwrap();
+            let mut zip = ZipWriter::new(file);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zip.start_file("target.txt", opts).unwrap();
+            zip.write_all(&vec![b'A'; 4096]).unwrap();
+            zip.finish().unwrap();
+        }
+
+        let dest_dir = temp.path().join("dest_atomic");
+        fs::create_dir_all(&dest_dir).unwrap();
+        let existing_file = dest_dir.join("target.txt");
+        fs::write(&existing_file, b"original intact content").unwrap();
+
+        // Use a low uncompressed limit that triggers failure; verify original file is preserved and no temp files remain.
+        let strict_limits = ArchiveLimits {
+            max_entries: 100,
+            max_total_uncompressed_bytes: 1024,
+            max_compression_ratio: 200,
+        };
+        let res = extract_archive_with_limits(
+            zip_path,
+            dest_dir.clone(),
+            ConflictPolicy::Overwrite,
+            strict_limits,
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(res.is_err());
+        assert_eq!(
+            fs::read(&existing_file).unwrap(),
+            b"original intact content"
+        );
+
+        let leftover_tmp = fs::read_dir(&dest_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".onyx_extract_tmp_")
+            });
+        assert!(
+            !leftover_tmp,
+            "Temporary extraction file must be cleaned up on error"
+        );
+
+        // Also corrupt the compressed payload bytes inside a valid-header ZIP so failure occurs mid-stream
+        // AFTER creating `.onyx_extract_tmp_*`, proving atomic preservation of `existing_file` and temp cleanup.
+        let corrupt_zip = temp.path().join("corrupt_crc.zip");
+        {
+            let file = File::create(&corrupt_zip).unwrap();
+            let mut zip = ZipWriter::new(file);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zip.start_file("target.txt", opts).unwrap();
+            zip.write_all(b"payload whose CRC will not match after byte flip")
+                .unwrap();
+            zip.finish().unwrap();
+        }
+        let mut raw_zip_bytes = fs::read(&corrupt_zip).unwrap();
+        if let Some(pos) = raw_zip_bytes.windows(7).position(|w| w == b"payload") {
+            raw_zip_bytes[pos] ^= 0xFF;
+        }
+        fs::write(&corrupt_zip, &raw_zip_bytes).unwrap();
+
+        let crc_res = extract_archive(
+            corrupt_zip,
+            dest_dir.clone(),
+            ConflictPolicy::Overwrite,
+            None,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(crc_res.is_err(), "Corrupt CRC archive must fail extraction");
+        assert_eq!(
+            fs::read(&existing_file).unwrap(),
+            b"original intact content",
+            "Existing target file must remain untouched when extraction fails mid-stream"
+        );
+        let leftover_tmp2 = fs::read_dir(&dest_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".onyx_extract_tmp_")
+            });
+        assert!(
+            !leftover_tmp2,
+            "Temporary extraction file must be cleaned up on CRC failure"
+        );
     }
 }
