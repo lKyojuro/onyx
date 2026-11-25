@@ -1,6 +1,10 @@
 //! Internal drag & drop between file rows, tabs, sidebar entries and the other
 //! dual pane, following the `drag-*` properties of `crates/onyx-ui/ui/main.slint`
 //! and the pointer handling of `file_pane.slint`.
+//!
+//! The same gesture also leaves the window: once the pointer crosses the window
+//! edge an armed drag is handed to `onyx_windows::start_external_file_drag`, so
+//! items can be dropped into Explorer, the desktop or other applications.
 
 use crate::explorer::{OnyxExplorer, PaneId, same_path};
 use crate::icons::{OnyxGlyph, render_glyph};
@@ -54,6 +58,33 @@ pub fn exceeded_threshold(origin: (f32, f32), pointer: (f32, f32)) -> bool {
     let dx = pointer.0 - origin.0;
     let dy = pointer.1 - origin.1;
     (dx * dx + dy * dy).sqrt() >= DRAG_THRESHOLD_PX
+}
+
+/// Whether `pointer` lies outside the window rectangle `(0, 0)..viewport`.
+///
+/// Windows keeps reporting mouse moves with client coordinates while the left
+/// button is held, so a pointer that has left the window arrives with negative
+/// or oversized values.
+#[must_use]
+pub fn pointer_left_window(pointer: (f32, f32), viewport: (f32, f32)) -> bool {
+    if viewport.0 <= 0.0 || viewport.1 <= 0.0 {
+        return false;
+    }
+    pointer.0 < 0.0 || pointer.1 < 0.0 || pointer.0 >= viewport.0 || pointer.1 >= viewport.1
+}
+
+/// Whether an armed internal drag has to be handed over to the shell because the
+/// pointer left the window.
+#[must_use]
+pub fn should_start_external_drag(
+    drag: Option<&DragState>,
+    external_active: bool,
+    pointer: (f32, f32),
+    viewport: (f32, f32),
+) -> bool {
+    !external_active
+        && drag.is_some_and(|drag| drag.armed)
+        && pointer_left_window(pointer, viewport)
 }
 
 /// Validates dropping `source` into `destination_dir`, returning the resolved
@@ -250,5 +281,75 @@ mod tests {
         drag.track((120.0, 100.0), false);
         assert!(drag.armed);
         assert!(!drag.copy);
+    }
+
+    #[test]
+    fn pointer_leaves_the_window_at_every_edge() {
+        let viewport = (1000.0, 700.0);
+        assert!(!pointer_left_window((0.0, 0.0), viewport));
+        assert!(!pointer_left_window((999.0, 699.0), viewport));
+        assert!(pointer_left_window((-1.0, 20.0), viewport));
+        assert!(pointer_left_window((20.0, -1.0), viewport));
+        assert!(pointer_left_window((1000.0, 20.0), viewport));
+        assert!(pointer_left_window((20.0, 700.0), viewport));
+    }
+
+    #[test]
+    fn unknown_viewport_never_counts_as_left() {
+        assert!(!pointer_left_window((-500.0, -500.0), (0.0, 0.0)));
+    }
+
+    #[test]
+    fn external_drag_needs_an_armed_drag_outside_the_window() {
+        let viewport = (1000.0, 700.0);
+        let mut drag = DragState::new(
+            PathBuf::from("C:\\data\\a.txt"),
+            "a.txt".to_string(),
+            false,
+            (500.0, 300.0),
+        );
+        drag.track((-40.0, 300.0), false);
+        assert!(drag.armed);
+        // Still inside the window: the drop stays internal.
+        assert!(!should_start_external_drag(
+            Some(&drag),
+            false,
+            (500.0, 300.0),
+            viewport
+        ));
+        // A running OS drag swallows further crossings.
+        assert!(!should_start_external_drag(
+            Some(&drag),
+            true,
+            (-40.0, 300.0),
+            viewport
+        ));
+        assert!(!should_start_external_drag(
+            None,
+            false,
+            (-40.0, 300.0),
+            viewport
+        ));
+
+        // A press that has not passed the threshold yet never leaves the app.
+        let mut pressed = DragState::new(
+            PathBuf::from("C:\\data\\a.txt"),
+            "a.txt".to_string(),
+            false,
+            (500.0, 300.0),
+        );
+        pressed.track((502.0, 300.0), false);
+        assert!(!should_start_external_drag(
+            Some(&pressed),
+            false,
+            (-40.0, 300.0),
+            viewport
+        ));
+        assert!(should_start_external_drag(
+            Some(&drag),
+            false,
+            (-40.0, 300.0),
+            viewport
+        ));
     }
 }
