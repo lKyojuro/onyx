@@ -6,6 +6,7 @@
 pub mod clipboard;
 pub mod com;
 pub mod context_menu;
+pub mod dnd;
 pub mod drives;
 pub mod dwm;
 pub mod icons;
@@ -17,6 +18,10 @@ pub mod usn;
 pub use clipboard::{get_clipboard_files, set_clipboard_files};
 pub use com::ComGuard;
 pub use context_menu::show_context_menu;
+pub use dnd::{
+    DragOutcome, DropEvent, DropTargetGuard, decode_cf_hdrop, encode_cf_hdrop,
+    register_file_drop_target, start_external_file_drag,
+};
 pub use drives::{enumerate_drives, free_disk_space};
 pub use dwm::{
     apply_titlebar_colors, apply_window_backdrop, has_system_font_family, set_window_icon_from_exe,

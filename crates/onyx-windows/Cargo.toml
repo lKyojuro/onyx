@@ -9,7 +9,8 @@ license.workspace = true
 onyx-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-windows.workspace = true
+windows = { workspace = true, features = ["Win32_System_Com_StructuredStorage", "Win32_System_Ole"] }
+windows-core = "0.62"
 
 [dev-dependencies]
 tempfile.workspace = true

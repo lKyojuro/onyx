@@ -8,6 +8,11 @@ pub mod directory;
 pub mod document;
 pub mod image_preview;
 pub mod text;
+pub mod thumbnails;
+
+pub use thumbnails::{
+    ThumbnailConfig, ThumbnailEngine, ThumbnailImage, ThumbnailKey, is_thumbnail_supported,
+};
 
 use onyx_core::{OnyxError, OnyxResult, to_extended_length_path};
 use std::fs::File;
