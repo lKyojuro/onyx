@@ -27,6 +27,13 @@ const COMMANDS: &[Command] = &[
         run: |app, ui| app.close_tab(ui, -1),
     },
     Command {
+        id: "move-tab-pane",
+        title: "Move Active Tab to Other Pane",
+        shortcut: "Ctrl+Shift+M",
+        category: "Navigation",
+        run: |app, ui| app.move_tab_to_other_pane(ui, -1),
+    },
+    Command {
         id: "refresh",
         title: "Refresh",
         shortcut: "F5",
@@ -48,11 +55,39 @@ const COMMANDS: &[Command] = &[
         run: Controller::toggle_dual,
     },
     Command {
+        id: "swap-panes",
+        title: "Swap Panes",
+        shortcut: "Ctrl+Shift+S",
+        category: "View",
+        run: Controller::swap_panes,
+    },
+    Command {
+        id: "sidebar",
+        title: "Toggle Sidebar",
+        shortcut: "Ctrl+B",
+        category: "View",
+        run: Controller::toggle_sidebar,
+    },
+    Command {
         id: "preview",
         title: "Toggle Preview Pane",
         shortcut: "",
         category: "View",
         run: Controller::toggle_preview,
+    },
+    Command {
+        id: "preview-side",
+        title: "Toggle Preview Dock Side (Left / Right)",
+        shortcut: "",
+        category: "View",
+        run: Controller::toggle_preview_side,
+    },
+    Command {
+        id: "reset-layout",
+        title: "Reset Layout",
+        shortcut: "",
+        category: "View",
+        run: Controller::reset_layout,
     },
     Command {
         id: "quick-look",

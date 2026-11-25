@@ -267,48 +267,112 @@ export component NavBar inherits Rectangle {
                         }
                     }
 
-                    search-input := LineEdit {
+                    Rectangle {
                         horizontal-stretch: 1;
-                        text <=> root.search-text;
-                        placeholder-text: root.indexed-search ? "Search index..." : "Filter folder...";
-                        font-size: OnyxTheme.font-md;
-                        edited(text) => { root.search-changed(text); }
-                        accepted(text) => { root.search-submitted(text); }
+                        min-width: 1px;
+                        clip: true;
+
+                        ContextMenuArea {
+                            Menu {
+                                MenuItem { title: @tr("Undo"); activated => { search-input.undo(); } }
+                                MenuItem { title: @tr("Redo"); activated => { search-input.redo(); } }
+                                MenuSeparator {}
+                                MenuItem {
+                                    title: @tr("Cut");
+                                    enabled: search-input.has-selection;
+                                    activated => { search-input.cut(); }
+                                }
+                                MenuItem {
+                                    title: @tr("Copy");
+                                    enabled: search-input.has-selection;
+                                    activated => { search-input.copy(); }
+                                }
+                                MenuItem { title: @tr("Paste"); activated => { search-input.paste(); } }
+                                MenuItem {
+                                    title: @tr("Select All");
+                                    enabled: root.search-text != "";
+                                    activated => { search-input.select-all(); }
+                                }
+                            }
+                        }
+
+                        search-input := TextInput {
+                            property <length> scroll-x: 0px;
+
+                            x: clamp(scroll-x, parent.width - self.width, 0px);
+                            width: max(parent.width, self.preferred-width + self.text-cursor-width);
+                            height: parent.height;
+                            text <=> root.search-text;
+                            single-line: true;
+                            vertical-alignment: center;
+                            font-size: OnyxTheme.font-md;
+                            color: OnyxTheme.text-primary;
+                            accessible-label: root.indexed-search ? "Search index" : "Filter folder";
+                            cursor-position-changed(position) => {
+                                if position.x + self.x < 0px {
+                                    self.scroll-x = -position.x;
+                                } else if position.x + self.x + self.text-cursor-width > parent.width {
+                                    self.scroll-x = parent.width - position.x - self.text-cursor-width;
+                                }
+                            }
+                            edited => { root.search-changed(self.text); }
+                            accepted => { root.search-submitted(self.text); }
+                        }
+
+                        placeholder := Text {
+                            width: parent.width;
+                            height: parent.height;
+                            visible: root.search-text == "" && search-input.preedit-text == "";
+                            text: root.indexed-search ? "Search index..." : "Filter folder...";
+                            font-size: search-input.font-size;
+                            color: OnyxTheme.text-muted;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            accessible-role: none;
+                        }
                     }
 
                     // Clear search button
-                    if root.search-text != "" : Rectangle {
-                        width: 20px;
-                        height: 20px;
-                        y: 4px;
-                        border-radius: OnyxTheme.radius-sm;
-                        background: clear-ta.has-hover ? OnyxTheme.bg-hover : transparent;
-                        accessible-role: button;
-                        accessible-label: "Clear search";
+                    if root.search-text != "" : VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
 
-                        OnyxIcon {
-                            x: (parent.width - self.width) / 2;
-                            y: (parent.height - self.height) / 2;
-                            name: "close";
-                            icon-color: OnyxTheme.text-muted;
-                        }
+                        Rectangle {
+                            width: 20px;
+                            height: 20px;
+                            border-radius: OnyxTheme.radius-sm;
+                            background: clear-ta.has-hover ? OnyxTheme.bg-hover : transparent;
+                            accessible-role: button;
+                            accessible-label: "Clear search";
 
-                        clear-ta := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => {
-                                root.search-text = "";
-                                root.search-changed("");
+                            OnyxIcon {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                name: "close";
+                                icon-color: OnyxTheme.text-muted;
+                            }
+
+                            clear-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.search-text = "";
+                                    root.search-changed("");
+                                }
                             }
                         }
                     }
 
                     // Indexed Search toggle chip
-                    FluentChip {
-                        y: 3px;
-                        label: "Index";
-                        a11y-label: "Toggle indexed search";
-                        active: root.indexed-search;
-                        clicked => { root.toggle-indexed-search(); }
+                    VerticalLayout {
+                        alignment: center;
+                        horizontal-stretch: 0;
+
+                        FluentChip {
+                            label: "Index";
+                            a11y-label: "Toggle indexed search";
+                            active: root.indexed-search;
+                            clicked => { root.toggle-indexed-search(); }
+                        }
                     }
                 }
             }

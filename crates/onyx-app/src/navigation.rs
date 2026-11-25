@@ -85,6 +85,14 @@ impl Controller {
         self.primary_tab_changed(ui);
     }
 
+    pub(crate) fn open_in_new_tab(&self, ui: &OnyxWindow) {
+        let Some(entry) = self.selected().filter(|entry| entry.is_dir()) else {
+            return;
+        };
+        self.state.borrow_mut().tabs.new_tab(entry.path);
+        self.primary_tab_changed(ui);
+    }
+
     pub(crate) fn close_tab(&self, ui: &OnyxWindow, id: i32) {
         let changed = {
             let mut state = self.state.borrow_mut();
@@ -394,15 +402,34 @@ impl Controller {
     }
 
     pub(crate) fn toggle_favorite(&self, ui: &OnyxWindow) {
-        let mut state = self.state.borrow_mut();
-        let path = state.path(state.active).to_path_buf();
-        if !state.config.remove_favorite(&path) {
-            state.config.add_favorite(onyx_core::FavoriteItem {
-                name: onyx_core::navigation::derive_tab_title(&path),
-                path,
+        let added_path = {
+            let mut state = self.state.borrow_mut();
+            let path = state.path(state.active).to_path_buf();
+            let added = if !state.config.remove_favorite(&path) {
+                state.config.add_favorite(onyx_core::FavoriteItem {
+                    name: onyx_core::navigation::derive_tab_title(&path),
+                    path: path.clone(),
+                });
+                let key = ui_sync::path_icon_key(&path);
+                state.icons.get(&key).is_none().then_some((key, path))
+            } else {
+                None
+            };
+            ui_sync::chrome(ui, &state);
+            added
+        };
+        if let Some((key, path)) = added_path {
+            let weak = self.ui.clone();
+            self.runtime.spawn_blocking(move || {
+                if let Some(icon) = onyx_windows::extract_path_icon_rgba(&path, true) {
+                    let data = onyx_cache::RgbaImageData::new(icon.width, icon.height, icon.pixels);
+                    post(&weak, move |app, ui| {
+                        app.state.borrow_mut().icons.put(key, data);
+                        app.sync_chrome(ui);
+                    });
+                }
             });
         }
-        ui_sync::chrome(ui, &state);
     }
 
     pub(crate) fn unpin_favorite(&self, ui: &OnyxWindow, path: &Path) {

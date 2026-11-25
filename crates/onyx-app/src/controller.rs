@@ -1,7 +1,11 @@
-use onyx_config::ConfigStore;
+use onyx_cache::RgbaImageData;
+use onyx_config::{
+    ConfigStore, PreviewSide, clamp_pane_split_ratio, clamp_preview_width, clamp_sidebar_width,
+};
 use onyx_core::{FileEntry, KnownFolderKind, PaneId, ThemeMode, ViewMode};
 use onyx_fs::DirectoryWatcher;
 use onyx_ui::{OnyxTheme, OnyxWindow};
+use onyx_windows::{MouseNavDirection, MouseNavHook};
 use slint::{ComponentHandle, ModelRc, PhysicalSize, Weak};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -25,6 +29,7 @@ pub(crate) struct Controller {
     pub clipboard: mpsc::UnboundedSender<crate::operations::ClipboardCommand>,
     pub shutdown: CancellationToken,
     watched: watch::Sender<Vec<PathBuf>>,
+    mouse_nav_hook: RefCell<Option<MouseNavHook>>,
     pub runtime: Arc<Runtime>,
 }
 
@@ -66,18 +71,44 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
                         .and_then(ui_sync::accent_color)
                 });
             let fonts = ui_sync::system_fonts();
+            let mut sidebar_icons = Vec::new();
+            let mut collect_icon = |target: &Path| {
+                if let Some(icon) = onyx_windows::extract_path_icon_rgba(target, true) {
+                    sidebar_icons.push((
+                        ui_sync::path_icon_key(target),
+                        RgbaImageData::new(icon.width, icon.height, icon.pixels),
+                    ));
+                }
+            };
+            collect_icon(&home);
+            for folder in &folders {
+                if folder.kind != KnownFolderKind::Home {
+                    collect_icon(&folder.path);
+                }
+            }
+            for favorite in &config.favorites {
+                collect_icon(&favorite.path);
+            }
             Ok((
-                store, config, session, home, path, dark, accent, folders, fonts,
+                store,
+                config,
+                session,
+                home,
+                path,
+                dark,
+                accent,
+                folders,
+                fonts,
+                sidebar_icons,
             ))
         })
         .await
     })??;
-    let (store, config, session, home, path, dark, accent, folders, fonts) = startup;
+    let (store, config, session, home, path, dark, accent, folders, fonts, sidebar_icons) = startup;
     let ui = OnyxWindow::new()?;
-    let [ui_font, brand_font, mono_font] = fonts;
+    let [ui_font, mono_font] = fonts;
     let theme = ui.global::<OnyxTheme>();
     theme.set_font_family(ui_font.into());
-    theme.set_font_brand(brand_font.into());
     theme.set_font_mono(mono_font.into());
     ui.window().set_size(PhysicalSize::new(
         session.window_width,
@@ -87,8 +118,15 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
     if let Some(color) = accent {
         ui.set_accent_color(color);
     }
-    ui_sync::known_folders(&ui, folders);
     let state = State::new(store, config, session, home, path);
+    for (key, data) in sidebar_icons {
+        state.icons.put(key, data);
+    }
+    if let Some(home_icon) = state.icons.get(&ui_sync::path_icon_key(&state.home)) {
+        ui.set_home_icon(ui_sync::rgba_image(&home_icon));
+        ui.set_has_home_icon(true);
+    }
+    ui_sync::known_folders(&ui, &state, folders);
     ui.set_primary_entries(ModelRc::from(state.panes[0].model.clone()));
     ui.set_secondary_entries(ModelRc::from(state.panes[1].model.clone()));
     let (watched, watch_requests) = watch::channel(Vec::new());
@@ -100,6 +138,7 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
         clipboard,
         shutdown: CancellationToken::new(),
         watched,
+        mouse_nav_hook: RefCell::new(None),
     });
     CONTROLLER.with(|active| *active.borrow_mut() = Rc::downgrade(&controller));
     controller.bind(&ui);
@@ -108,7 +147,14 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
     controller.runtime.spawn_blocking({
         let weak = controller.ui.clone();
         move || {
-            let drives = onyx_windows::enumerate_drives();
+            let drives: Vec<_> = onyx_windows::enumerate_drives()
+                .into_iter()
+                .map(|drive| {
+                    let icon = onyx_windows::extract_path_icon_rgba(&drive.root, true)
+                        .map(|icon| RgbaImageData::new(icon.width, icon.height, icon.pixels));
+                    (drive, icon)
+                })
+                .collect();
             post(&weak, move |_, ui| ui_sync::drives(ui, drives));
         }
     });
@@ -117,6 +163,7 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
     post(&controller.ui, |controller, ui| {
         if let Some(hwnd) = ui_sync::window_hwnd(ui) {
             ui_sync::apply_window_theme(hwnd, ui);
+            controller.ensure_mouse_nav_hook(hwnd);
             controller.runtime.spawn_blocking(move || {
                 if let Err(error) = onyx_windows::set_window_icon_from_exe(hwnd) {
                     tracing::warn!(%error, "could not set the Windows window icon");
@@ -132,6 +179,7 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
     }
     let event_result = slint::run_event_loop();
     controller.shutdown.cancel();
+    controller.mouse_nav_hook.borrow_mut().take();
     let size = ui.window().size();
     let (store, config, session, operation) = {
         let mut state = controller.state.borrow_mut();
@@ -205,6 +253,9 @@ impl Controller {
         bind!(on_switch_tab, |app, ui, id| app.switch_tab(&ui, id));
         bind!(on_reorder_tab, |app, ui, from, to| app
             .reorder_tab(&ui, from, to));
+        bind!(on_move_tab_to_other_pane, |app, ui, id| app
+            .move_tab_to_other_pane(&ui, id));
+        bind!(on_swap_panes, |app, ui| app.swap_panes(&ui));
         bind!(on_nav_back, |app, ui| app.history(&ui, false));
         bind!(on_nav_forward, |app, ui| app.history(&ui, true));
         bind!(on_nav_up, |app, ui| app.go_up(&ui));
@@ -239,6 +290,8 @@ impl Controller {
         ));
         bind!(on_context_menu_requested, |app, ui, pane, index| app
             .context_menu(&ui, pane_id(pane), index));
+        bind!(on_show_native_context_menu, |app, ui, pane, index| app
+            .context_menu(&ui, pane_id(pane), index));
         bind!(on_set_active_pane, |app, ui, pane| app
             .activate_pane(&ui, pane_id(pane)));
         bind!(on_sort_by, |app, ui, pane, column| app.sort_by(
@@ -248,6 +301,15 @@ impl Controller {
         ));
         bind!(on_toggle_view_mode, |app, ui| app.toggle_view(&ui));
         bind!(on_toggle_dual_pane, |app, ui| app.toggle_dual(&ui));
+        bind!(on_toggle_sidebar, |app, ui| app.toggle_sidebar(&ui));
+        bind!(on_toggle_sidebar_group, |app, ui, group| app
+            .toggle_sidebar_group(&ui, group.as_str()));
+        bind!(on_sidebar_width_changed, |app, ui, width| app
+            .set_sidebar_width(&ui, width));
+        bind!(on_preview_width_changed, |app, ui, width| app
+            .set_preview_width(&ui, width));
+        bind!(on_pane_split_ratio_changed, |app, ui, ratio| app
+            .set_pane_split_ratio(&ui, ratio));
         bind!(on_toggle_preview_pane, |app, ui| app.toggle_preview(&ui));
         bind!(on_toggle_quick_look, |app, ui| app.toggle_quick_look(&ui));
         bind!(on_toggle_theme, |app, ui| app.toggle_theme(&ui));
@@ -264,6 +326,9 @@ impl Controller {
         bind!(on_action_recycle, |app, ui| app.recycle(&ui));
         bind!(on_action_permanent_delete, |app, ui| app.prompt_delete(&ui));
         bind!(on_action_undo, |app, ui| app.undo(&ui));
+        bind!(on_action_open_in_new_tab, |app, ui| app
+            .open_in_new_tab(&ui));
+        bind!(on_action_copy_path, |app, ui| app.copy_path(&ui));
         bind!(on_action_properties, |app, ui| app.properties(&ui));
         bind!(on_action_open_with, |app, ui| app.open_with(&ui));
         bind!(on_action_open_terminal, |app, ui| app.terminal(&ui));
@@ -411,6 +476,147 @@ impl Controller {
         }
     }
 
+    pub(crate) fn toggle_sidebar(&self, ui: &OnyxWindow) {
+        let visible = self.state.borrow_mut().toggle_sidebar();
+        ui.set_sidebar_visible(visible);
+    }
+
+    pub(crate) fn toggle_sidebar_group(&self, ui: &OnyxWindow, group_id: &str) {
+        let mut state = self.state.borrow_mut();
+        state.toggle_sidebar_group(group_id);
+        ui_sync::layout(ui, &state);
+    }
+
+    pub(crate) fn set_sidebar_width(&self, ui: &OnyxWindow, width: f32) {
+        let clamped = clamp_sidebar_width(width);
+        self.state.borrow_mut().sidebar_width = clamped;
+        if (ui.get_sidebar_width() - clamped).abs() > f32::EPSILON {
+            ui.set_sidebar_width(clamped);
+        }
+    }
+
+    pub(crate) fn set_preview_width(&self, ui: &OnyxWindow, width: f32) {
+        let clamped = if width <= 0.0 {
+            None
+        } else {
+            clamp_preview_width(Some(width))
+        };
+        self.state.borrow_mut().preview_width = clamped;
+        let target = clamped.unwrap_or(0.0);
+        if (ui.get_preview_width() - target).abs() > f32::EPSILON {
+            ui.set_preview_width(target);
+        }
+    }
+
+    pub(crate) fn set_pane_split_ratio(&self, ui: &OnyxWindow, ratio: f32) {
+        let clamped = clamp_pane_split_ratio(ratio);
+        self.state.borrow_mut().pane_split_ratio = clamped;
+        if (ui.get_pane_split_ratio() - clamped).abs() > f32::EPSILON {
+            ui.set_pane_split_ratio(clamped);
+        }
+    }
+
+    pub(crate) fn toggle_preview_side(&self, ui: &OnyxWindow) {
+        let side = self.state.borrow_mut().toggle_preview_side();
+        ui.set_preview_side_left(side == PreviewSide::Left);
+    }
+
+    pub(crate) fn reset_layout(&self, ui: &OnyxWindow) {
+        {
+            let mut state = self.state.borrow_mut();
+            state.reset_layout();
+            ui_sync::chrome(ui, &state);
+        }
+        self.update_preview(ui);
+    }
+
+    pub(crate) fn swap_panes(&self, ui: &OnyxWindow) {
+        let swapped = {
+            let mut state = self.state.borrow_mut();
+            if !state.swap_panes() {
+                return;
+            }
+            state.pane_mut(PaneId::Primary).query.clear();
+            state.pane_mut(PaneId::Secondary).query.clear();
+            true
+        };
+        if swapped {
+            ui.set_address_editing(false);
+            self.sync_chrome(ui);
+            self.update_watcher();
+            self.load_directory(ui, PaneId::Primary, true);
+            self.load_directory(ui, PaneId::Secondary, true);
+        }
+    }
+
+    pub(crate) fn move_tab_to_other_pane(&self, ui: &OnyxWindow, id: i32) {
+        let moved = {
+            let mut state = self.state.borrow_mut();
+            if !state.dual {
+                return;
+            }
+            let changed = if id == -1 {
+                state.move_active_tab_to_other_pane()
+            } else {
+                let Some(idx) = state.tabs.tabs().iter().position(|tab| tab.id as i32 == id) else {
+                    return;
+                };
+                state.move_tab_to_other_pane(Some(idx))
+            };
+            if !changed {
+                return;
+            }
+            state.pane_mut(PaneId::Primary).query.clear();
+            state.pane_mut(PaneId::Secondary).query.clear();
+            true
+        };
+        if moved {
+            ui.set_address_editing(false);
+            self.sync_chrome(ui);
+            self.update_watcher();
+            self.load_directory(ui, PaneId::Primary, true);
+            self.load_directory(ui, PaneId::Secondary, true);
+        }
+    }
+
+    fn ensure_mouse_nav_hook(&self, hwnd: isize) {
+        if self
+            .mouse_nav_hook
+            .borrow()
+            .as_ref()
+            .is_some_and(|hook| hook.hwnd() == hwnd)
+        {
+            return;
+        }
+        self.mouse_nav_hook.borrow_mut().take();
+        let weak = self.ui.clone();
+        match onyx_windows::install_mouse_nav_hook(hwnd, move |direction| {
+            post(&weak, move |app, ui| {
+                app.handle_mouse_nav(ui, direction);
+            });
+        }) {
+            Ok(hook) => {
+                *self.mouse_nav_hook.borrow_mut() = Some(hook);
+            }
+            Err(error) => {
+                tracing::warn!(%error, hwnd, "could not install mouse side-button navigation hook");
+            }
+        }
+    }
+
+    fn handle_mouse_nav(&self, ui: &OnyxWindow, direction: MouseNavDirection) {
+        if ui.get_command_palette_open()
+            || ui.get_modal_open()
+            || ui.get_quick_look_open()
+            || ui.get_context_menu_open()
+            || ui.get_address_editing()
+        {
+            return;
+        }
+        let forward = matches!(direction, MouseNavDirection::Forward);
+        self.history(ui, forward);
+    }
+
     pub(crate) fn toggle_preview(&self, ui: &OnyxWindow) {
         let enabled = !self.state.borrow().config.show_preview_pane;
         self.state.borrow_mut().config.show_preview_pane = enabled;
@@ -435,6 +641,7 @@ impl Controller {
         ui.set_dark_mode(dark);
         if let Some(hwnd) = ui_sync::window_hwnd(ui) {
             ui_sync::apply_window_theme(hwnd, ui);
+            self.ensure_mouse_nav_hook(hwnd);
         }
     }
 }

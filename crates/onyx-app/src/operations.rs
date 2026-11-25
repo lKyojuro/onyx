@@ -265,6 +265,33 @@ impl Controller {
         }
     }
 
+    pub(crate) fn copy_path(&self, _ui: &OnyxWindow) {
+        let text = {
+            let state = self.state.borrow();
+            let selected = state
+                .tab(state.active)
+                .map(|tab| tab.selected_paths.as_slice())
+                .unwrap_or(&[]);
+            if selected.is_empty() {
+                onyx_core::normalize_display_path(state.path(state.active))
+            } else {
+                selected
+                    .iter()
+                    .map(|path| onyx_core::normalize_display_path(path))
+                    .collect::<Vec<_>>()
+                    .join("\r\n")
+            }
+        };
+        let weak = self.ui.clone();
+        self.runtime.spawn_blocking(move || {
+            let message = match copy_text_to_clipboard(&text) {
+                Ok(()) => "Copied path to clipboard.".to_string(),
+                Err(error) => format!("Could not copy path: {error}"),
+            };
+            post(&weak, move |_, ui| ui.set_status_message(message.into()));
+        });
+    }
+
     pub(crate) fn prompt_new_folder(&self, ui: &OnyxWindow) {
         let parent = self.state.borrow().path(self.active()).to_path_buf();
         self.prompt(
@@ -463,42 +490,50 @@ impl Controller {
     }
 
     pub(crate) fn context_menu(&self, ui: &OnyxWindow, pane: PaneId, index: i32) {
-        let (clicked, selection, pane_path) = {
-            let state = self.state.borrow();
-            let Some(entry) = usize::try_from(index)
-                .ok()
-                .and_then(|index| state.pane(pane).entries.get(index))
-            else {
-                return;
-            };
-            let selection = state
-                .tab(pane)
-                .filter(|tab| tab.selected_paths.contains(&entry.path))
-                .map(|tab| tab.selected_paths.clone());
-            (
-                entry.path.clone(),
-                selection,
-                state.path(pane).to_path_buf(),
-            )
-        };
-        if selection.is_some() {
+        let (paths, affected) = if index < 0 {
             self.activate_pane(ui, pane);
+            let pane_path = self.state.borrow().path(pane).to_path_buf();
+            (vec![pane_path.clone()], vec![pane_path])
         } else {
-            self.select(ui, pane, index);
-        }
+            let (clicked, selection, pane_path) = {
+                let state = self.state.borrow();
+                let Some(entry) = usize::try_from(index)
+                    .ok()
+                    .and_then(|index| state.pane(pane).entries.get(index))
+                else {
+                    return;
+                };
+                let selection = state
+                    .tab(pane)
+                    .filter(|tab| tab.selected_paths.contains(&entry.path))
+                    .map(|tab| tab.selected_paths.clone());
+                (
+                    entry.path.clone(),
+                    selection,
+                    state.path(pane).to_path_buf(),
+                )
+            };
+            if selection.is_some() {
+                self.activate_pane(ui, pane);
+            } else {
+                self.select(ui, pane, index);
+            }
+            let parent = clicked.parent();
+            let changed_parent = parent
+                .filter(|parent| *parent != pane_path)
+                .map(Path::to_path_buf);
+            let mut affected = vec![pane_path];
+            affected.extend(changed_parent);
+            let paths = selection
+                .filter(|paths| paths.iter().all(|path| path.parent() == parent))
+                .unwrap_or_else(|| vec![clicked]);
+            (paths, affected)
+        };
+
         let Some(hwnd) = ui_sync::window_hwnd(ui) else {
             ui.set_status_message("The Windows context menu requires a window handle.".into());
             return;
         };
-        let parent = clicked.parent();
-        let changed_parent = parent
-            .filter(|parent| *parent != pane_path)
-            .map(Path::to_path_buf);
-        let mut affected = vec![pane_path];
-        affected.extend(changed_parent);
-        let paths = selection
-            .filter(|paths| paths.iter().all(|path| path.parent() == parent))
-            .unwrap_or_else(|| vec![clicked]);
 
         let weak = self.ui.clone();
         // The native menu initializes COM as STA and blocks until dismissal.
@@ -593,5 +628,40 @@ fn operation_message(title: &str, result: OnyxResult<Option<OperationReport>>) -
         }
         Err(OnyxError::Cancelled) => format!("{title} cancelled."),
         Err(error) => error.to_string(),
+    }
+}
+
+fn copy_text_to_clipboard(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    let mut command = Command::new("clip.exe");
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let mut utf16le = Vec::with_capacity(2 + text.len() * 2);
+        utf16le.extend_from_slice(&[0xFF, 0xFE]);
+        for unit in text.encode_utf16() {
+            utf16le.extend_from_slice(&unit.to_le_bytes());
+        }
+        stdin.write_all(&utf16le)?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "clip.exe exited with status {status}"
+        )))
     }
 }

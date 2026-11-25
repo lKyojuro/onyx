@@ -17,6 +17,8 @@ export struct UiSidebarItem {
     path: string,
     icon_glyph: string,
     is_favorite: bool,
+    icon: image,
+    has_icon: bool,
 }
 
 export struct UiDriveItem {
@@ -25,6 +27,8 @@ export struct UiDriveItem {
     filesystem: string,
     free_label: string,
     usage_ratio: float,
+    icon: image,
+    has_icon: bool,
 }
 
 export struct UiFileEntry {

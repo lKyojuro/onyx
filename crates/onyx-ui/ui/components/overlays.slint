@@ -7,6 +7,7 @@ import { PreviewPane } from "preview_pane.slint";
 
 // Command Palette Modal (Ctrl+K)
 export component CommandPaletteModal inherits Rectangle {
+    in property <bool> open: false;
     in-out property <string> query: "";
     in property <[UiCommandItem]> items;
     in-out property <int> selected-index: 0;
@@ -20,7 +21,10 @@ export component CommandPaletteModal inherits Rectangle {
         cmd-input.focus();
     }
 
+    opacity: root.open ? 1.0 : 0.0;
+    visible: self.opacity > 0.01;
     background: OnyxTheme.bg-backdrop;
+    animate opacity { duration: 140ms; easing: ease-out; }
 
     // Click outside to dismiss
     TouchArea {
@@ -214,6 +218,7 @@ export component CommandPaletteModal inherits Rectangle {
 
 // Reusable Prompt Dialog Modal (New Folder, Rename, Permanent Delete confirmation)
 export component PromptDialogModal inherits Rectangle {
+    in property <bool> open: false;
     in property <string> title: "";
     in property <string> message: "";
     in-out property <string> input-text: "";
@@ -232,7 +237,10 @@ export component PromptDialogModal inherits Rectangle {
         }
     }
 
+    opacity: root.open ? 1.0 : 0.0;
+    visible: self.opacity > 0.01;
     background: OnyxTheme.bg-backdrop;
+    animate opacity { duration: 140ms; easing: ease-out; }
 
     TouchArea {
         clicked => { root.cancel(); }
@@ -342,6 +350,7 @@ export component PromptDialogModal inherits Rectangle {
 
 // Spacebar Quick Look Modal Overlay
 export component QuickLookModal inherits Rectangle {
+    in property <bool> open: false;
     in property <string> preview-title: "";
     in property <string> preview-subtitle: "";
     in property <string> preview-kind: "none";
@@ -357,7 +366,10 @@ export component QuickLookModal inherits Rectangle {
     callback close();
     callback open-item();
 
+    opacity: root.open ? 1.0 : 0.0;
+    visible: self.opacity > 0.01;
     background: OnyxTheme.bg-backdrop;
+    animate opacity { duration: 140ms; easing: ease-out; }
 
     TouchArea {
         clicked => { root.close(); }

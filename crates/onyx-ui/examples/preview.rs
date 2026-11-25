@@ -184,6 +184,8 @@ fn main() -> Result<(), slint::PlatformError> {
             path: "D:\\Onyx".into(),
             icon_glyph: "star-filled".into(),
             is_favorite: true,
+            icon: slint::Image::default(),
+            has_icon: false,
         },
     ]))));
 
@@ -193,24 +195,32 @@ fn main() -> Result<(), slint::PlatformError> {
             path: "C:\\Users\\User\\Desktop".into(),
             icon_glyph: "desktop".into(),
             is_favorite: false,
+            icon: slint::Image::default(),
+            has_icon: false,
         },
         UiSidebarItem {
             label: "Downloads".into(),
             path: "C:\\Users\\User\\Downloads".into(),
             icon_glyph: "download".into(),
             is_favorite: false,
+            icon: slint::Image::default(),
+            has_icon: false,
         },
         UiSidebarItem {
             label: "Documents".into(),
             path: "C:\\Users\\User\\Documents".into(),
             icon_glyph: "file".into(),
             is_favorite: false,
+            icon: slint::Image::default(),
+            has_icon: false,
         },
         UiSidebarItem {
             label: "Pictures".into(),
             path: "C:\\Users\\User\\Pictures".into(),
             icon_glyph: "image".into(),
             is_favorite: false,
+            icon: slint::Image::default(),
+            has_icon: false,
         },
     ]))));
 
@@ -221,6 +231,8 @@ fn main() -> Result<(), slint::PlatformError> {
             filesystem: "NTFS".into(),
             free_label: "148 GB free of 512 GB".into(),
             usage_ratio: 0.71,
+            icon: slint::Image::default(),
+            has_icon: false,
         },
         UiDriveItem {
             label: "Data (D:)".into(),
@@ -228,6 +240,8 @@ fn main() -> Result<(), slint::PlatformError> {
             filesystem: "NTFS".into(),
             free_label: "620 GB free of 1.0 TB".into(),
             usage_ratio: 0.38,
+            icon: slint::Image::default(),
+            has_icon: false,
         },
         UiDriveItem {
             label: "Archive (E:)".into(),
@@ -235,6 +249,8 @@ fn main() -> Result<(), slint::PlatformError> {
             filesystem: "NTFS".into(),
             free_label: "42 GB free of 500 GB".into(),
             usage_ratio: 0.92,
+            icon: slint::Image::default(),
+            has_icon: false,
         },
     ]))));
 

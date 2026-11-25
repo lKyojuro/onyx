@@ -1,4 +1,7 @@
 use onyx_cache::RgbaImageData;
+use onyx_config::{
+    PreviewSide, SIDEBAR_GROUP_DRIVES, SIDEBAR_GROUP_FAVORITES, SIDEBAR_GROUP_QUICK_ACCESS,
+};
 use onyx_core::{
     DriveInfo, FileEntry, KnownFolder, KnownFolderKind, PaneId, SortColumn, SortDirection,
     ViewMode, build_breadcrumbs, format_bytes, format_timestamp, normalize_display_path,
@@ -43,7 +46,7 @@ pub(crate) fn window_hwnd(ui: &OnyxWindow) -> Option<isize> {
     }
 }
 
-pub(crate) fn system_fonts() -> [&'static str; 3] {
+pub(crate) fn system_fonts() -> [&'static str; 2] {
     fn preferred(preferred: &'static str, fallback: &'static str) -> &'static str {
         if onyx_windows::has_system_font_family(preferred) {
             preferred
@@ -52,10 +55,8 @@ pub(crate) fn system_fonts() -> [&'static str; 3] {
         }
     }
 
-    let ui = preferred("Segoe UI Variable Text", "Segoe UI");
     [
-        ui,
-        preferred("Bahnschrift", ui),
+        preferred("Segoe UI Variable Text", "Segoe UI"),
         preferred("Cascadia Mono", "Consolas"),
     ]
 }
@@ -78,42 +79,51 @@ pub(crate) fn apply_window_theme(hwnd: isize, ui: &OnyxWindow) {
     }
 }
 
-pub(crate) fn known_folders(ui: &OnyxWindow, folders: Vec<KnownFolder>) {
-    ui.set_known_folders(model(folders.into_iter().map(|folder| {
-        UiSidebarItem {
+pub(crate) fn known_folders(ui: &OnyxWindow, state: &State, folders: Vec<KnownFolder>) {
+    ui.set_known_folders(model(folders.into_iter().filter_map(|folder| {
+        let icon_name = match folder.kind {
+            KnownFolderKind::Home => return None,
+            KnownFolderKind::Desktop => "desktop",
+            KnownFolderKind::Downloads => "download",
+            KnownFolderKind::Documents => "file",
+            KnownFolderKind::Pictures => "image",
+            KnownFolderKind::Music => "music",
+            KnownFolderKind::Videos => "video",
+        };
+        let key = path_icon_key(&folder.path);
+        let native_icon = state.icons.get(&key).as_ref().map(rgba_image);
+        Some(UiSidebarItem {
             label: folder.name.into(),
             path: display_path(&folder.path),
-            icon_glyph: match folder.kind {
-                KnownFolderKind::Home => "home",
-                KnownFolderKind::Desktop => "desktop",
-                KnownFolderKind::Downloads => "download",
-                KnownFolderKind::Documents => "file",
-                KnownFolderKind::Pictures => "image",
-                KnownFolderKind::Music => "music",
-                KnownFolderKind::Videos => "video",
-            }
-            .into(),
+            icon_glyph: icon_name.into(),
             is_favorite: false,
-        }
+            has_icon: native_icon.is_some(),
+            icon: native_icon.unwrap_or_default(),
+        })
     })));
 }
 
-pub(crate) fn drives(ui: &OnyxWindow, drives: Vec<DriveInfo>) {
-    ui.set_drives(model(drives.into_iter().map(|drive| UiDriveItem {
-        label: format!("{} ({})", drive.label, normalize_display_path(&drive.root)).into(),
-        root: display_path(&drive.root),
-        filesystem: drive.filesystem.clone().into(),
-        free_label: if drive.total_bytes == 0 {
-            "".into()
-        } else {
-            format!(
-                "{} free of {}",
-                format_bytes(drive.free_bytes),
-                format_bytes(drive.total_bytes)
-            )
-            .into()
-        },
-        usage_ratio: drive.usage_ratio(),
+pub(crate) fn drives(ui: &OnyxWindow, drives: Vec<(DriveInfo, Option<RgbaImageData>)>) {
+    ui.set_drives(model(drives.into_iter().map(|(drive, icon_data)| {
+        let icon = icon_data.as_ref().map(rgba_image);
+        UiDriveItem {
+            label: format!("{} ({})", drive.label, normalize_display_path(&drive.root)).into(),
+            root: display_path(&drive.root),
+            filesystem: drive.filesystem.clone().into(),
+            free_label: if drive.total_bytes == 0 {
+                "".into()
+            } else {
+                format!(
+                    "{} free of {}",
+                    format_bytes(drive.free_bytes),
+                    format_bytes(drive.total_bytes)
+                )
+                .into()
+            },
+            usage_ratio: drive.usage_ratio(),
+            has_icon: icon.is_some(),
+            icon: icon.unwrap_or_default(),
+        }
     })));
 }
 
@@ -127,11 +137,15 @@ pub(crate) fn chrome(ui: &OnyxWindow, state: &State) {
         },
     )));
     ui.set_favorites(model(state.config.favorites.iter().map(|item| {
+        let key = path_icon_key(&item.path);
+        let native_icon = state.icons.get(&key).as_ref().map(rgba_image);
         UiSidebarItem {
             label: item.name.as_str().into(),
             path: display_path(&item.path),
             icon_glyph: "star-filled".into(),
             is_favorite: true,
+            has_icon: native_icon.is_some(),
+            icon: native_icon.unwrap_or_default(),
         }
     })));
     let path = state.path(state.active);
@@ -162,6 +176,20 @@ pub(crate) fn chrome(ui: &OnyxWindow, state: &State) {
     ui.set_view_mode(i32::from(state.config.default_view == ViewMode::Grid));
     ui.set_show_hidden(state.config.show_hidden);
     ui.set_indexed_search(state.indexed_search);
+    layout(ui, state);
+}
+
+pub(crate) fn layout(ui: &OnyxWindow, state: &State) {
+    ui.set_sidebar_visible(state.sidebar_visible);
+    ui.set_sidebar_width(state.sidebar_width);
+    ui.set_preview_width(state.preview_width.unwrap_or(0.0));
+    ui.set_pane_split_ratio(state.pane_split_ratio);
+    ui.set_preview_side_left(state.preview_side == PreviewSide::Left);
+    ui.set_sidebar_favorites_collapsed(state.is_sidebar_group_collapsed(SIDEBAR_GROUP_FAVORITES));
+    ui.set_sidebar_quick_access_collapsed(
+        state.is_sidebar_group_collapsed(SIDEBAR_GROUP_QUICK_ACCESS),
+    );
+    ui.set_sidebar_drives_collapsed(state.is_sidebar_group_collapsed(SIDEBAR_GROUP_DRIVES));
 }
 
 pub(crate) fn same_path(first: &Path, second: &Path) -> bool {
@@ -174,6 +202,10 @@ pub(crate) fn same_path(first: &Path, second: &Path) -> bool {
     first == second || normalize(first) == normalize(second)
 }
 
+pub(crate) fn path_icon_key(path: &Path) -> String {
+    format!("path:{}", normalize_display_path(path))
+}
+
 pub(crate) fn icon_key(entry: &FileEntry) -> String {
     if entry.is_dir() {
         return "directory".into();
@@ -184,7 +216,7 @@ pub(crate) fn icon_key(entry: &FileEntry) -> String {
         .unwrap_or_default()
         .to_ascii_lowercase();
     if ext == "exe" || ext == "lnk" || ext == "ico" {
-        format!("path:{}", normalize_display_path(&entry.path))
+        path_icon_key(&entry.path)
     } else {
         format!("extension:{ext}")
     }

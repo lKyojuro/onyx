@@ -8,6 +8,7 @@ export component Toolbar inherits Rectangle {
     in property <int> view-mode: 0;
     in property <bool> show-hidden: false;
     in property <bool> dual-pane: false;
+    in property <bool> sidebar-visible: true;
     in property <bool> preview-pane: true;
     in property <bool> dark-mode: true;
     in property <bool> can-undo: false;
@@ -26,18 +27,23 @@ export component Toolbar inherits Rectangle {
     callback toggle-view-mode();
     callback toggle-hidden();
     callback toggle-dual-pane();
+    callback toggle-sidebar();
     callback toggle-preview-pane();
     callback action-open-terminal();
     callback action-properties();
     callback toggle-theme();
     callback toggle-command-palette();
 
+    public function focus-sidebar-toggle() {
+        sidebar-toggle-focus.focus();
+    }
+
     pure function sort-icon(column: int) -> string {
         return root.sort-column == column ? (root.sort-ascending ? "sort-ascending" : "sort-descending") : "";
     }
 
     height: 40px;
-    background: OnyxTheme.bg-surface-alt;
+    background: OnyxTheme.dark-mode ? OnyxTheme.bg-chrome : OnyxTheme.bg-surface-alt;
 
     // Subtle bottom hairline
     Rectangle {
@@ -196,6 +202,38 @@ export component Toolbar inherits Rectangle {
                 compact: true;
                 active: root.dual-pane;
                 clicked => { root.toggle-dual-pane(); }
+            }
+
+            sidebar-toggle-focus := FocusScope {
+                width: sidebar-toggle-btn.preferred-width;
+                height: sidebar-toggle-btn.preferred-height;
+
+                key-pressed(event) => {
+                    if event.text == " " || event.text == Key.Return {
+                        root.toggle-sidebar();
+                        return accept;
+                    }
+                    return reject;
+                }
+
+                sidebar-toggle-btn := FluentButton {
+                    width: parent.width;
+                    height: parent.height;
+                    icon-name: "panel-left";
+                    label: "Sidebar";
+                    a11y-label: root.sidebar-visible ? "Hide sidebar" : "Show sidebar";
+                    compact: true;
+                    active: root.sidebar-visible;
+                    clicked => { root.toggle-sidebar(); }
+                }
+
+                if self.has-focus : Rectangle {
+                    width: parent.width;
+                    height: parent.height;
+                    border-radius: OnyxTheme.radius-sm;
+                    border-width: 1.5px;
+                    border-color: OnyxTheme.border-focus;
+                }
             }
 
             FluentButton {

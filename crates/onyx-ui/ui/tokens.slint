@@ -1,8 +1,8 @@
 // Onyx Nocturne (Nyx-inspired) & Clean Light Design Tokens
 // WCAG contrast ratios (primary / secondary / muted).
-// Dark translucent surfaces use white behind them for a conservative lower bound.
+// Dark surfaces use white under the window's lightest scrim for a conservative lower bound.
 // Theme   bg-surface          bg-sidebar          bg-chrome
-// Dark    14.78 / 6.83 / 4.69 14.48 / 6.69 / 4.59 17.64 / 8.15 / 5.59
+// Dark    16.01 / 7.40 / 6.23 12.17 / 5.63 / 4.73 12.24 / 5.66 / 4.76
 // Light   18.14 / 8.47 / 5.37 15.94 / 7.45 / 4.72 15.67 / 7.32 / 4.64
 
 export global OnyxTheme {
@@ -11,8 +11,8 @@ export global OnyxTheme {
 
     // Core surface hierarchy (translucent midnight-obsidian over cosmic aurora in dark mode)
     out property <color> bg-base: dark-mode ? #000000 : #f4f5fa;
-    out property <color> bg-chrome: dark-mode ? #080817 : #eceef7;
-    out property <color> bg-sidebar: dark-mode ? #090913e8 : #eef0f8;
+    out property <color> bg-chrome: dark-mode ? #080817b8 : #eceef7;
+    out property <color> bg-sidebar: dark-mode ? #090913b8 : #eef0f8;
     out property <color> bg-surface: dark-mode ? #0d0c20ee : #ffffff;
     out property <color> bg-surface-alt: dark-mode ? #0b0a1cd6 : #f8f9fd;
     out property <color> bg-elevated: dark-mode ? #101024f5 : #ffffff;
@@ -34,7 +34,7 @@ export global OnyxTheme {
     // Typography colors
     out property <color> text-primary: dark-mode ? #f1f0ff : #141426;
     out property <color> text-secondary: dark-mode ? #a6a3c0 : #4b4a68;
-    out property <color> text-muted: dark-mode ? #8884a8 : #696883;
+    out property <color> text-muted: dark-mode ? #9894b7 : #696883;
     out property <color> text-on-accent: dark-mode ? #06061a : #ffffff;
 
     // Accent & semantic colors
@@ -66,7 +66,6 @@ export global OnyxTheme {
 
     // Typography
     in-out property <string> font-family: "Segoe UI Variable Text";
-    in-out property <string> font-brand: "Bahnschrift";
     in-out property <string> font-mono: "Cascadia Mono";
     out property <length> font-xs: 12px;
     out property <length> font-sm: 13px;

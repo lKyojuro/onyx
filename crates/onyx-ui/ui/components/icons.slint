@@ -28,6 +28,27 @@ export component OnyxIcon inherits Rectangle {
         LineTo { x: root.name == "chevron-left" ? 15 : 9; y: 19; }
     }
 
+    if name == "chevron-down" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 5; y: 9; }
+        LineTo { x: 12; y: 16; }
+        LineTo { x: 19; y: 9; }
+    }
+
+    if name == "arrow-left-right" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 8; y: 3; } LineTo { x: 4; y: 7; } LineTo { x: 8; y: 11; }
+        MoveTo { x: 4; y: 7; } LineTo { x: 20; y: 7; }
+        MoveTo { x: 16; y: 21; } LineTo { x: 20; y: 17; } LineTo { x: 16; y: 13; }
+        MoveTo { x: 20; y: 17; } LineTo { x: 4; y: 17; }
+    }
+
     if name == "sort-ascending" || name == "sort-descending" : Path {
         width: parent.width; height: parent.height;
         viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
@@ -362,6 +383,16 @@ export component OnyxIcon inherits Rectangle {
         stroke-line-cap: round; stroke-line-join: round;
         MoveTo { x: 3; y: 4; } LineTo { x: 21; y: 4; } LineTo { x: 21; y: 20; } LineTo { x: 3; y: 20; } Close { }
         MoveTo { x: 12; y: 4; } LineTo { x: 12; y: 20; }
+    }
+
+    // Sidebar panel left
+    if name == "panel-left" : Path {
+        width: parent.width; height: parent.height;
+        viewbox-x: 0; viewbox-y: 0; viewbox-width: 24; viewbox-height: 24;
+        stroke: root.icon-color; stroke-width: root.stroke-w;
+        stroke-line-cap: round; stroke-line-join: round;
+        MoveTo { x: 3; y: 4; } LineTo { x: 21; y: 4; } LineTo { x: 21; y: 20; } LineTo { x: 3; y: 20; } Close { }
+        MoveTo { x: 9; y: 4; } LineTo { x: 9; y: 20; }
     }
 
     // Preview panel right

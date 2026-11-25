@@ -94,7 +94,10 @@ impl ConfigStore {
         };
 
         match serde_json::from_str::<SessionState>(&contents) {
-            Ok(session) => session,
+            Ok(mut session) => {
+                session.sanitize();
+                session
+            }
             Err(err) => {
                 warn!(path = %path.display(), error = %err, "Corrupt session JSON; falling back to defaults");
                 SessionState::default()
@@ -243,10 +246,152 @@ mod tests {
             secondary_path: Some(PathBuf::from(r"D:\Projects")),
             window_width: 1920,
             window_height: 1080,
+            sidebar_visible: false,
+            sidebar_width: 280.0,
+            preview_width: Some(340.0),
+            pane_split_ratio: 0.62,
+            collapsed_sidebar_groups: vec![
+                crate::model::SIDEBAR_GROUP_FAVORITES.to_string(),
+                crate::model::SIDEBAR_GROUP_DRIVES.to_string(),
+            ],
+            preview_side: crate::model::PreviewSide::Left,
         };
 
         store.save_session(&session).unwrap();
         assert_eq!(store.load_session(), session);
+    }
+
+    #[test]
+    fn legacy_session_missing_layout_fields_uses_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let store = ConfigStore::with_dir(tmp.path().to_path_buf());
+
+        let legacy_json = r#"{
+            "tabs": ["C:\\Users", "D:\\Onyx"],
+            "active_tab": 1,
+            "dual_pane": true,
+            "secondary_path": "D:\\Projects",
+            "window_width": 1600,
+            "window_height": 900
+        }"#;
+        fs::write(store.session_path(), legacy_json).unwrap();
+
+        let loaded = store.load_session();
+        assert_eq!(
+            loaded.tabs,
+            vec![PathBuf::from(r"C:\Users"), PathBuf::from(r"D:\Onyx")]
+        );
+        assert_eq!(loaded.active_tab, 1);
+        assert!(loaded.dual_pane);
+        assert_eq!(loaded.secondary_path, Some(PathBuf::from(r"D:\Projects")));
+        assert_eq!(loaded.window_width, 1600);
+        assert_eq!(loaded.window_height, 900);
+        assert!(loaded.sidebar_visible);
+        assert_eq!(loaded.sidebar_width, crate::model::DEFAULT_SIDEBAR_WIDTH);
+        assert_eq!(loaded.preview_width, None);
+        assert_eq!(
+            loaded.effective_preview_width(),
+            crate::model::DEFAULT_PREVIEW_WIDTH_DUAL
+        );
+        assert_eq!(
+            loaded.pane_split_ratio,
+            crate::model::DEFAULT_PANE_SPLIT_RATIO
+        );
+        assert!(loaded.collapsed_sidebar_groups.is_empty());
+        assert_eq!(loaded.preview_side, crate::model::PreviewSide::Right);
+    }
+
+    #[test]
+    fn session_load_clamps_and_sanitizes_layout_values() {
+        let tmp = TempDir::new().unwrap();
+        let store = ConfigStore::with_dir(tmp.path().to_path_buf());
+
+        let out_of_bounds_json = r#"{
+            "tabs": ["C:\\Users"],
+            "active_tab": 0,
+            "dual_pane": false,
+            "secondary_path": null,
+            "window_width": 1280,
+            "window_height": 800,
+            "sidebar_visible": false,
+            "sidebar_width": 999.0,
+            "preview_width": 50.0,
+            "pane_split_ratio": 0.99,
+            "collapsed_sidebar_groups": ["favorites", "unknown_group", "favorites", "drives"],
+            "preview_side": "left"
+        }"#;
+        fs::write(store.session_path(), out_of_bounds_json).unwrap();
+
+        let loaded = store.load_session();
+        assert!(!loaded.sidebar_visible);
+        assert_eq!(loaded.sidebar_width, crate::model::MAX_SIDEBAR_WIDTH);
+        assert_eq!(loaded.preview_width, Some(crate::model::MIN_PREVIEW_WIDTH));
+        assert_eq!(loaded.pane_split_ratio, crate::model::MAX_PANE_SPLIT_RATIO);
+        assert_eq!(
+            loaded.collapsed_sidebar_groups,
+            vec!["favorites".to_string(), "drives".to_string()]
+        );
+        assert_eq!(loaded.preview_side, crate::model::PreviewSide::Left);
+
+        let mut non_finite = SessionState {
+            sidebar_width: f32::NAN,
+            preview_width: Some(f32::INFINITY),
+            pane_split_ratio: f32::NEG_INFINITY,
+            ..SessionState::default()
+        };
+        non_finite.sanitize();
+        assert_eq!(
+            non_finite.sidebar_width,
+            crate::model::DEFAULT_SIDEBAR_WIDTH
+        );
+        assert_eq!(non_finite.preview_width, None);
+        assert_eq!(
+            non_finite.effective_preview_width(),
+            crate::model::DEFAULT_PREVIEW_WIDTH_SINGLE
+        );
+        assert_eq!(
+            non_finite.pane_split_ratio,
+            crate::model::DEFAULT_PANE_SPLIT_RATIO
+        );
+    }
+
+    #[test]
+    fn session_reset_layout_preserves_tabs_and_paths() {
+        let mut session = SessionState {
+            tabs: vec![PathBuf::from(r"C:\Users"), PathBuf::from(r"D:\Onyx")],
+            active_tab: 1,
+            dual_pane: true,
+            secondary_path: Some(PathBuf::from(r"D:\Projects")),
+            window_width: 1440,
+            window_height: 900,
+            sidebar_visible: false,
+            sidebar_width: 350.0,
+            preview_width: Some(420.0),
+            pane_split_ratio: 0.7,
+            collapsed_sidebar_groups: vec!["quick_access".to_string()],
+            preview_side: crate::model::PreviewSide::Left,
+        };
+
+        session.reset_layout();
+
+        assert_eq!(
+            session.tabs,
+            vec![PathBuf::from(r"C:\Users"), PathBuf::from(r"D:\Onyx")]
+        );
+        assert_eq!(session.active_tab, 1);
+        assert!(session.dual_pane);
+        assert_eq!(session.secondary_path, Some(PathBuf::from(r"D:\Projects")));
+        assert_eq!(session.window_width, 1440);
+        assert_eq!(session.window_height, 900);
+        assert!(session.sidebar_visible);
+        assert_eq!(session.sidebar_width, crate::model::DEFAULT_SIDEBAR_WIDTH);
+        assert_eq!(session.preview_width, None);
+        assert_eq!(
+            session.pane_split_ratio,
+            crate::model::DEFAULT_PANE_SPLIT_RATIO
+        );
+        assert!(session.collapsed_sidebar_groups.is_empty());
+        assert_eq!(session.preview_side, crate::model::PreviewSide::Right);
     }
 
     #[test]
