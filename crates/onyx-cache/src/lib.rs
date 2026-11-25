@@ -4,7 +4,8 @@ mod memory;
 mod metadata;
 
 pub use memory::{
-    DEFAULT_DIRECTORY_CACHE_CAPACITY, DEFAULT_ICON_CACHE_CAPACITY,
-    DEFAULT_THUMBNAIL_CACHE_CAPACITY, DirectoryCache, IconCache, RgbaImageData, ThumbnailCache,
+    CachedFolderSize, DEFAULT_DIRECTORY_CACHE_CAPACITY, DEFAULT_FOLDER_SIZE_CACHE_CAPACITY,
+    DEFAULT_ICON_CACHE_CAPACITY, DEFAULT_THUMBNAIL_CACHE_CAPACITY, DirectoryCache, FolderSizeCache,
+    IconCache, RgbaImageData, ThumbnailCache,
 };
 pub use metadata::{DirMetadataRecord, FolderVisit, MetadataStore};

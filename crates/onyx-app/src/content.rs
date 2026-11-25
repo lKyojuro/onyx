@@ -1,8 +1,9 @@
-use onyx_cache::RgbaImageData;
+use onyx_cache::{CachedFolderSize, RgbaImageData};
 use onyx_core::{
     FileEntry, GenerationId, OnyxError, OnyxResult, PaneId, SortSpec, ViewMode,
     normalize_display_path, sort_entries,
 };
+use onyx_fs::{DEFAULT_MAX_FOLDER_SIZE_ENTRIES, FolderSizeResult, compute_folder_size};
 use onyx_preview::{PreviewEngine, ThumbnailImage, is_thumbnail_supported};
 use onyx_search::{
     IncrementalIndexer, SearchIndex, SearchQuery, SearchResult, UnifiedSearchEngine,
@@ -13,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::controller::{Controller, post};
@@ -26,6 +27,9 @@ pub(crate) const THUMBNAIL_TARGET_PX: u32 = 128;
 
 /// Maximum concurrent thumbnail worker tasks spawned per pane.
 const MAX_THUMBNAIL_WORKERS: usize = 4;
+
+/// Maximum concurrent recursive folder size calculations per pane.
+const MAX_FOLDER_SIZE_CONCURRENCY: usize = 3;
 
 #[derive(Clone)]
 pub(crate) struct IndexWatchRequest {
@@ -113,6 +117,36 @@ impl Controller {
     }
 
     pub(crate) fn queue_icons(&self, id: PaneId, first: usize) {
+        if first == 0 {
+            let should_queue_sizes = {
+                let mut state = self.state.borrow_mut();
+                let current_dir = state.path(id).to_path_buf();
+                let is_loading = state.pane(id).loading;
+                let is_search = !state.pane(id).query.is_empty();
+                if is_loading && !is_search {
+                    let dir_uncached = state.directories.get(&current_dir).is_none();
+                    let refreshing_same_dir = state
+                        .pane(id)
+                        .loaded_path
+                        .as_deref()
+                        .is_some_and(|prev| ui_sync::same_path(prev, &current_dir));
+                    if dir_uncached && refreshing_same_dir {
+                        state.folder_sizes.invalidate_prefix(&current_dir);
+                        state.folder_sizes.invalidate_ancestors(&current_dir);
+                    }
+                    false
+                } else if !is_loading {
+                    state.pane_mut(id).loaded_path = Some(current_dir);
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_queue_sizes {
+                self.queue_folder_sizes(id);
+            }
+        }
+
         let work = {
             let mut state = self.state.borrow_mut();
             let mut candidates = HashMap::new();
@@ -288,6 +322,122 @@ impl Controller {
         }
     }
 
+    /// Asynchronously computes recursive folder sizes for directories in the pane with bounded concurrency.
+    ///
+    /// Checks [`FolderSizeCache`] first and spawns up to [`MAX_FOLDER_SIZE_CONCURRENCY`] concurrent
+    /// folder size walks tagged with the pane's [`GenerationId`] and `folder_size_cancel` token.
+    pub(crate) fn queue_folder_sizes(&self, id: PaneId) {
+        let (generation, cancel, pending, any_cached_applied) = {
+            let mut state = self.state.borrow_mut();
+            let mut cached_hits = Vec::new();
+            let mut pending = Vec::new();
+            for (index, entry) in state.pane(id).entries.iter().enumerate() {
+                if !entry.is_dir() || entry.is_symlink || entry.attributes.reparse_point {
+                    continue;
+                }
+                if let Some(cached) = state.folder_sizes.get(&entry.path) {
+                    if entry.size != cached.total_bytes {
+                        cached_hits.push((index, cached.total_bytes));
+                    }
+                } else {
+                    pending.push(entry.path.clone());
+                }
+            }
+            let any_cached = !cached_hits.is_empty();
+            let pane = state.pane_mut(id);
+            for (index, bytes) in cached_hits {
+                if let Some(entry) = pane.entries.get_mut(index) {
+                    entry.size = bytes;
+                }
+            }
+            let (generation, cancel) = pane.restart_folder_sizes();
+            if any_cached {
+                ui_sync::update_size_bars(&state, id);
+            }
+            (generation, cancel, pending, any_cached)
+        };
+
+        if any_cached_applied && let Some(ui) = self.ui.upgrade() {
+            self.sync_pane(&ui, id);
+        }
+
+        if pending.is_empty() {
+            return;
+        }
+
+        let semaphore = Arc::new(Semaphore::new(MAX_FOLDER_SIZE_CONCURRENCY));
+        for path in pending {
+            let sem = Arc::clone(&semaphore);
+            let cancel = cancel.clone();
+            let shutdown = self.shutdown.clone();
+            let weak = self.ui.clone();
+            self.runtime.spawn(async move {
+                let permit = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = shutdown.cancelled() => return,
+                    permit = sem.acquire_owned() => match permit {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    },
+                };
+                let result =
+                    compute_folder_size(path.clone(), DEFAULT_MAX_FOLDER_SIZE_ENTRIES, cancel.clone())
+                        .await;
+                drop(permit);
+                match result {
+                    Ok(size) => {
+                        if cancel.is_cancelled() || shutdown.is_cancelled() {
+                            return;
+                        }
+                        post(&weak, move |app, ui| {
+                            app.folder_size_loaded(ui, id, generation, path, size)
+                        });
+                    }
+                    Err(OnyxError::Cancelled) => {}
+                    Err(error) => {
+                        tracing::debug!(path = %path.display(), %error, "folder size calculation skipped");
+                    }
+                }
+            });
+        }
+    }
+
+    fn folder_size_loaded(
+        &self,
+        ui: &OnyxWindow,
+        id: PaneId,
+        generation: GenerationId,
+        path: PathBuf,
+        size: FolderSizeResult,
+    ) {
+        let updated = {
+            let mut state = self.state.borrow_mut();
+            let cached = CachedFolderSize::new(size.total_bytes, size.file_count, size.truncated);
+            state.folder_sizes.put(&path, cached);
+            let pane = state.pane_mut(id);
+            if pane.generation != generation
+                || pane.cancel.is_cancelled()
+                || pane.folder_size_cancel.is_cancelled()
+            {
+                return;
+            }
+            if let Some(entry) = pane
+                .entries
+                .iter_mut()
+                .find(|entry| ui_sync::same_path(&entry.path, &path))
+            {
+                entry.size = size.total_bytes;
+                ui_sync::update_size_bars(&state, id);
+                true
+            } else {
+                false
+            }
+        };
+        if updated {
+            self.sync_pane(ui, id);
+        }
+    }
+
     pub(crate) fn search_changed(&self, ui: &OnyxWindow, query: &str, debounce: bool) {
         let id = self.active();
         let query = query.trim();
@@ -416,6 +566,7 @@ impl Controller {
         self.sync_pane(ui, id);
         self.update_preview(ui);
         self.queue_thumbnails(id);
+        self.queue_folder_sizes(id);
     }
 
     pub(crate) fn start_incremental_indexer(

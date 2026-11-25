@@ -1,4 +1,4 @@
-use onyx_cache::RgbaImageData;
+use onyx_cache::{CachedFolderSize, RgbaImageData};
 use onyx_config::AppConfig;
 use onyx_core::{
     DriveInfo, FileEntry, KnownFolder, KnownFolderKind, PaneId, SortColumn, SortDirection,
@@ -240,6 +240,70 @@ pub(crate) fn thumbnail_image(img: &ThumbnailImage) -> Image {
     ))
 }
 
+pub(crate) fn format_folder_size_label(size: CachedFolderSize) -> SharedString {
+    if size.truncated {
+        format!("{}+", format_bytes(size.total_bytes)).into()
+    } else {
+        format_bytes(size.total_bytes).into()
+    }
+}
+
+pub(crate) fn compute_size_ratio(known_bytes: Option<u64>, max_bytes: u64) -> f32 {
+    match known_bytes {
+        Some(bytes) if max_bytes > 0 && bytes > 0 => {
+            ((bytes as f64) / (max_bytes as f64)).clamp(0.0, 1.0) as f32
+        }
+        _ => 0.0,
+    }
+}
+
+pub(crate) fn max_entry_bytes(state: &State, entries: &[FileEntry]) -> u64 {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            if entry.is_dir() {
+                state.folder_sizes.get(&entry.path).map(|s| s.total_bytes)
+            } else {
+                Some(entry.size)
+            }
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+pub(crate) fn update_size_bars(state: &State, id: PaneId) {
+    let pane = state.pane(id);
+    let max_bytes = max_entry_bytes(state, &pane.entries);
+
+    for (index, entry) in pane.entries.iter().enumerate() {
+        let (known_bytes, new_label) = if entry.is_dir() {
+            match state.folder_sizes.get(&entry.path) {
+                Some(cached) => (
+                    Some(cached.total_bytes),
+                    Some(format_folder_size_label(cached)),
+                ),
+                None => (None, None),
+            }
+        } else {
+            (Some(entry.size), None)
+        };
+        let ratio = compute_size_ratio(known_bytes, max_bytes);
+        if let Some(mut row) = pane.model.row_data(index) {
+            let label_changed = new_label
+                .as_ref()
+                .is_some_and(|label| &row.size_label != label);
+            let ratio_changed = (row.size_ratio - ratio).abs() > 1e-5;
+            if label_changed || ratio_changed {
+                if let Some(label) = new_label {
+                    row.size_label = label;
+                }
+                row.size_ratio = ratio;
+                pane.model.set_row_data(index, row);
+            }
+        }
+    }
+}
+
 pub(crate) fn rows(state: &State, id: PaneId) {
     let pane = state.pane(id);
     pane.model
@@ -253,6 +317,7 @@ pub(crate) fn file_rows<'a>(
 ) -> impl Iterator<Item = UiFileEntry> + 'a {
     let selected = state.tab(id).and_then(|tab| tab.selected_paths.first());
     let grid_mode = state.config.default_view == ViewMode::Grid;
+    let max_bytes = max_entry_bytes(state, &state.pane(id).entries);
     let mut images = HashMap::new();
     entries.iter().map(move |entry| {
         let key = icon_key(entry);
@@ -271,16 +336,27 @@ pub(crate) fn file_rows<'a>(
         } else {
             None
         };
+        let (size_label, size_ratio) = if entry.is_dir() {
+            match state.folder_sizes.get(&entry.path) {
+                Some(cached) => (
+                    format_folder_size_label(cached),
+                    compute_size_ratio(Some(cached.total_bytes), max_bytes),
+                ),
+                None => ("".into(), 0.0),
+            }
+        } else {
+            (
+                format_bytes(entry.size).into(),
+                compute_size_ratio(Some(entry.size), max_bytes),
+            )
+        };
         UiFileEntry {
             path: display_path(&entry.path),
             name: entry.name.as_str().into(),
             modified: format_timestamp(entry.modified).into(),
             type_label: entry.type_label.as_str().into(),
-            size_label: if entry.is_dir() {
-                "".into()
-            } else {
-                format_bytes(entry.size).into()
-            },
+            size_label,
+            size_ratio,
             is_dir: entry.is_dir(),
             is_hidden: entry.attributes.hidden,
             is_symlink: entry.is_symlink,
@@ -357,7 +433,10 @@ pub(crate) fn status(ui: &OnyxWindow, state: &State) {
     ui.set_has_archive_selection(selected.is_some_and(|e| !e.is_dir() && is_zip_path(&e.path)));
     ui.set_status_selection_text(selected.map_or_else(Default::default, |entry| {
         if entry.is_dir() {
-            "1 selected".into()
+            match state.folder_sizes.get(&entry.path) {
+                Some(cached) => format!("1 selected · {}", format_folder_size_label(cached)).into(),
+                None => "1 selected".into(),
+            }
         } else {
             format!("1 selected · {}", format_bytes(entry.size)).into()
         }
@@ -507,4 +586,24 @@ fn metadata(ui: &OnyxWindow, fields: impl IntoIterator<Item = (String, String)>)
             value: value.into(),
         }
     })));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_size_labels_and_proportional_ratios() {
+        let exact = CachedFolderSize::new(1536, 4, false);
+        let trunc = CachedFolderSize::new(10 * 1024 * 1024, 100_000, true);
+
+        assert_eq!(format_folder_size_label(exact).as_str(), "1.50 KB");
+        assert_eq!(format_folder_size_label(trunc).as_str(), "10.0 MB+");
+
+        assert_eq!(compute_size_ratio(None, 1000), 0.0);
+        assert_eq!(compute_size_ratio(Some(0), 1000), 0.0);
+        assert_eq!(compute_size_ratio(Some(500), 0), 0.0);
+        assert!((compute_size_ratio(Some(250), 1000) - 0.25).abs() < 1e-6);
+        assert!((compute_size_ratio(Some(1000), 1000) - 1.0).abs() < 1e-6);
+    }
 }

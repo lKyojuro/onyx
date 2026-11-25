@@ -1,5 +1,5 @@
 use lru::LruCache;
-use onyx_core::FileEntry;
+use onyx_core::{FileEntry, normalize_display_path};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -11,6 +11,8 @@ pub const DEFAULT_DIRECTORY_CACHE_CAPACITY: usize = 64;
 pub const DEFAULT_ICON_CACHE_CAPACITY: usize = 512;
 /// Default maximum number of cached thumbnails.
 pub const DEFAULT_THUMBNAIL_CACHE_CAPACITY: usize = 128;
+/// Default maximum number of cached folder size calculations.
+pub const DEFAULT_FOLDER_SIZE_CACHE_CAPACITY: usize = 512;
 
 /// Decoded RGBA8 image buffer used by icon and thumbnail caches.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,6 +273,156 @@ impl fmt::Debug for ThumbnailCache {
     }
 }
 
+/// Cached recursive folder size entry stored in [`FolderSizeCache`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CachedFolderSize {
+    pub total_bytes: u64,
+    pub file_count: u64,
+    pub truncated: bool,
+}
+
+impl CachedFolderSize {
+    /// Creates a new cached folder size entry.
+    #[must_use]
+    pub const fn new(total_bytes: u64, file_count: u64, truncated: bool) -> Self {
+        Self {
+            total_bytes,
+            file_count,
+            truncated,
+        }
+    }
+}
+
+fn normalize_folder_key(path: &Path) -> String {
+    let normalized = normalize_display_path(path).replace('/', "\\");
+    let trimmed = normalized.trim_end_matches('\\');
+    if trimmed.len() == 2 && trimmed.as_bytes()[1] == b':' {
+        format!("{trimmed}\\").to_ascii_lowercase()
+    } else if trimmed.is_empty() {
+        normalized.to_ascii_lowercase()
+    } else {
+        trimmed.to_ascii_lowercase()
+    }
+}
+
+/// Thread-safe bounded LRU cache for recursive folder sizes keyed by normalized path.
+pub struct FolderSizeCache {
+    inner: Mutex<LruCache<String, CachedFolderSize>>,
+}
+
+impl FolderSizeCache {
+    /// Creates a folder size cache with the given capacity (minimum 1).
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: Mutex::new(LruCache::new(non_zero_capacity(capacity))),
+        }
+    }
+
+    /// Retrieves a cached folder size for `path`, promoting it to most-recently-used.
+    #[must_use]
+    pub fn get(&self, path: &Path) -> Option<CachedFolderSize> {
+        let key = normalize_folder_key(path);
+        let mut guard = lock_unpoisoned(&self.inner);
+        guard.get(&key).copied()
+    }
+
+    /// Inserts or updates a folder size in the cache under its normalized path key.
+    pub fn put(&self, path: impl AsRef<Path>, size: CachedFolderSize) {
+        let key = normalize_folder_key(path.as_ref());
+        let mut guard = lock_unpoisoned(&self.inner);
+        guard.put(key, size);
+    }
+
+    /// Removes a specific folder path from the cache. Returns `true` if it was present.
+    pub fn invalidate(&self, path: &Path) -> bool {
+        let key = normalize_folder_key(path);
+        let mut guard = lock_unpoisoned(&self.inner);
+        guard.pop(&key).is_some()
+    }
+
+    /// Invalidates all cached folder sizes at or beneath `prefix`.
+    /// Returns the number of entries removed.
+    pub fn invalidate_prefix(&self, prefix: &Path) -> usize {
+        let prefix_key = normalize_folder_key(prefix);
+        let prefix_path = Path::new(&prefix_key);
+        let mut guard = lock_unpoisoned(&self.inner);
+        let to_remove: Vec<String> = guard
+            .iter()
+            .filter_map(|(k, _)| {
+                let k_path = Path::new(k);
+                (k == &prefix_key || k_path.starts_with(prefix_path)).then(|| k.clone())
+            })
+            .collect();
+        let removed = to_remove.len();
+        for key in to_remove {
+            guard.pop(&key);
+        }
+        removed
+    }
+
+    /// Invalidates any cached ancestor folders that contain `path`.
+    /// Returns the number of entries removed.
+    pub fn invalidate_ancestors(&self, path: &Path) -> usize {
+        let target_key = normalize_folder_key(path);
+        let target_path = Path::new(&target_key);
+        let mut guard = lock_unpoisoned(&self.inner);
+        let to_remove: Vec<String> = guard
+            .iter()
+            .filter_map(|(k, _)| {
+                let k_path = Path::new(k);
+                (k == &target_key || target_path.starts_with(k_path)).then(|| k.clone())
+            })
+            .collect();
+        let removed = to_remove.len();
+        for key in to_remove {
+            guard.pop(&key);
+        }
+        removed
+    }
+
+    /// Clears all cached folder sizes.
+    pub fn clear(&self) {
+        let mut guard = lock_unpoisoned(&self.inner);
+        guard.clear();
+    }
+
+    /// Number of folder sizes currently cached.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let guard = lock_unpoisoned(&self.inner);
+        guard.len()
+    }
+
+    /// Returns `true` when no folder sizes are cached.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Maximum number of folder sizes this cache can hold.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        let guard = lock_unpoisoned(&self.inner);
+        guard.cap().get()
+    }
+}
+
+impl Default for FolderSizeCache {
+    fn default() -> Self {
+        Self::new(DEFAULT_FOLDER_SIZE_CACHE_CAPACITY)
+    }
+}
+
+impl fmt::Debug for FolderSizeCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FolderSizeCache")
+            .field("len", &self.len())
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -349,5 +501,33 @@ mod tests {
         assert!(thumbs.get(&p1).is_none());
         thumbs.clear();
         assert!(thumbs.is_empty());
+    }
+
+    #[test]
+    fn folder_size_cache_normalizes_paths_and_invalidates_prefixes() {
+        let cache = FolderSizeCache::new(3);
+        assert_eq!(cache.capacity(), 3);
+        assert!(cache.is_empty());
+
+        let s1 = CachedFolderSize::new(1024, 3, false);
+        let s2 = CachedFolderSize::new(2048, 8, true);
+        let s3 = CachedFolderSize::new(4096, 12, false);
+
+        cache.put(Path::new(r"C:\Projects\Onyx\"), s1);
+        cache.put(Path::new(r"c:/projects/onyx/crates"), s2);
+        cache.put(Path::new(r"D:\Other"), s3);
+
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.get(Path::new(r"c:\projects\onyx")), Some(s1));
+        assert_eq!(cache.get(Path::new(r"C:\Projects\Onyx\crates\")), Some(s2));
+
+        let removed = cache.invalidate_prefix(Path::new(r"C:\Projects\Onyx"));
+        assert_eq!(removed, 2);
+        assert!(cache.get(Path::new(r"C:\Projects\Onyx")).is_none());
+        assert!(cache.get(Path::new(r"C:\Projects\Onyx\crates")).is_none());
+        assert_eq!(cache.get(Path::new(r"D:\Other")), Some(s3));
+
+        cache.clear();
+        assert!(cache.is_empty());
     }
 }

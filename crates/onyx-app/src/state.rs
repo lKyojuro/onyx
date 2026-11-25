@@ -1,4 +1,4 @@
-use onyx_cache::{DirectoryCache, IconCache};
+use onyx_cache::{DirectoryCache, FolderSizeCache, IconCache};
 use onyx_config::{AppConfig, ConfigStore, SessionState};
 use onyx_core::{FileEntry, GenerationId, PaneId, TabManager, TabState, ThemeMode};
 use onyx_operations::FileOperationsEngine;
@@ -24,6 +24,8 @@ pub(crate) struct Pane {
     pub generation: GenerationId,
     pub cancel: CancellationToken,
     pub thumb_cancel: CancellationToken,
+    pub folder_size_cancel: CancellationToken,
+    pub loaded_path: Option<PathBuf>,
     pub entries: Vec<FileEntry>,
     pub model: Rc<VecModel<UiFileEntry>>,
     pub loading: bool,
@@ -36,9 +38,11 @@ impl Pane {
     pub fn restart(&mut self) -> (GenerationId, CancellationToken) {
         self.cancel.cancel();
         self.thumb_cancel.cancel();
+        self.folder_size_cancel.cancel();
         self.generation = self.generation.next();
         self.cancel = CancellationToken::new();
         self.thumb_cancel = self.cancel.child_token();
+        self.folder_size_cancel = self.cancel.child_token();
         self.loading = true;
         self.error.clear();
         (self.generation, self.cancel.clone())
@@ -48,6 +52,12 @@ impl Pane {
         self.thumb_cancel.cancel();
         self.thumb_cancel = self.cancel.child_token();
         (self.generation, self.thumb_cancel.clone())
+    }
+
+    pub fn restart_folder_sizes(&mut self) -> (GenerationId, CancellationToken) {
+        self.folder_size_cancel.cancel();
+        self.folder_size_cancel = self.cancel.child_token();
+        (self.generation, self.folder_size_cancel.clone())
     }
 }
 
@@ -62,6 +72,7 @@ pub(crate) struct State {
     pub dual: bool,
     pub quick_look: bool,
     pub directories: DirectoryCache,
+    pub folder_sizes: FolderSizeCache,
     pub icons: IconCache,
     pub pending_icons: HashSet<String>,
     pub missing_icons: HashSet<String>,
@@ -123,6 +134,7 @@ impl State {
             dual,
             quick_look: false,
             directories: DirectoryCache::default(),
+            folder_sizes: FolderSizeCache::default(),
             icons: IconCache::default(),
             pending_icons: HashSet::new(),
             missing_icons: HashSet::new(),
@@ -268,11 +280,16 @@ mod tests {
         assert!(!c1.is_cancelled());
         assert!(!tc2.is_cancelled());
 
-        // Restarting the pane increments generation and cancels both directory and thumbnail tokens.
+        let (fg1, fc1) = pane.restart_folder_sizes();
+        assert_eq!(fg1, g1);
+        assert!(!fc1.is_cancelled());
+
+        // Restarting the pane increments generation and cancels directory, thumbnail, and folder size tokens.
         let (g2, c2) = pane.restart();
         assert_eq!(g2, GenerationId::new(2));
         assert!(c1.is_cancelled());
         assert!(tc2.is_cancelled());
+        assert!(fc1.is_cancelled());
         assert!(!c2.is_cancelled());
     }
 
