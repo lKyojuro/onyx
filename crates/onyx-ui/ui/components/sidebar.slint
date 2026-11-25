@@ -13,6 +13,7 @@ component SidebarSectionHeader inherits Text {
 component SidebarNavRow inherits Rectangle {
     in property <string> label;
     in property <string> icon-glyph: "folder";
+    in property <image> icon;
     in property <bool> active: false;
     in property <bool> removable: false;
 
@@ -56,7 +57,14 @@ component SidebarNavRow inherits Rectangle {
             alignment: center;
             width: 18px;
 
-            OnyxIcon {
+            if root.icon.width > 0 : Image {
+                width: 18px;
+                height: 18px;
+                source: root.icon;
+                image-fit: contain;
+            }
+
+            if root.icon.width == 0 : OnyxIcon {
                 name: root.icon-glyph != "" ? root.icon-glyph : "folder";
                 icon-color: root.active ? OnyxTheme.accent-bright : OnyxTheme.text-secondary;
             }
@@ -176,6 +184,7 @@ export component Sidebar inherits Rectangle {
                 for folder in root.known-folders : SidebarNavRow {
                     label: folder.label;
                     icon-glyph: folder.icon_glyph != "" ? folder.icon_glyph : "folder";
+                    icon: folder.icon;
                     active: root.current-path == folder.path;
                     clicked => { root.navigate-to(root.active-pane, folder.path); }
                 }
@@ -220,7 +229,13 @@ export component Sidebar inherits Rectangle {
 
                             VerticalLayout {
                                 alignment: center;
-                                OnyxIcon {
+                                if drive.icon.width > 0 : Image {
+                                    width: 18px;
+                                    height: 18px;
+                                    source: drive.icon;
+                                    image-fit: contain;
+                                }
+                                if drive.icon.width == 0 : OnyxIcon {
                                     name: "drive";
                                     icon-color: OnyxTheme.accent-bright;
                                 }

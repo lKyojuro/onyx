@@ -79,8 +79,21 @@ pub(crate) fn apply_window_theme(hwnd: isize, ui: &OnyxWindow) {
     }
 }
 
-pub(crate) fn known_folders(ui: &OnyxWindow, folders: Vec<KnownFolder>) {
-    ui.set_known_folders(model(folders.into_iter().map(|folder| {
+fn sidebar_icon(icon: Option<onyx_windows::RgbaIcon>) -> Image {
+    icon.map_or_else(Image::default, |icon| {
+        Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+            &icon.pixels,
+            icon.width,
+            icon.height,
+        ))
+    })
+}
+
+pub(crate) fn known_folders(
+    ui: &OnyxWindow,
+    folders: impl IntoIterator<Item = (KnownFolder, Option<onyx_windows::RgbaIcon>)>,
+) {
+    ui.set_known_folders(model(folders.into_iter().map(|(folder, icon)| {
         UiSidebarItem {
             label: folder.name.into(),
             path: display_path(&folder.path),
@@ -94,15 +107,17 @@ pub(crate) fn known_folders(ui: &OnyxWindow, folders: Vec<KnownFolder>) {
                 KnownFolderKind::Videos => "video",
             }
             .into(),
+            icon: sidebar_icon(icon),
             is_favorite: false,
         }
     })));
 }
 
-pub(crate) fn drives(ui: &OnyxWindow, drives: Vec<DriveInfo>) {
-    ui.set_drives(model(drives.into_iter().map(|drive| UiDriveItem {
+pub(crate) fn drives(ui: &OnyxWindow, drives: Vec<(DriveInfo, Option<onyx_windows::RgbaIcon>)>) {
+    ui.set_drives(model(drives.into_iter().map(|(drive, icon)| UiDriveItem {
         label: format!("{} ({})", drive.label, normalize_display_path(&drive.root)).into(),
         root: display_path(&drive.root),
+        icon: sidebar_icon(icon),
         filesystem: drive.filesystem.clone().into(),
         free_label: if drive.total_bytes == 0 {
             "".into()
@@ -150,6 +165,7 @@ pub(crate) fn chrome(ui: &OnyxWindow, state: &State) {
             label: item.name.as_str().into(),
             path: display_path(&item.path),
             icon_glyph: "star-filled".into(),
+            icon: Image::default(),
             is_favorite: true,
         }
     })));

@@ -26,7 +26,7 @@ pub use drives::{enumerate_drives, free_disk_space};
 pub use dwm::{
     apply_titlebar_colors, apply_window_backdrop, has_system_font_family, set_window_icon_from_exe,
 };
-pub use icons::{RgbaIcon, extract_file_icon_rgba};
+pub use icons::{RgbaIcon, extract_existing_icon_rgba, extract_file_icon_rgba};
 pub use known_folders::enumerate_known_folders;
 pub use shell::{
     TerminalProfile, launch_terminal, launch_terminal_with_profile, open_file, open_with_dialog,

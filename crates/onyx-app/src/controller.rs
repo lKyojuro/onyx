@@ -82,7 +82,7 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
     if let Some(color) = accent {
         ui.set_accent_color(color);
     }
-    ui_sync::known_folders(&ui, folders);
+    ui_sync::known_folders(&ui, folders.iter().cloned().map(|folder| (folder, None)));
     let state = State::new(store, config, session, home, path);
     ui.set_primary_entries(ModelRc::from(state.panes[0].model.clone()));
     ui.set_secondary_entries(ModelRc::from(state.panes[1].model.clone()));
@@ -128,7 +128,29 @@ pub(crate) fn run(runtime: Arc<Runtime>, path: Option<PathBuf>) -> AppResult<()>
     controller.runtime.spawn_blocking({
         let weak = controller.ui.clone();
         move || {
+            let folders: Vec<_> = folders
+                .into_iter()
+                .map(|folder| {
+                    let icon = onyx_windows::extract_existing_icon_rgba(&folder.path);
+                    (folder, icon)
+                })
+                .collect();
+            post(&weak, move |_, ui| ui_sync::known_folders(ui, folders));
+        }
+    });
+    controller.runtime.spawn_blocking({
+        let weak = controller.ui.clone();
+        move || {
             let drives = onyx_windows::enumerate_drives();
+            let initial_drives = drives.iter().cloned().map(|drive| (drive, None)).collect();
+            post(&weak, move |_, ui| ui_sync::drives(ui, initial_drives));
+            let drives = drives
+                .into_iter()
+                .map(|drive| {
+                    let icon = onyx_windows::extract_existing_icon_rgba(&drive.root);
+                    (drive, icon)
+                })
+                .collect();
             post(&weak, move |_, ui| ui_sync::drives(ui, drives));
         }
     });

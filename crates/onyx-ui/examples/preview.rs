@@ -197,6 +197,7 @@ fn main() -> Result<(), slint::PlatformError> {
             label: "Onyx".into(),
             path: "D:\\Onyx".into(),
             icon_glyph: "star-filled".into(),
+            icon: Image::default(),
             is_favorite: true,
         },
     ]))));
@@ -206,24 +207,28 @@ fn main() -> Result<(), slint::PlatformError> {
             label: "Desktop".into(),
             path: "C:\\Users\\User\\Desktop".into(),
             icon_glyph: "desktop".into(),
+            icon: Image::default(),
             is_favorite: false,
         },
         UiSidebarItem {
             label: "Downloads".into(),
             path: "C:\\Users\\User\\Downloads".into(),
             icon_glyph: "download".into(),
+            icon: Image::default(),
             is_favorite: false,
         },
         UiSidebarItem {
             label: "Documents".into(),
             path: "C:\\Users\\User\\Documents".into(),
             icon_glyph: "file".into(),
+            icon: Image::default(),
             is_favorite: false,
         },
         UiSidebarItem {
             label: "Pictures".into(),
             path: "C:\\Users\\User\\Pictures".into(),
             icon_glyph: "image".into(),
+            icon: Image::default(),
             is_favorite: false,
         },
     ]))));
@@ -231,6 +236,7 @@ fn main() -> Result<(), slint::PlatformError> {
     window.set_drives(ModelRc::from(Rc::new(VecModel::from(vec![
         UiDriveItem {
             label: "Windows (C:)".into(),
+            icon: Image::default(),
             root: "C:\\".into(),
             filesystem: "NTFS".into(),
             free_label: "148 GB free of 512 GB".into(),
@@ -238,6 +244,7 @@ fn main() -> Result<(), slint::PlatformError> {
         },
         UiDriveItem {
             label: "Data (D:)".into(),
+            icon: Image::default(),
             root: "D:\\".into(),
             filesystem: "NTFS".into(),
             free_label: "620 GB free of 1.0 TB".into(),
@@ -245,6 +252,7 @@ fn main() -> Result<(), slint::PlatformError> {
         },
         UiDriveItem {
             label: "Archive (E:)".into(),
+            icon: Image::default(),
             root: "E:\\".into(),
             filesystem: "NTFS".into(),
             free_label: "42 GB free of 500 GB".into(),

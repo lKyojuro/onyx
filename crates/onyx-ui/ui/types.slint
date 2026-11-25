@@ -16,12 +16,14 @@ export struct UiSidebarItem {
     label: string,
     path: string,
     icon_glyph: string,
+    icon: image,
     is_favorite: bool,
 }
 
 export struct UiDriveItem {
     label: string,
     root: string,
+    icon: image,
     filesystem: string,
     free_label: string,
     usage_ratio: float,

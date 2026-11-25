@@ -5,16 +5,21 @@ use crate::to_wide_null;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::path::Path;
+use std::sync::{Mutex, PoisonError};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits,
     GetObjectW, HBITMAP, HDC, HGDIOBJ, ReleaseDC,
 };
-use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
+use windows::Win32::Storage::FileSystem::{
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES,
+};
 use windows::Win32::UI::Shell::{
-    SHFILEINFOW, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
+    SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 use windows::core::PCWSTR;
+
+static SHELL_ICON_LOOKUP: Mutex<()> = Mutex::new(());
 
 /// Decoded 32-bit straight-alpha RGBA icon bitmap.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,26 +106,46 @@ fn read_bitmap_bgra(hdc: HDC, hbm: HBITMAP, width: u32, height: u32) -> Option<V
 /// path does not need to exist on disk) and converts it into a top-down 32-bit RGBA image.
 #[must_use]
 pub fn extract_file_icon_rgba(path: &Path, is_dir: bool) -> Option<RgbaIcon> {
-    let _com = ComGuard::init_sta().ok();
-
-    let wide = to_wide_null(path.as_os_str());
     let attrs = if is_dir {
         FILE_ATTRIBUTE_DIRECTORY
     } else {
         FILE_ATTRIBUTE_NORMAL
     };
-    let flags = SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES;
+    extract_icon_rgba(path, attrs, SHGFI_USEFILEATTRIBUTES)
+}
+
+/// Resolves the Shell icon for an existing item, including known folders and drive roots.
+/// Call from a blocking worker because the Shell may access the filesystem or network.
+#[must_use]
+pub fn extract_existing_icon_rgba(path: &Path) -> Option<RgbaIcon> {
+    extract_icon_rgba(path, FILE_FLAGS_AND_ATTRIBUTES(0), SHGFI_FLAGS(0))
+}
+
+fn extract_icon_rgba(
+    path: &Path,
+    attrs: FILE_FLAGS_AND_ATTRIBUTES,
+    flags: SHGFI_FLAGS,
+) -> Option<RgbaIcon> {
+    let _com = ComGuard::init_sta().ok();
+    let wide = to_wide_null(path.as_os_str());
+    let flags = flags | SHGFI_ICON | SHGFI_SMALLICON;
     let mut sfi = SHFILEINFOW::default();
 
-    // SAFETY: `wide` is null-terminated UTF-16 and `sfi` is a valid `SHFILEINFOW` buffer.
-    let status = unsafe {
-        SHGetFileInfoW(
-            PCWSTR(wide.as_ptr()),
-            attrs,
-            Some(&raw mut sfi),
-            size_of::<SHFILEINFOW>() as u32,
-            flags,
-        )
+    let status = {
+        // Concurrent lookups can report success before they populate the icon handle.
+        let _lookup = SHELL_ICON_LOOKUP
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: `wide` is null-terminated UTF-16 and `sfi` is a valid `SHFILEINFOW` buffer.
+        unsafe {
+            SHGetFileInfoW(
+                PCWSTR(wide.as_ptr()),
+                attrs,
+                Some(&raw mut sfi),
+                size_of::<SHFILEINFOW>() as u32,
+                flags,
+            )
+        }
     };
 
     if status == 0 || sfi.hIcon.is_invalid() {
@@ -213,6 +238,15 @@ pub fn extract_file_icon_rgba(path: &Path, is_dir: bool) -> Option<RgbaIcon> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_shell_icon_for_existing_folder() {
+        let folder = tempfile::TempDir::new().unwrap();
+        let icon = extract_existing_icon_rgba(folder.path())
+            .expect("Windows should resolve the existing folder icon");
+        assert_eq!(icon.pixels.len(), (icon.width * icon.height * 4) as usize);
+        assert!(icon.pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
+    }
 
     #[test]
     fn extract_icons_for_file_and_directory() {
