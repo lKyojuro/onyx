@@ -602,6 +602,8 @@ export component OnyxWindow inherits Window {
                 submit-address(path) => { root.submit-address(path); }
                 address-edited(text) => { root.address-edited(text); }
                 address-suggestion-accepted(path) => {
+                    root.address-editing = false;
+                    root.address-suggestions = [];
                     key-handler.focus();
                     root.navigate-to(root.active-pane, path);
                 }
@@ -924,6 +926,57 @@ export component OnyxWindow inherits Window {
             close => {
                 root.close-archive-browser();
                 key-handler.focus();
+            }
+        }
+
+        // Live address bar autocomplete dropdown (rendered above Toolbar & FilePane)
+        if root.address-editing && root.address-suggestions.length > 0 : Rectangle {
+            x: nav-bar.address-bar-x;
+            y: nav-bar.address-bar-y;
+            width: nav-bar.address-bar-width;
+            height: root.address-suggestions.length * 28px + 8px;
+            background: OnyxTheme.bg-elevated;
+            border-width: 1px;
+            border-color: OnyxTheme.border-strong;
+            border-radius: OnyxTheme.radius-md;
+            drop-shadow-blur: 12px;
+            drop-shadow-color: #00000033;
+
+            VerticalLayout {
+                padding: 4px;
+                spacing: 2px;
+
+                for suggestion[idx] in root.address-suggestions : Rectangle {
+                    height: 26px;
+                    border-radius: OnyxTheme.radius-sm;
+                    background: (sug-ta.has-hover || idx == nav-bar.suggestion-index) ? OnyxTheme.bg-hover : transparent;
+                    accessible-role: button;
+                    accessible-label: "Navigate to " + suggestion;
+
+                    HorizontalLayout {
+                        padding-left: 8px;
+                        padding-right: 8px;
+
+                        Text {
+                            text: suggestion;
+                            font-size: OnyxTheme.font-sm;
+                            color: idx == nav-bar.suggestion-index ? OnyxTheme.text-primary : OnyxTheme.text-secondary;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+
+                    sug-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            nav-bar.suggestion-index = idx;
+                            root.address-editing = false;
+                            root.address-suggestions = [];
+                            key-handler.focus();
+                            root.navigate-to(root.active-pane, suggestion);
+                        }
+                    }
+                }
             }
         }
 

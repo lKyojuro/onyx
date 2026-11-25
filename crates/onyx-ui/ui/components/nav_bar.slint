@@ -10,6 +10,10 @@ export component NavBar inherits Rectangle {
     in-out property <string> address-text: "";
     in-out property <bool> address-editing: false;
     in-out property <[string]> address-suggestions;
+    in-out property <int> suggestion-index: -1;
+    out property <length> address-bar-x: address-box.absolute-position.x;
+    out property <length> address-bar-y: address-box.absolute-position.y + address-box.height + 4px;
+    out property <length> address-bar-width: address-box.width;
     in property <bool> can-go-back: false;
     in property <bool> can-go-forward: false;
     in property <bool> is-current-favorite: false;
@@ -34,9 +38,6 @@ export component NavBar inherits Rectangle {
         root.address-editing = true;
         address-input.focus();
     }
-
-    // Index of the keyboard-highlighted suggestion, -1 when none is highlighted.
-    property <int> suggestion-index: -1;
 
     changed address-editing => {
         if !root.address-editing {
@@ -105,7 +106,7 @@ export component NavBar inherits Rectangle {
         }
 
         // Breadcrumbs / Editable Address Bar
-        Rectangle {
+        address-box := Rectangle {
             horizontal-stretch: 1;
             min-width: 240px;
             height: 32px;
@@ -251,53 +252,6 @@ export component NavBar inherits Rectangle {
                             root.address-editing = false;
                             root.submit-address(text);
                             root.focus-main();
-                        }
-                    }
-                }
-            }
-
-            // Live autocomplete dropdown beneath the address bar
-            if root.address-editing && root.address-suggestions.length > 0 : Rectangle {
-                y: parent.height + 4px;
-                width: parent.width;
-                height: root.address-suggestions.length * 28px + 8px;
-                background: OnyxTheme.bg-elevated;
-                border-width: 1px;
-                border-color: OnyxTheme.border-strong;
-                border-radius: OnyxTheme.radius-md;
-                drop-shadow-blur: 12px;
-                drop-shadow-color: #00000033;
-
-                VerticalLayout {
-                    padding: 4px;
-                    spacing: 2px;
-
-                    for suggestion[idx] in root.address-suggestions : Rectangle {
-                        height: 26px;
-                        border-radius: OnyxTheme.radius-sm;
-                        background: (sug-ta.has-hover || idx == suggestion-index) ? OnyxTheme.bg-hover : transparent;
-                        accessible-role: button;
-                        accessible-label: "Navigate to " + suggestion;
-
-                        HorizontalLayout {
-                            padding-left: 8px;
-                            padding-right: 8px;
-
-                            Text {
-                                text: suggestion;
-                                font-size: OnyxTheme.font-sm;
-                                color: idx == suggestion-index ? OnyxTheme.text-primary : OnyxTheme.text-secondary;
-                                vertical-alignment: center;
-                                overflow: elide;
-                            }
-                        }
-
-                        sug-ta := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => {
-                                suggestion-index = idx;
-                                root.address-suggestion-accepted(suggestion);
-                            }
                         }
                     }
                 }

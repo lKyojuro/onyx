@@ -62,6 +62,7 @@ impl Controller {
     /// Computes live address bar suggestions off the UI thread.
     /// A monotonically increasing generation counter drops stale results.
     pub(crate) fn address_edited(&self, ui: &OnyxWindow, text: &str) {
+        let generation = self.address_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let expanded = onyx_core::expand_env_vars(text.trim());
         let Some((parent, prefix)) = onyx_core::split_autocomplete_prefix(&expanded) else {
             ui.set_address_suggestions(ModelRc::default());
@@ -72,7 +73,6 @@ impl Controller {
         } else {
             self.state.borrow().path(self.active()).join(parent)
         };
-        let generation = self.address_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let weak = self.ui.clone();
         self.runtime.spawn_blocking(move || {
             let suggestions = list_address_suggestions(&parent, &prefix);

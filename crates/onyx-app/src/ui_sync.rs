@@ -291,7 +291,7 @@ pub(crate) fn update_size_bars(state: &State, id: PaneId) {
         if let Some(mut row) = pane.model.row_data(index) {
             let label_changed = new_label
                 .as_ref()
-                .is_some_and(|label| &row.size_label != label);
+                .is_some_and(|label| row.size_label != *label);
             let ratio_changed = (row.size_ratio - ratio).abs() > 1e-5;
             if label_changed || ratio_changed {
                 if let Some(label) = new_label {
