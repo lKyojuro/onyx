@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod commands;
 mod content;
 mod controller;
+mod logging;
 mod navigation;
 mod operations;
 mod state;
@@ -18,7 +20,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::runtime::Builder;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::EnvFilter;
 
 type AppResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -47,18 +48,23 @@ fn launch_mode() -> AppResult<Launch> {
 }
 
 fn main() -> AppResult<()> {
+    onyx_windows::attach_parent_console();
     let mode = launch_mode()?;
     if matches!(mode, Launch::Version) {
         println!("onyx {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
+    let _logging = logging::init();
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "Onyx started");
+    let result = run(mode);
+    if let Err(error) = &result {
+        tracing::error!(%error, "Onyx exited with an error");
+    }
+    result
+}
+
+fn run(mode: Launch) -> AppResult<()> {
     let runtime = Arc::new(Builder::new_multi_thread().enable_all().build()?);
     match mode {
         Launch::Version => Ok(()),

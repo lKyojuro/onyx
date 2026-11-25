@@ -1,4 +1,4 @@
-//! Native Windows shell file icon extraction into top-down 32-bit RGBA pixel buffers.
+//! Native Windows shell file and folder icon extraction into top-down 32-bit RGBA pixel buffers.
 
 use crate::com::ComGuard;
 use crate::to_wide_null;
@@ -14,7 +14,8 @@ use windows::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES,
 };
 use windows::Win32::UI::Shell::{
-    SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_SMALLICON, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
+    SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON,
+    SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 use windows::core::PCWSTR;
@@ -27,6 +28,24 @@ pub struct RgbaIcon {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+}
+
+/// Requested Windows shell icon size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IconSize {
+    /// Standard small shell icon (`SHGFI_SMALLICON`, 16x16 at 100% DPI).
+    Small,
+    /// Standard large shell icon (`SHGFI_LARGEICON`, 32x32 at 100% DPI, scaled on HiDPI).
+    Large,
+}
+
+impl IconSize {
+    fn shgfi_flag(self) -> SHGFI_FLAGS {
+        match self {
+            Self::Small => SHGFI_SMALLICON,
+            Self::Large => SHGFI_LARGEICON,
+        }
+    }
 }
 
 struct IconGuard(HICON);
@@ -102,33 +121,11 @@ fn read_bitmap_bgra(hdc: HDC, hbm: HBITMAP, width: u32, height: u32) -> Option<V
     if lines == 0 { None } else { Some(buf) }
 }
 
-/// Extracts the small Windows shell icon for `path` (using `SHGFI_USEFILEATTRIBUTES` so the
-/// path does not need to exist on disk) and converts it into a top-down 32-bit RGBA image.
-#[must_use]
-pub fn extract_file_icon_rgba(path: &Path, is_dir: bool) -> Option<RgbaIcon> {
-    let attrs = if is_dir {
-        FILE_ATTRIBUTE_DIRECTORY
-    } else {
-        FILE_ATTRIBUTE_NORMAL
-    };
-    extract_icon_rgba(path, attrs, SHGFI_USEFILEATTRIBUTES)
-}
-
-/// Resolves the Shell icon for an existing item, including known folders and drive roots.
-/// Call from a blocking worker because the Shell may access the filesystem or network.
-#[must_use]
-pub fn extract_existing_icon_rgba(path: &Path) -> Option<RgbaIcon> {
-    extract_icon_rgba(path, FILE_FLAGS_AND_ATTRIBUTES(0), SHGFI_FLAGS(0))
-}
-
-fn extract_icon_rgba(
-    path: &Path,
+fn shgetfileinfo_icon(
+    wide_path: &[u16],
     attrs: FILE_FLAGS_AND_ATTRIBUTES,
     flags: SHGFI_FLAGS,
-) -> Option<RgbaIcon> {
-    let _com = ComGuard::init_sta().ok();
-    let wide = to_wide_null(path.as_os_str());
-    let flags = flags | SHGFI_ICON | SHGFI_SMALLICON;
+) -> Option<IconGuard> {
     let mut sfi = SHFILEINFOW::default();
 
     let status = {
@@ -136,10 +133,10 @@ fn extract_icon_rgba(
         let _lookup = SHELL_ICON_LOOKUP
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        // SAFETY: `wide` is null-terminated UTF-16 and `sfi` is a valid `SHFILEINFOW` buffer.
+        // SAFETY: `wide_path` is null-terminated UTF-16 and `sfi` is a valid `SHFILEINFOW` buffer.
         unsafe {
             SHGetFileInfoW(
-                PCWSTR(wide.as_ptr()),
+                PCWSTR(wide_path.as_ptr()),
                 attrs,
                 Some(&raw mut sfi),
                 size_of::<SHFILEINFOW>() as u32,
@@ -149,10 +146,13 @@ fn extract_icon_rgba(
     };
 
     if status == 0 || sfi.hIcon.is_invalid() {
-        return None;
+        None
+    } else {
+        Some(IconGuard(sfi.hIcon))
     }
-    let icon_guard = IconGuard(sfi.hIcon);
+}
 
+fn decode_icon_rgba(icon_guard: &IconGuard) -> Option<RgbaIcon> {
     let mut icon_info = ICONINFO::default();
     // SAFETY: `icon_guard.0` is a valid `HICON`. Returned bitmaps are wrapped immediately in RAII guards.
     unsafe { GetIconInfo(icon_guard.0, &raw mut icon_info) }.ok()?;
@@ -234,38 +234,147 @@ fn extract_icon_rgba(
     })
 }
 
+/// Extracts the large (32x32 at 100% DPI) Windows shell icon for `path` using
+/// `SHGFI_USEFILEATTRIBUTES` (so `path` does not need to exist on disk) and converts
+/// it into a top-down 32-bit RGBA image.
+#[must_use]
+pub fn extract_file_icon_rgba(path: &Path, is_dir: bool) -> Option<RgbaIcon> {
+    extract_file_icon_rgba_sized(path, is_dir, IconSize::Large)
+}
+
+/// Extracts a Windows shell icon at the requested [`IconSize`] for `path` using
+/// `SHGFI_USEFILEATTRIBUTES` (extension/type-based lookup without touching disk).
+#[must_use]
+pub fn extract_file_icon_rgba_sized(path: &Path, is_dir: bool, size: IconSize) -> Option<RgbaIcon> {
+    let _com = ComGuard::init_sta().ok();
+
+    let wide = to_wide_null(path.as_os_str());
+    let attrs = if is_dir {
+        FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        FILE_ATTRIBUTE_NORMAL
+    };
+    let flags = SHGFI_ICON | size.shgfi_flag() | SHGFI_USEFILEATTRIBUTES;
+    let icon_guard = shgetfileinfo_icon(&wide, attrs, flags)?;
+    decode_icon_rgba(&icon_guard)
+}
+
+/// Resolves the large (32x32 at 100% DPI) Shell icon for an existing item, including known
+/// folders and drive roots, without falling back to `SHGFI_USEFILEATTRIBUTES`.
+/// Call from a blocking worker because the Shell may access the filesystem or network.
+#[must_use]
+pub fn extract_existing_icon_rgba(path: &Path) -> Option<RgbaIcon> {
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    let _com = ComGuard::init_sta().ok();
+    let wide = to_wide_null(path.as_os_str());
+    let icon_guard = shgetfileinfo_icon(
+        &wide,
+        FILE_FLAGS_AND_ATTRIBUTES(0),
+        SHGFI_ICON | IconSize::Large.shgfi_flag(),
+    )?;
+    decode_icon_rgba(&icon_guard)
+}
+
+/// Extracts the large (32x32 at 100% DPI) native Windows shell icon for a real filesystem
+/// `path` (such as drives `C:\`, Known Folders like Downloads/Desktop/Documents/Pictures,
+/// UserProfile, custom folders, or files).
+///
+/// Queries `SHGetFileInfoW` directly against the path on disk so Windows returns authentic
+/// per-folder and per-drive icons, and falls back safely to `SHGFI_USEFILEATTRIBUTES` if
+/// the path does not exist or cannot be queried directly.
+#[must_use]
+pub fn extract_path_icon_rgba(path: &Path, is_dir: bool) -> Option<RgbaIcon> {
+    extract_path_icon_rgba_sized(path, is_dir, IconSize::Large)
+}
+
+/// Extracts a native Windows shell icon at the requested [`IconSize`] for a real filesystem
+/// `path`, with safe fallback to `SHGFI_USEFILEATTRIBUTES` if the path does not exist.
+#[must_use]
+pub fn extract_path_icon_rgba_sized(path: &Path, is_dir: bool, size: IconSize) -> Option<RgbaIcon> {
+    let _com = ComGuard::init_sta().ok();
+
+    let wide = to_wide_null(path.as_os_str());
+    let direct_flags = SHGFI_ICON | size.shgfi_flag();
+    let icon_guard = if !path.as_os_str().is_empty() {
+        shgetfileinfo_icon(&wide, FILE_FLAGS_AND_ATTRIBUTES(0), direct_flags)
+    } else {
+        None
+    }
+    .or_else(|| {
+        let attrs = if is_dir {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            FILE_ATTRIBUTE_NORMAL
+        };
+        shgetfileinfo_icon(&wide, attrs, direct_flags | SHGFI_USEFILEATTRIBUTES)
+    })?;
+
+    decode_icon_rgba(&icon_guard)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn assert_valid_rgba_icon(icon: &RgbaIcon, min_dim: u32) {
+        assert!(
+            icon.width >= min_dim && icon.height >= min_dim,
+            "expected icon at least {min_dim}x{min_dim}, got {}x{}",
+            icon.width,
+            icon.height
+        );
+        assert_eq!(icon.width, icon.height);
+        assert_eq!(icon.pixels.len(), (icon.width * icon.height * 4) as usize);
+        assert!(
+            icon.pixels.chunks_exact(4).any(|px| px[3] > 0),
+            "icon should contain at least one visible (non-transparent) pixel"
+        );
+    }
 
     #[test]
     fn resolves_shell_icon_for_existing_folder() {
         let folder = tempfile::TempDir::new().unwrap();
         let icon = extract_existing_icon_rgba(folder.path())
             .expect("Windows should resolve the existing folder icon");
-        assert_eq!(icon.pixels.len(), (icon.width * icon.height * 4) as usize);
-        assert!(icon.pixels.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert_valid_rgba_icon(&icon, 32);
     }
 
     #[test]
-    fn extract_icons_for_file_and_directory() {
+    fn extract_large_icons_for_file_and_directory() {
         let file_icon = extract_file_icon_rgba(Path::new("example.txt"), false)
-            .expect("Windows should provide a small icon for .txt");
-        assert!(file_icon.width > 0);
-        assert!(file_icon.height > 0);
-        assert_eq!(
-            file_icon.pixels.len(),
-            (file_icon.width * file_icon.height * 4) as usize
-        );
+            .expect("Windows should provide a large icon for .txt");
+        assert_valid_rgba_icon(&file_icon, 32);
 
         let dir_icon = extract_file_icon_rgba(Path::new("folder"), true)
-            .expect("Windows should provide a small icon for directories");
-        assert!(dir_icon.width > 0);
-        assert!(dir_icon.height > 0);
-        assert_eq!(
-            dir_icon.pixels.len(),
-            (dir_icon.width * dir_icon.height * 4) as usize
-        );
+            .expect("Windows should provide a large icon for directories");
+        assert_valid_rgba_icon(&dir_icon, 32);
+
+        let small_icon =
+            extract_file_icon_rgba_sized(Path::new("example.txt"), false, IconSize::Small)
+                .expect("Windows should provide a small icon for .txt");
+        assert_valid_rgba_icon(&small_icon, 16);
+        assert!(file_icon.width >= small_icon.width);
+    }
+
+    #[test]
+    fn extract_path_icons_for_real_drive_folder_and_missing_fallback() {
+        let drive_icon = extract_path_icon_rgba(Path::new("C:\\"), true)
+            .expect("Windows should provide a large shell icon for C:\\");
+        assert_valid_rgba_icon(&drive_icon, 32);
+
+        let temp_dir = std::env::temp_dir();
+        let folder_icon = extract_path_icon_rgba(&temp_dir, true)
+            .expect("Windows should provide a large shell icon for an existing directory");
+        assert_valid_rgba_icon(&folder_icon, 32);
+
+        let missing_fallback = extract_path_icon_rgba(
+            Path::new("C:\\__onyx_nonexistent_path_for_icon_test__\\sample.rs"),
+            false,
+        )
+        .expect("Missing path should fall back to SHGFI_USEFILEATTRIBUTES");
+        assert_valid_rgba_icon(&missing_fallback, 32);
     }
 }

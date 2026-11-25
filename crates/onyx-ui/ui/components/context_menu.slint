@@ -1,0 +1,404 @@
+import { OnyxTheme } from "../tokens.slint";
+import { OnyxIcon, OnyxIconSize } from "icons.slint";
+
+component ContextMenuRow inherits Rectangle {
+    in property <string> label: "";
+    in property <string> icon-name: "";
+    in property <string> shortcut: "";
+    in property <bool> enabled: true;
+    in property <bool> danger: false;
+    in property <bool> highlighted: false;
+
+    callback activated();
+    callback hovered();
+
+    property <bool> is-active: root.enabled && (ta.has-hover || root.highlighted);
+
+    height: 30px;
+    border-radius: OnyxTheme.radius-sm;
+    background: !root.enabled
+        ? transparent
+        : (root.danger && root.is-active
+            ? OnyxTheme.danger-bg
+            : (root.is-active ? OnyxTheme.bg-hover : transparent));
+
+    animate background { duration: 120ms; easing: ease-out; }
+
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.activated(); }
+        changed has-hover => {
+            if self.has-hover && root.enabled {
+                root.hovered();
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 9px;
+        opacity: root.enabled ? 1.0 : 0.42;
+
+        VerticalLayout {
+            alignment: center;
+            width: 16px;
+
+            if root.icon-name != "" : OnyxIcon {
+                name: root.icon-name;
+                size: OnyxIconSize.standard;
+                icon-color: root.danger && root.is-active
+                    ? OnyxTheme.danger
+                    : (root.is-active ? OnyxTheme.accent-bright : OnyxTheme.text-secondary);
+            }
+        }
+
+        Text {
+            text: root.label;
+            font-size: OnyxTheme.font-sm;
+            font-weight: root.is-active ? 500 : 400;
+            color: root.danger && root.is-active
+                ? OnyxTheme.danger
+                : OnyxTheme.text-primary;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+
+        if root.shortcut != "" : Text {
+            text: root.shortcut;
+            font-size: OnyxTheme.font-xs;
+            color: OnyxTheme.text-muted;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component ContextMenuSeparator inherits Rectangle {
+    height: 9px;
+    background: transparent;
+
+    Rectangle {
+        x: 8px;
+        y: 4px;
+        width: parent.width - 16px;
+        height: 1px;
+        background: OnyxTheme.border-subtle;
+    }
+}
+
+// Fast theme-aware custom right-click context menu overlay
+export component CustomContextMenu inherits Rectangle {
+    in property <bool> open: false;
+    in property <length> anchor-x: 0px;
+    in property <length> anchor-y: 0px;
+    in property <bool> is-background: false;
+    in property <bool> is-dir: false;
+    in property <bool> can-paste: false;
+
+    callback close();
+    callback action-open();
+    callback action-open-in-new-tab();
+    callback action-open-with();
+    callback action-cut();
+    callback action-copy();
+    callback action-paste();
+    callback action-copy-path();
+    callback action-rename();
+    callback action-duplicate();
+    callback action-open-terminal();
+    callback action-properties();
+    callback action-delete();
+    callback action-new-folder();
+    callback action-refresh();
+    callback action-more-options();
+
+    property <int> focused-idx: -1;
+    property <int> item-count: root.is-background ? 5 : (root.is-dir ? 13 : 12);
+
+    public function focus-menu() {
+        root.focused-idx = -1;
+        menu-fs.focus();
+    }
+
+    function activate-focused() {
+        if root.focused-idx < 0 {
+            return;
+        }
+        if root.is-background {
+            if root.focused-idx == 0 && root.can-paste { root.action-paste(); }
+            else if root.focused-idx == 1 { root.action-new-folder(); }
+            else if root.focused-idx == 2 { root.action-open-terminal(); }
+            else if root.focused-idx == 3 { root.action-refresh(); }
+            else if root.focused-idx == 4 { root.action-more-options(); }
+        } else {
+            if root.focused-idx == 0 { root.action-open(); }
+            else if root.is-dir && root.focused-idx == 1 { root.action-open-in-new-tab(); }
+            else if root.focused-idx == (root.is-dir ? 2 : 1) { root.action-open-with(); }
+            else if root.focused-idx == (root.is-dir ? 3 : 2) { root.action-cut(); }
+            else if root.focused-idx == (root.is-dir ? 4 : 3) { root.action-copy(); }
+            else if root.focused-idx == (root.is-dir ? 5 : 4) && root.can-paste { root.action-paste(); }
+            else if root.focused-idx == (root.is-dir ? 6 : 5) { root.action-copy-path(); }
+            else if root.focused-idx == (root.is-dir ? 7 : 6) { root.action-rename(); }
+            else if root.focused-idx == (root.is-dir ? 8 : 7) { root.action-duplicate(); }
+            else if root.focused-idx == (root.is-dir ? 9 : 8) { root.action-open-terminal(); }
+            else if root.focused-idx == (root.is-dir ? 10 : 9) { root.action-properties(); }
+            else if root.focused-idx == (root.is-dir ? 11 : 10) { root.action-delete(); }
+            else if root.focused-idx == (root.is-dir ? 12 : 11) { root.action-more-options(); }
+        }
+    }
+
+    opacity: root.open ? 1.0 : 0.0;
+    visible: self.opacity > 0.01;
+    background: transparent;
+
+    animate opacity { duration: 120ms; easing: ease-out; }
+
+    // Outside click dismisses immediately
+    TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down {
+                root.close();
+            }
+        }
+    }
+
+    menu-fs := FocusScope {
+        width: parent.width;
+        height: parent.height;
+
+        key-pressed(event) => {
+            if !root.open {
+                return reject;
+            }
+            if event.text == Key.Escape {
+                root.close();
+                return accept;
+            }
+            if event.text == Key.DownArrow {
+                root.focused-idx = root.focused-idx < root.item-count - 1 ? root.focused-idx + 1 : 0;
+                return accept;
+            }
+            if event.text == Key.UpArrow {
+                root.focused-idx = root.focused-idx > 0 ? root.focused-idx - 1 : root.item-count - 1;
+                return accept;
+            }
+            if event.text == Key.Return || event.text == " " {
+                root.activate-focused();
+                return accept;
+            }
+            return reject;
+        }
+    }
+
+    menu-card := Rectangle {
+        x: Math.clamp(root.anchor-x, 8px, Math.max(8px, root.width - self.width - 8px));
+        y: Math.clamp(root.anchor-y, 8px, Math.max(8px, root.height - self.height - 8px));
+        width: 248px;
+        height: menu-layout.preferred-height;
+        border-radius: OnyxTheme.radius-md;
+        border-width: 1px;
+        border-color: OnyxTheme.border-strong;
+        background: OnyxTheme.bg-elevated;
+        drop-shadow-blur: 18px;
+        drop-shadow-offset-y: 6px;
+        drop-shadow-color: #00000044;
+        clip: true;
+
+        // Absorb clicks inside menu card
+        TouchArea { }
+
+        // Specular top edge
+        Rectangle {
+            x: 8px;
+            y: 1px;
+            width: parent.width - 16px;
+            height: 1px;
+            background: OnyxTheme.border-specular;
+        }
+
+        menu-layout := VerticalLayout {
+            padding: 5px;
+            spacing: 1px;
+
+            // === ITEM MENU ===
+            if !root.is-background : VerticalLayout {
+                spacing: 1px;
+
+                ContextMenuRow {
+                    label: "Open";
+                    icon-name: "arrow-up-right";
+                    shortcut: "Enter";
+                    highlighted: root.focused-idx == 0;
+                    hovered => { root.focused-idx = 0; }
+                    activated => { root.action-open(); }
+                }
+
+                if root.is-dir : ContextMenuRow {
+                    label: "Open in New Tab";
+                    icon-name: "plus";
+                    highlighted: root.focused-idx == 1;
+                    hovered => { root.focused-idx = 1; }
+                    activated => { root.action-open-in-new-tab(); }
+                }
+
+                ContextMenuRow {
+                    label: "Open With...";
+                    icon-name: "file";
+                    highlighted: root.focused-idx == (root.is-dir ? 2 : 1);
+                    hovered => { root.focused-idx = root.is-dir ? 2 : 1; }
+                    activated => { root.action-open-with(); }
+                }
+
+                ContextMenuSeparator { }
+
+                ContextMenuRow {
+                    label: "Cut";
+                    icon-name: "cut";
+                    shortcut: "Ctrl+X";
+                    highlighted: root.focused-idx == (root.is-dir ? 3 : 2);
+                    hovered => { root.focused-idx = root.is-dir ? 3 : 2; }
+                    activated => { root.action-cut(); }
+                }
+
+                ContextMenuRow {
+                    label: "Copy";
+                    icon-name: "copy";
+                    shortcut: "Ctrl+C";
+                    highlighted: root.focused-idx == (root.is-dir ? 4 : 3);
+                    hovered => { root.focused-idx = root.is-dir ? 4 : 3; }
+                    activated => { root.action-copy(); }
+                }
+
+                ContextMenuRow {
+                    label: "Paste";
+                    icon-name: "paste";
+                    shortcut: "Ctrl+V";
+                    enabled: root.can-paste;
+                    highlighted: root.focused-idx == (root.is-dir ? 5 : 4);
+                    hovered => { root.focused-idx = root.is-dir ? 5 : 4; }
+                    activated => { root.action-paste(); }
+                }
+
+                ContextMenuRow {
+                    label: "Copy Path";
+                    icon-name: "copy";
+                    highlighted: root.focused-idx == (root.is-dir ? 6 : 5);
+                    hovered => { root.focused-idx = root.is-dir ? 6 : 5; }
+                    activated => { root.action-copy-path(); }
+                }
+
+                ContextMenuSeparator { }
+
+                ContextMenuRow {
+                    label: "Rename";
+                    icon-name: "rename";
+                    shortcut: "F2";
+                    highlighted: root.focused-idx == (root.is-dir ? 7 : 6);
+                    hovered => { root.focused-idx = root.is-dir ? 7 : 6; }
+                    activated => { root.action-rename(); }
+                }
+
+                ContextMenuRow {
+                    label: "Duplicate";
+                    icon-name: "duplicate";
+                    highlighted: root.focused-idx == (root.is-dir ? 8 : 7);
+                    hovered => { root.focused-idx = root.is-dir ? 8 : 7; }
+                    activated => { root.action-duplicate(); }
+                }
+
+                ContextMenuRow {
+                    label: "Open in Terminal";
+                    icon-name: "terminal";
+                    highlighted: root.focused-idx == (root.is-dir ? 9 : 8);
+                    hovered => { root.focused-idx = root.is-dir ? 9 : 8; }
+                    activated => { root.action-open-terminal(); }
+                }
+
+                ContextMenuRow {
+                    label: "Properties";
+                    icon-name: "info";
+                    shortcut: "Alt+Enter";
+                    highlighted: root.focused-idx == (root.is-dir ? 10 : 9);
+                    hovered => { root.focused-idx = root.is-dir ? 10 : 9; }
+                    activated => { root.action-properties(); }
+                }
+
+                ContextMenuRow {
+                    label: "Delete";
+                    icon-name: "trash";
+                    shortcut: "Del";
+                    danger: true;
+                    highlighted: root.focused-idx == (root.is-dir ? 11 : 10);
+                    hovered => { root.focused-idx = root.is-dir ? 11 : 10; }
+                    activated => { root.action-delete(); }
+                }
+
+                ContextMenuSeparator { }
+
+                ContextMenuRow {
+                    label: "More options (Windows)...";
+                    icon-name: "chevron-right";
+                    highlighted: root.focused-idx == (root.is-dir ? 12 : 11);
+                    hovered => { root.focused-idx = root.is-dir ? 12 : 11; }
+                    activated => { root.action-more-options(); }
+                }
+            }
+
+            // === BACKGROUND (EMPTY AREA) MENU ===
+            if root.is-background : VerticalLayout {
+                spacing: 1px;
+
+                ContextMenuRow {
+                    label: "Paste";
+                    icon-name: "paste";
+                    shortcut: "Ctrl+V";
+                    enabled: root.can-paste;
+                    highlighted: root.focused-idx == 0;
+                    hovered => { root.focused-idx = 0; }
+                    activated => { root.action-paste(); }
+                }
+
+                ContextMenuRow {
+                    label: "New Folder";
+                    icon-name: "folder-plus";
+                    highlighted: root.focused-idx == 1;
+                    hovered => { root.focused-idx = 1; }
+                    activated => { root.action-new-folder(); }
+                }
+
+                ContextMenuRow {
+                    label: "Open in Terminal";
+                    icon-name: "terminal";
+                    highlighted: root.focused-idx == 2;
+                    hovered => { root.focused-idx = 2; }
+                    activated => { root.action-open-terminal(); }
+                }
+
+                ContextMenuRow {
+                    label: "Refresh";
+                    icon-name: "refresh";
+                    shortcut: "F5";
+                    highlighted: root.focused-idx == 3;
+                    hovered => { root.focused-idx = 3; }
+                    activated => { root.action-refresh(); }
+                }
+
+                ContextMenuSeparator { }
+
+                ContextMenuRow {
+                    label: "More options (Windows)...";
+                    icon-name: "chevron-right";
+                    highlighted: root.focused-idx == 4;
+                    hovered => { root.focused-idx = 4; }
+                    activated => { root.action-more-options(); }
+                }
+            }
+        }
+    }
+}

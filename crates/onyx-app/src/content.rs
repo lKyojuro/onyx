@@ -175,8 +175,13 @@ impl Controller {
                 if shutdown.is_cancelled() {
                     return;
                 }
-                let image = onyx_windows::extract_file_icon_rgba(&path, is_dir)
-                    .map(|icon| RgbaImageData::new(icon.width, icon.height, icon.pixels));
+                let icon = if key.starts_with("path:") {
+                    onyx_windows::extract_path_icon_rgba(&path, is_dir)
+                } else {
+                    onyx_windows::extract_file_icon_rgba(&path, is_dir)
+                };
+                let image =
+                    icon.map(|icon| RgbaImageData::new(icon.width, icon.height, icon.pixels));
                 batch.push((key, image));
                 if batch.len() == 24 {
                     let filled = std::mem::replace(&mut batch, Vec::with_capacity(24));

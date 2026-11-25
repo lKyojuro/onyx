@@ -5,18 +5,21 @@
 
 pub mod clipboard;
 pub mod com;
+mod console;
 pub mod context_menu;
 pub mod dnd;
 pub mod drives;
 pub mod dwm;
 pub mod icons;
 pub mod known_folders;
+pub mod mouse_nav;
 pub mod shell;
 pub mod theme;
 pub mod usn;
 
 pub use clipboard::{get_clipboard_files, set_clipboard_files};
 pub use com::ComGuard;
+pub use console::attach_parent_console;
 pub use context_menu::show_context_menu;
 pub use dnd::{
     DragOutcome, DropEvent, DropTargetGuard, decode_cf_hdrop, encode_cf_hdrop,
@@ -26,8 +29,14 @@ pub use drives::{enumerate_drives, free_disk_space};
 pub use dwm::{
     apply_titlebar_colors, apply_window_backdrop, has_system_font_family, set_window_icon_from_exe,
 };
-pub use icons::{RgbaIcon, extract_existing_icon_rgba, extract_file_icon_rgba};
+pub use icons::{
+    IconSize, RgbaIcon, extract_existing_icon_rgba, extract_file_icon_rgba,
+    extract_file_icon_rgba_sized, extract_path_icon_rgba, extract_path_icon_rgba_sized,
+};
 pub use known_folders::enumerate_known_folders;
+pub use mouse_nav::{
+    MouseNavDirection, MouseNavHook, install_mouse_nav_hook, uninstall_mouse_nav_hook,
+};
 pub use shell::{
     TerminalProfile, launch_terminal, launch_terminal_with_profile, open_file, open_with_dialog,
     recycle_paths, show_properties_dialog,

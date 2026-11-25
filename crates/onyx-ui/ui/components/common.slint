@@ -100,7 +100,8 @@ export component FluentButton inherits Rectangle {
                     ? (ta.has-hover ? OnyxTheme.accent-subtle.brighter(12%) : OnyxTheme.accent-subtle)
                     : (ta.pressed ? OnyxTheme.bg-pressed : (ta.has-hover ? OnyxTheme.bg-hover : transparent));
 
-    animate background { duration: 110ms; easing: ease-out; }
+    animate background { duration: 130ms; easing: ease-out; }
+    animate border-color { duration: 130ms; easing: ease-out; }
 
     accessible-role: button;
     accessible-label: root.a11y-label;
@@ -165,7 +166,8 @@ export component FluentChip inherits Rectangle {
         ? OnyxTheme.accent-subtle
         : (interactive && ta.has-hover ? OnyxTheme.bg-hover : OnyxTheme.bg-badge);
 
-    animate background { duration: 100ms; }
+    animate background { duration: 130ms; easing: ease-out; }
+    animate border-color { duration: 130ms; easing: ease-out; }
 
     accessible-role: button;
     accessible-label: root.a11y-label;

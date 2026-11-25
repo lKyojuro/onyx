@@ -689,6 +689,7 @@ fn e2e_config_session_and_cache_crash_recovery() {
         secondary_path: Some(temp.path().to_path_buf()),
         window_width: 1600,
         window_height: 900,
+        ..SessionState::default()
     };
     store.save_session(&session).unwrap();
     assert_eq!(store.load_session(), session);

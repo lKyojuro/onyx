@@ -16,17 +16,19 @@ export struct UiSidebarItem {
     label: string,
     path: string,
     icon_glyph: string,
-    icon: image,
     is_favorite: bool,
+    icon: image,
+    has_icon: bool,
 }
 
 export struct UiDriveItem {
     label: string,
     root: string,
-    icon: image,
     filesystem: string,
     free_label: string,
     usage_ratio: float,
+    icon: image,
+    has_icon: bool,
 }
 
 export struct UiFileEntry {
