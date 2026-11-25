@@ -113,11 +113,12 @@ export component FilePane inherits Rectangle {
     in-out property <string> drag-source-name: "";
     in-out property <string> drag-source-dir: "";
     in-out property <bool> drag-source-is-dir: false;
+    in-out property <image> drag-source-icon;
+    in-out property <bool> drag-source-has-icon: false;
     in-out property <int> drag-source-pane: -1;
     in-out property <length> drag-x: 0px;
     in-out property <length> drag-y: 0px;
     in-out property <string> drag-hover-folder-path: "";
-    in-out property <string> drag-hover-folder-name: "";
     in-out property <int> drag-hover-pane: -1;
     in-out property <string> drag-hover-pane-path: "";
 
@@ -133,6 +134,10 @@ export component FilePane inherits Rectangle {
     property <int> grid-rows: root.entries.length == 0
         ? 0
         : Math.floor((root.entries.length + root.grid-columns - 1) / root.grid-columns);
+    // Keep room for file names when two panes and the preview share the window.
+    property <bool> show-type-column: self.width >= 520px;
+    property <bool> show-date-column: self.width >= 370px;
+    property <length> size-column-width: self.width >= 520px ? 88px : 72px;
 
     property <bool> is-pane-drop-hovered: root.dragging-active
         && root.dual-pane
@@ -143,6 +148,7 @@ export component FilePane inherits Rectangle {
         && root.drag-x <= self.absolute-position.x + self.width
         && root.drag-y >= self.absolute-position.y
         && root.drag-y < self.absolute-position.y + self.height;
+    property <bool> show-pane-drop-target: root.is-pane-drop-hovered && root.drag-hover-folder-path == "";
 
     changed is-pane-drop-hovered => {
         if self.is-pane-drop-hovered {
@@ -175,13 +181,13 @@ export component FilePane inherits Rectangle {
         // Compact pane path header in dual-pane mode
         if root.show-active-indicator : Rectangle {
             height: 26px;
-            background: OnyxTheme.bg-chrome;
+            background: root.show-pane-drop-target ? OnyxTheme.bg-selected : OnyxTheme.bg-chrome;
 
             Rectangle {
                 y: parent.height - 1px;
                 width: parent.width;
                 height: 1px;
-                background: OnyxTheme.border-subtle;
+                background: root.show-pane-drop-target ? OnyxTheme.accent-bright : OnyxTheme.border-subtle;
             }
 
             TouchArea {
@@ -234,6 +240,10 @@ export component FilePane inherits Rectangle {
             }
 
             HorizontalLayout {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: parent.height;
                 padding-left: 10px;
                 padding-right: 18px;
                 spacing: 4px;
@@ -251,7 +261,7 @@ export component FilePane inherits Rectangle {
                     }
                 }
 
-                ColumnHeaderButton {
+                if root.show-date-column : ColumnHeaderButton {
                     label: "Date modified";
                     column-index: 1;
                     active-column: root.sort-column;
@@ -264,7 +274,7 @@ export component FilePane inherits Rectangle {
                     }
                 }
 
-                ColumnHeaderButton {
+                if root.show-type-column : ColumnHeaderButton {
                     label: "Type";
                     column-index: 2;
                     active-column: root.sort-column;
@@ -283,7 +293,7 @@ export component FilePane inherits Rectangle {
                     active-column: root.sort-column;
                     ascending: root.sort-ascending;
                     text-align: right;
-                    width: 88px;
+                    width: root.size-column-width;
                     horizontal-stretch: 0;
                     clicked => {
                         root.set-active-pane(root.pane-index);
@@ -423,10 +433,8 @@ export component FilePane inherits Rectangle {
                     changed is-drop-target => {
                         if self.is-drop-target {
                             root.drag-hover-folder-path = entry.path;
-                            root.drag-hover-folder-name = entry.name;
                         } else if root.drag-hover-folder-path == entry.path {
                             root.drag-hover-folder-path = "";
-                            root.drag-hover-folder-name = "";
                         }
                     }
 
@@ -513,6 +521,8 @@ export component FilePane inherits Rectangle {
                                     root.drag-source-name = entry.name;
                                     root.drag-source-dir = root.current-path;
                                     root.drag-source-is-dir = entry.is_dir;
+                                    root.drag-source-icon = entry.icon;
+                                    root.drag-source-has-icon = entry.has_icon;
                                     root.drag-source-pane = root.pane-index;
                                 }
                                 if root.dragging-active {
@@ -555,7 +565,7 @@ export component FilePane inherits Rectangle {
                         }
 
                         // Date modified
-                        Text {
+                        if root.show-date-column : Text {
                             text: entry.modified;
                             font-size: OnyxTheme.font-xs;
                             color: OnyxTheme.text-secondary;
@@ -566,7 +576,7 @@ export component FilePane inherits Rectangle {
                         }
 
                         // Type
-                        Text {
+                        if root.show-type-column : Text {
                             text: entry.type_label;
                             font-size: OnyxTheme.font-xs;
                             color: OnyxTheme.text-secondary;
@@ -584,7 +594,7 @@ export component FilePane inherits Rectangle {
                             vertical-alignment: center;
                             horizontal-alignment: right;
                             overflow: elide;
-                            width: 88px;
+                            width: root.size-column-width;
                             horizontal-stretch: 0;
                         }
                     }
@@ -628,10 +638,8 @@ export component FilePane inherits Rectangle {
                         changed is-drop-target => {
                             if self.is-drop-target {
                                 root.drag-hover-folder-path = entry.path;
-                                root.drag-hover-folder-name = entry.name;
                             } else if root.drag-hover-folder-path == entry.path {
                                 root.drag-hover-folder-path = "";
-                                root.drag-hover-folder-name = "";
                             }
                         }
 
@@ -710,6 +718,8 @@ export component FilePane inherits Rectangle {
                                         root.drag-source-name = entry.name;
                                         root.drag-source-dir = root.current-path;
                                         root.drag-source-is-dir = entry.is_dir;
+                                        root.drag-source-icon = entry.has_thumbnail ? entry.thumbnail : entry.icon;
+                                        root.drag-source-has-icon = entry.has_thumbnail || entry.has_icon;
                                         root.drag-source-pane = root.pane-index;
                                     }
                                     if root.dragging-active {
@@ -783,17 +793,5 @@ export component FilePane inherits Rectangle {
                 }
             }
         }
-    }
-
-    // Dual-pane drop highlight overlay when dragging over opposite pane background
-    if root.is-pane-drop-hovered && root.drag-hover-folder-path == "" : Rectangle {
-        x: 4px;
-        y: 4px;
-        width: parent.width - 8px;
-        height: parent.height - 8px;
-        border-radius: OnyxTheme.radius-md;
-        border-width: 2px;
-        border-color: OnyxTheme.accent-bright;
-        background: OnyxTheme.accent-subtle;
     }
 }

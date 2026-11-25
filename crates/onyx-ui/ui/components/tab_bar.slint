@@ -11,7 +11,6 @@ export component TabBar inherits Rectangle {
     in property <length> drag-y: 0px;
     in property <string> drag-source-dir: "";
     in-out property <string> drag-hover-tab-path: "";
-    in-out property <string> drag-hover-tab-title: "";
 
     callback new-tab();
     callback close-tab(int);
@@ -82,10 +81,8 @@ export component TabBar inherits Rectangle {
                 changed is-drop-hovered => {
                     if self.is-drop-hovered {
                         root.drag-hover-tab-path = tab.path;
-                        root.drag-hover-tab-title = tab.title;
                     } else if root.drag-hover-tab-path == tab.path {
                         root.drag-hover-tab-path = "";
-                        root.drag-hover-tab-title = "";
                     }
                 }
 

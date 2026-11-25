@@ -133,13 +133,13 @@ export component OnyxWindow inherits Window {
     in-out property <string> drag-source-name: "";
     in-out property <string> drag-source-dir: "";
     in-out property <bool> drag-source-is-dir: false;
+    in-out property <image> drag-source-icon;
+    in-out property <bool> drag-source-has-icon: false;
     in-out property <int> drag-source-pane: -1;
     in-out property <length> drag-x: 0px;
     in-out property <length> drag-y: 0px;
     in-out property <string> drag-hover-folder-path: "";
-    in-out property <string> drag-hover-folder-name: "";
     in-out property <string> drag-hover-tab-path: "";
-    in-out property <string> drag-hover-tab-title: "";
     in-out property <int> drag-hover-pane: -1;
     in-out property <string> drag-hover-pane-path: "";
 
@@ -265,13 +265,6 @@ export component OnyxWindow inherits Window {
             : (root.drag-hover-pane != -1 && root.drag-hover-pane != root.drag-source-pane
                 ? root.drag-hover-pane-path
                 : ""));
-    property <string> resolved-drop-target-label: root.drag-hover-folder-name != ""
-        ? root.drag-hover-folder-name
-        : (root.drag-hover-tab-title != ""
-            ? root.drag-hover-tab-title
-            : (root.drag-hover-pane != -1 && root.drag-hover-pane != root.drag-source-pane
-                ? (root.drag-hover-pane == 0 ? "Primary Pane" : "Secondary Pane")
-                : ""));
 
     function clear-drag-state() {
         root.drag-generation += 1;
@@ -280,11 +273,11 @@ export component OnyxWindow inherits Window {
         root.drag-source-name = "";
         root.drag-source-dir = "";
         root.drag-source-is-dir = false;
+        root.drag-source-icon = @image-url("");
+        root.drag-source-has-icon = false;
         root.drag-source-pane = -1;
         root.drag-hover-folder-path = "";
-        root.drag-hover-folder-name = "";
         root.drag-hover-tab-path = "";
-        root.drag-hover-tab-title = "";
         root.drag-hover-pane = -1;
         root.drag-hover-pane-path = "";
     }
@@ -541,7 +534,6 @@ export component OnyxWindow inherits Window {
                 drag-y: root.drag-y;
                 drag-source-dir: root.drag-source-dir;
                 drag-hover-tab-path <=> root.drag-hover-tab-path;
-                drag-hover-tab-title <=> root.drag-hover-tab-title;
                 new-tab => { root.new-tab(); }
                 close-tab(id) => { root.close-tab(id); }
                 switch-tab(id) => { root.switch-tab(id); }
@@ -649,11 +641,12 @@ export component OnyxWindow inherits Window {
                     drag-source-name <=> root.drag-source-name;
                     drag-source-dir <=> root.drag-source-dir;
                     drag-source-is-dir <=> root.drag-source-is-dir;
+                    drag-source-icon <=> root.drag-source-icon;
+                    drag-source-has-icon <=> root.drag-source-has-icon;
                     drag-source-pane <=> root.drag-source-pane;
                     drag-x <=> root.drag-x;
                     drag-y <=> root.drag-y;
                     drag-hover-folder-path <=> root.drag-hover-folder-path;
-                    drag-hover-folder-name <=> root.drag-hover-folder-name;
                     drag-hover-pane <=> root.drag-hover-pane;
                     drag-hover-pane-path <=> root.drag-hover-pane-path;
                     select-entry(pane, idx) => {
@@ -704,11 +697,12 @@ export component OnyxWindow inherits Window {
                     drag-source-name <=> root.drag-source-name;
                     drag-source-dir <=> root.drag-source-dir;
                     drag-source-is-dir <=> root.drag-source-is-dir;
+                    drag-source-icon <=> root.drag-source-icon;
+                    drag-source-has-icon <=> root.drag-source-has-icon;
                     drag-source-pane <=> root.drag-source-pane;
                     drag-x <=> root.drag-x;
                     drag-y <=> root.drag-y;
                     drag-hover-folder-path <=> root.drag-hover-folder-path;
-                    drag-hover-folder-name <=> root.drag-hover-folder-name;
                     drag-hover-pane <=> root.drag-hover-pane;
                     drag-hover-pane-path <=> root.drag-hover-pane-path;
                     select-entry(pane, idx) => {
@@ -884,53 +878,45 @@ export component OnyxWindow inherits Window {
             }
         }
 
-        // Lightweight floating internal drag badge
+        // Fixed-size drag preview keeps the pointer and the destination visible.
         if root.dragging-active : Rectangle {
-            x: Math.clamp(root.drag-x + 14px, 8px, parent.width - self.width - 8px);
-            y: Math.clamp(root.drag-y + 14px, 8px, parent.height - self.height - 8px);
-            max-width: 280px;
-            border-radius: OnyxTheme.radius-md;
+            width: 180px;
+            height: 26px;
+            x: root.drag-x + self.width + 16px <= parent.width
+                ? root.drag-x + 12px
+                : Math.max(4px, root.drag-x - self.width - 12px);
+            y: root.drag-y + self.height + 16px <= parent.height
+                ? root.drag-y + 12px
+                : Math.max(4px, root.drag-y - self.height - 12px);
+            border-radius: OnyxTheme.radius-sm;
             border-width: 1px;
-            border-color: root.resolved-drop-target-path != "" ? OnyxTheme.accent-bright : OnyxTheme.border-strong;
+            border-color: OnyxTheme.border-strong;
             background: OnyxTheme.bg-elevated;
 
-            HorizontalLayout {
-                padding-left: 10px;
-                padding-right: 12px;
-                padding-top: 7px;
-                padding-bottom: 7px;
-                spacing: 8px;
-
-                VerticalLayout {
-                    alignment: center;
-                    OnyxIcon {
-                        name: root.drag-source-is-dir ? "folder" : "file";
-                        size: OnyxIconSize.standard;
-                        icon-color: root.drag-source-is-dir ? OnyxTheme.folder-tint : OnyxTheme.accent-bright;
-                    }
-                }
-
-                VerticalLayout {
-                    spacing: 1px;
-                    alignment: center;
-
-                    Text {
-                        text: root.drag-source-name;
-                        font-size: OnyxTheme.font-xs;
-                        font-weight: 600;
-                        color: OnyxTheme.text-primary;
-                        overflow: elide;
-                    }
-
-                    Text {
-                        text: root.resolved-drop-target-label != ""
-                            ? ("Drop into " + root.resolved-drop-target-label + " (Ctrl = Copy)")
-                            : "Drag onto a folder, tab, or pane";
-                        font-size: 11px;
-                        color: root.resolved-drop-target-label != "" ? OnyxTheme.accent-bright : OnyxTheme.text-muted;
-                        overflow: elide;
-                    }
-                }
+            if root.drag-source-has-icon : Image {
+                x: 6px;
+                y: 5px;
+                width: 16px;
+                height: 16px;
+                source: root.drag-source-icon;
+                image-fit: contain;
+            }
+            if !root.drag-source-has-icon : OnyxIcon {
+                x: 6px;
+                y: 5px;
+                size: OnyxIconSize.small;
+                name: root.drag-source-is-dir ? "folder" : "file";
+                icon-color: root.drag-source-is-dir ? OnyxTheme.folder-tint : OnyxTheme.file-tint;
+            }
+            Text {
+                x: 28px;
+                width: parent.width - 34px;
+                height: parent.height;
+                text: root.drag-source-name;
+                font-size: OnyxTheme.font-xs;
+                color: OnyxTheme.text-primary;
+                vertical-alignment: center;
+                overflow: elide;
             }
         }
     }
