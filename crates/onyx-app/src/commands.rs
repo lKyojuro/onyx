@@ -3,15 +3,22 @@ use onyx_ui::{OnyxWindow, UiCommandItem};
 use crate::controller::Controller;
 use crate::ui_sync;
 
-struct Command {
-    id: &'static str,
-    title: &'static str,
-    shortcut: &'static str,
-    category: &'static str,
-    run: fn(&Controller, &OnyxWindow),
+pub(crate) struct Command {
+    pub id: &'static str,
+    pub title: &'static str,
+    pub shortcut: &'static str,
+    pub category: &'static str,
+    pub run: fn(&Controller, &OnyxWindow),
 }
 
-const COMMANDS: &[Command] = &[
+pub(crate) const COMMANDS: &[Command] = &[
+    Command {
+        id: "settings",
+        title: "Open Settings",
+        shortcut: "Ctrl+,",
+        category: "Preferences",
+        run: Controller::toggle_settings,
+    },
     Command {
         id: "new-tab",
         title: "New Tab",
@@ -132,6 +139,41 @@ const COMMANDS: &[Command] = &[
         run: Controller::undo,
     },
     Command {
+        id: "external-drag",
+        title: "Drag to External App",
+        shortcut: "",
+        category: "Files",
+        run: Controller::external_drag,
+    },
+    Command {
+        id: "compress-zip",
+        title: "Compress to ZIP",
+        shortcut: "",
+        category: "Archive",
+        run: Controller::compress_zip,
+    },
+    Command {
+        id: "extract-here",
+        title: "Extract Here",
+        shortcut: "",
+        category: "Archive",
+        run: Controller::extract_here,
+    },
+    Command {
+        id: "extract-to-folder",
+        title: "Extract to Folder",
+        shortcut: "",
+        category: "Archive",
+        run: Controller::extract_to_folder,
+    },
+    Command {
+        id: "browse-archive",
+        title: "Browse Archive",
+        shortcut: "",
+        category: "Archive",
+        run: Controller::browse_archive,
+    },
+    Command {
         id: "terminal",
         title: "Open Terminal",
         shortcut: "Ctrl+` / Alt+T",
@@ -170,34 +212,67 @@ pub(crate) fn toggle(ui: &OnyxWindow) {
     ui.set_command_palette_open(open);
 }
 
+pub(crate) fn matching_commands(query: &str) -> impl Iterator<Item = &'static Command> + '_ {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    COMMANDS.iter().filter(move |command| {
+        let title = command.title.to_lowercase();
+        let category = command.category.to_lowercase();
+        let shortcut = command.shortcut.to_lowercase();
+        words.iter().all(|word| {
+            title.contains(word.as_str())
+                || category.contains(word.as_str())
+                || shortcut.contains(word.as_str())
+                || command.id.contains(word.as_str())
+        })
+    })
+}
+
 pub(crate) fn filter(ui: &OnyxWindow, query: &str) {
-    let query = query.to_lowercase();
-    ui.set_command_items(ui_sync::model(
-        COMMANDS
-            .iter()
-            .filter(|command| {
-                let title = command.title.to_lowercase();
-                let category = command.category.to_lowercase();
-                let shortcut = command.shortcut.to_lowercase();
-                query.split_whitespace().all(|word| {
-                    title.contains(word)
-                        || category.contains(word)
-                        || shortcut.contains(word)
-                        || command.id.contains(word)
-                })
-            })
-            .map(|command| UiCommandItem {
-                id: command.id.into(),
-                title: command.title.into(),
-                shortcut: command.shortcut.into(),
-                category: command.category.into(),
-            }),
-    ));
+    ui.set_command_items(ui_sync::model(matching_commands(query).map(|command| {
+        UiCommandItem {
+            id: command.id.into(),
+            title: command.title.into(),
+            shortcut: command.shortcut.into(),
+            category: command.category.into(),
+        }
+    })));
 }
 
 pub(crate) fn execute(app: &Controller, ui: &OnyxWindow, id: &str) {
     if let Some(command) = COMMANDS.iter().find(|command| command.id == id) {
         ui.set_command_palette_open(false);
         (command.run)(app, ui);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_palette_includes_settings_archive_and_dnd_actions() {
+        let ids: Vec<&str> = matching_commands("").map(|c| c.id).collect();
+        for required in [
+            "settings",
+            "compress-zip",
+            "extract-here",
+            "extract-to-folder",
+            "browse-archive",
+            "external-drag",
+        ] {
+            assert!(
+                ids.contains(&required),
+                "expected command '{required}' to be registered"
+            );
+        }
+
+        let settings_hits: Vec<&str> = matching_commands("open settings").map(|c| c.id).collect();
+        assert_eq!(settings_hits, vec!["settings"]);
+
+        let archive_hits: Vec<&str> = matching_commands("archive").map(|c| c.id).collect();
+        assert!(archive_hits.contains(&"compress-zip"));
+        assert!(archive_hits.contains(&"extract-here"));
+        assert!(archive_hits.contains(&"extract-to-folder"));
+        assert!(archive_hits.contains(&"browse-archive"));
     }
 }

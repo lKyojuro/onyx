@@ -7,6 +7,7 @@ use onyx_ui::OnyxWindow;
 use std::path::{Path, PathBuf};
 
 use crate::controller::{Controller, post};
+use crate::state::is_zip_path;
 use crate::ui_sync;
 
 impl Controller {
@@ -19,6 +20,7 @@ impl Controller {
     }
 
     fn change_path(&self, ui: &OnyxWindow, id: PaneId, path: PathBuf, record: bool) {
+        let watch_path = path.clone();
         {
             let mut state = self.state.borrow_mut();
             if let Some(tab) = state.tab_mut(id) {
@@ -30,6 +32,7 @@ impl Controller {
         ui.set_address_editing(false);
         self.sync_chrome(ui);
         self.update_watcher();
+        self.watch_search_root(watch_path);
         self.load_directory(ui, id, true);
     }
 
@@ -196,7 +199,7 @@ impl Controller {
     }
 
     pub(crate) fn load_directory(&self, ui: &OnyxWindow, id: PaneId, clear_rows: bool) {
-        let (path, options, generation, cancel) = {
+        let (path, options, generation, cancel, has_cached_rows) = {
             let mut state = self.state.borrow_mut();
             let path = state.path(id).to_path_buf();
             let sort = state.tab(id).map_or_else(SortSpec::default, |tab| tab.sort);
@@ -211,6 +214,7 @@ impl Controller {
             } else {
                 None
             };
+            let has_cached = cached.as_ref().is_some_and(|entries| !entries.is_empty());
             let pane = state.pane_mut(id);
             let (generation, cancel) = pane.restart();
             if clear_rows {
@@ -218,11 +222,14 @@ impl Controller {
                 sort_entries(&mut pane.entries, sort);
                 ui_sync::rows(&state, id);
             }
-            (path, options, generation, cancel)
+            (path, options, generation, cancel, has_cached)
         };
         self.sync_pane(ui, id);
         self.update_preview(ui);
         self.queue_icons(id, 0);
+        if has_cached_rows {
+            self.queue_thumbnails(id);
+        }
         let weak = self.ui.clone();
         self.runtime.spawn(async move {
             let result = FsEngine::new()
@@ -270,6 +277,7 @@ impl Controller {
         self.sync_pane(ui, id);
         self.update_preview(ui);
         self.queue_icons(id, 0);
+        self.queue_thumbnails(id);
     }
 
     pub(crate) fn sort_by(&self, ui: &OnyxWindow, id: PaneId, column: i32) {
@@ -296,6 +304,7 @@ impl Controller {
             ui_sync::rows(&state, id);
         }
         self.sync_pane(ui, id);
+        self.queue_thumbnails(id);
     }
 
     pub(crate) fn select(&self, ui: &OnyxWindow, id: PaneId, index: i32) {
@@ -356,6 +365,8 @@ impl Controller {
         }
         if entry.is_dir() {
             self.change_path(ui, id, entry.path, true);
+        } else if !entry.is_symlink && !entry.attributes.reparse_point && is_zip_path(&entry.path) {
+            self.browse_archive_path(ui, entry.path);
         } else if entry.is_symlink || entry.attributes.reparse_point {
             let weak = self.ui.clone();
             let generation = self.state.borrow().pane(id).generation;
@@ -381,33 +392,29 @@ impl Controller {
     }
 
     pub(crate) fn toggle_hidden(&self, ui: &OnyxWindow) {
-        let panes: Vec<_> = {
-            let mut state = self.state.borrow_mut();
-            state.config.show_hidden = !state.config.show_hidden;
-            state.directories.clear();
-            state.visible_panes().collect()
-        };
-        self.sync_chrome(ui);
-        for pane in panes {
-            self.reload(ui, pane, true);
-        }
+        let enabled = !self.state.borrow().config.show_hidden;
+        self.settings_set_show_hidden(ui, enabled);
     }
 
     pub(crate) fn toggle_favorite(&self, ui: &OnyxWindow) {
-        let mut state = self.state.borrow_mut();
-        let path = state.path(state.active).to_path_buf();
-        if !state.config.remove_favorite(&path) {
-            state.config.add_favorite(onyx_core::FavoriteItem {
-                name: onyx_core::navigation::derive_tab_title(&path),
-                path,
-            });
+        {
+            let mut state = self.state.borrow_mut();
+            let path = state.path(state.active).to_path_buf();
+            if !state.config.remove_favorite(&path) {
+                state.config.add_favorite(onyx_core::FavoriteItem {
+                    name: onyx_core::navigation::derive_tab_title(&path),
+                    path,
+                });
+            }
+            ui_sync::chrome(ui, &state);
         }
-        ui_sync::chrome(ui, &state);
+        self.persist_config();
     }
 
     pub(crate) fn unpin_favorite(&self, ui: &OnyxWindow, path: &Path) {
         self.state.borrow_mut().config.remove_favorite(path);
         self.sync_chrome(ui);
+        self.persist_config();
     }
 }
 

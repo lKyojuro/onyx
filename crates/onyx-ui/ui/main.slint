@@ -6,6 +6,7 @@ import {
     UiSidebarItem,
     UiDriveItem,
     UiFileEntry,
+    UiArchiveEntry,
     UiMetadataRow,
     UiCommandItem,
     UiOperationProgress,
@@ -22,6 +23,9 @@ import {
     QuickLookModal,
     OperationProgressCard,
 } from "components/overlays.slint";
+import { SettingsOverlayModal } from "components/settings_overlay.slint";
+import { ArchiveBrowserModal } from "components/archive_overlay.slint";
+import { OnyxIcon, OnyxIconSize } from "components/icons.slint";
 import { StatusBar } from "components/status_bar.slint";
 
 export {
@@ -31,6 +35,7 @@ export {
     UiSidebarItem,
     UiDriveItem,
     UiFileEntry,
+    UiArchiveEntry,
     UiMetadataRow,
     UiCommandItem,
     UiOperationProgress,
@@ -98,6 +103,43 @@ export component OnyxWindow inherits Window {
     in property <bool> can-undo: false;
     in property <bool> can-paste: false;
     in property <bool> has-selection: false;
+    in property <bool> has-archive-selection: false;
+
+    // Settings overlay state
+    in-out property <bool> settings-open: false;
+    in property <int> settings-theme-mode: 0; // 0 = Dark, 1 = Light, 2 = System
+    in property <int> settings-default-view: 0; // 0 = Details, 1 = Grid
+    in property <bool> settings-show-hidden: false;
+    in property <bool> settings-show-system: false;
+    in property <bool> settings-show-preview: true;
+    in property <bool> settings-dual-pane-default: false;
+    in property <string> settings-default-terminal: "wt";
+    in property <[string]> settings-excluded-dirs;
+
+    // Archive browser overlay state
+    in-out property <bool> archive-open: false;
+    in property <string> archive-title: "";
+    in property <string> archive-path: "";
+    in property <string> archive-summary: "";
+    in property <bool> archive-loading: false;
+    in property <string> archive-error: "";
+    in property <[UiArchiveEntry]> archive-entries;
+
+    // Internal drag-and-drop state
+    in-out property <bool> dragging-active: false;
+    in-out property <string> drag-source-path: "";
+    in-out property <string> drag-source-name: "";
+    in-out property <string> drag-source-dir: "";
+    in-out property <bool> drag-source-is-dir: false;
+    in-out property <int> drag-source-pane: -1;
+    in-out property <length> drag-x: 0px;
+    in-out property <length> drag-y: 0px;
+    in-out property <string> drag-hover-folder-path: "";
+    in-out property <string> drag-hover-folder-name: "";
+    in-out property <string> drag-hover-tab-path: "";
+    in-out property <string> drag-hover-tab-title: "";
+    in-out property <int> drag-hover-pane: -1;
+    in-out property <string> drag-hover-pane-path: "";
 
     // Preview & Quick Look state
     in property <string> preview-title: "";
@@ -182,11 +224,74 @@ export component OnyxWindow inherits Window {
     callback modal-cancel();
     callback move-selection(int);
 
+    // Settings callbacks
+    callback toggle-settings();
+    callback settings-set-theme(int);
+    callback settings-set-default-view(int);
+    callback settings-set-show-hidden(bool);
+    callback settings-set-show-system(bool);
+    callback settings-set-show-preview(bool);
+    callback settings-set-dual-pane-default(bool);
+    callback settings-set-default-terminal(string);
+    callback settings-add-excluded-dir(string);
+    callback settings-remove-excluded-dir(string);
+
+    // Archive callbacks
+    callback action-compress-zip();
+    callback action-extract-here();
+    callback action-extract-to-folder();
+    callback action-browse-archive();
+    callback close-archive-browser();
+    callback archive-extract-here();
+    callback archive-extract-to-folder();
+
+    // Drag & Drop callbacks
+    callback internal-drop(string, string, bool); // (source_path, target_dir, copy)
+    callback action-external-drag();
+
     // Helper properties for active pane
     property <string> active-path: root.active-pane == 0 ? root.primary-path : root.secondary-path;
     property <int> active-sort-column: root.active-pane == 0 ? root.primary-sort-column : root.secondary-sort-column;
     property <bool> active-sort-ascending: root.active-pane == 0 ? root.primary-sort-ascending : root.secondary-sort-ascending;
     property <int> active-selected-index: root.active-pane == 0 ? root.primary-selected-index : root.secondary-selected-index;
+
+    // Resolved internal drag target (priority: folder > tab > opposite pane)
+    property <string> resolved-drop-target-path: root.drag-hover-folder-path != ""
+        ? root.drag-hover-folder-path
+        : (root.drag-hover-tab-path != ""
+            ? root.drag-hover-tab-path
+            : (root.drag-hover-pane != -1 && root.drag-hover-pane != root.drag-source-pane
+                ? root.drag-hover-pane-path
+                : ""));
+    property <string> resolved-drop-target-label: root.drag-hover-folder-name != ""
+        ? root.drag-hover-folder-name
+        : (root.drag-hover-tab-title != ""
+            ? root.drag-hover-tab-title
+            : (root.drag-hover-pane != -1 && root.drag-hover-pane != root.drag-source-pane
+                ? (root.drag-hover-pane == 0 ? "Primary Pane" : "Secondary Pane")
+                : ""));
+
+    function clear-drag-state() {
+        root.dragging-active = false;
+        root.drag-source-path = "";
+        root.drag-source-name = "";
+        root.drag-source-dir = "";
+        root.drag-source-is-dir = false;
+        root.drag-source-pane = -1;
+        root.drag-hover-folder-path = "";
+        root.drag-hover-folder-name = "";
+        root.drag-hover-tab-path = "";
+        root.drag-hover-tab-title = "";
+        root.drag-hover-pane = -1;
+        root.drag-hover-pane-path = "";
+    }
+
+    function complete-internal-drag(copy-mode: bool) {
+        if root.dragging-active && root.drag-source-path != "" && root.resolved-drop-target-path != "" {
+            root.internal-drop(root.drag-source-path, root.resolved-drop-target-path, copy-mode);
+        }
+        root.clear-drag-state();
+    }
 
     init => {
         Palette.color-scheme = root.dark-mode ? ColorScheme.dark : ColorScheme.light;
@@ -213,6 +318,22 @@ export component OnyxWindow inherits Window {
         }
     }
 
+    changed settings-open => {
+        if root.settings-open {
+            settings-modal.focus-panel();
+        } else {
+            key-handler.focus();
+        }
+    }
+
+    changed archive-open => {
+        if root.archive-open {
+            archive-modal.focus-panel();
+        } else {
+            key-handler.focus();
+        }
+    }
+
     // Atmospheric pixel-dithered cosmic aurora backdrop in Dark Mode (Nyx-inspired)
     if root.dark-mode : Image {
         width: parent.width;
@@ -234,14 +355,26 @@ export component OnyxWindow inherits Window {
 
         // Global shortcuts that work regardless of child focus
         capture-key-pressed(event) => {
-            // Escape closes active overlays or address editing
+            // Escape closes active overlays, drag, or address editing
             if event.text == Key.Escape {
+                if root.dragging-active {
+                    root.clear-drag-state();
+                    return accept;
+                }
                 if root.modal-open {
                     root.modal-cancel();
                     return accept;
                 }
                 if root.command-palette-open {
                     root.toggle-command-palette();
+                    return accept;
+                }
+                if root.settings-open {
+                    root.toggle-settings();
+                    return accept;
+                }
+                if root.archive-open {
+                    root.close-archive-browser();
                     return accept;
                 }
                 if root.quick-look-open {
@@ -255,14 +388,20 @@ export component OnyxWindow inherits Window {
                 }
             }
 
+            // Ctrl+,: Toggle Settings
+            if event.modifiers.control && event.text == "," {
+                root.toggle-settings();
+                return accept;
+            }
+
             // Ctrl+K: Toggle Command Palette
             if event.modifiers.control && (event.text == "k" || event.text == "K") {
                 root.toggle-command-palette();
                 return accept;
             }
 
-            // Block other global shortcuts while a modal prompt or command palette is open
-            if root.modal-open || root.command-palette-open {
+            // Block other global shortcuts while an overlay modal is open
+            if root.modal-open || root.command-palette-open || root.settings-open || root.archive-open {
                 return reject;
             }
 
@@ -322,7 +461,7 @@ export component OnyxWindow inherits Window {
 
         // File-pane shortcuts (only when no text input consumed the event)
         key-pressed(event) => {
-            if root.modal-open || root.command-palette-open {
+            if root.modal-open || root.command-palette-open || root.settings-open || root.archive-open {
                 return reject;
             }
 
@@ -388,6 +527,12 @@ export component OnyxWindow inherits Window {
             TabBar {
                 tabs: root.tabs;
                 dual-pane: root.dual-pane;
+                dragging-active: root.dragging-active;
+                drag-x: root.drag-x;
+                drag-y: root.drag-y;
+                drag-source-dir: root.drag-source-dir;
+                drag-hover-tab-path <=> root.drag-hover-tab-path;
+                drag-hover-tab-title <=> root.drag-hover-tab-title;
                 new-tab => { root.new-tab(); }
                 close-tab(id) => { root.close-tab(id); }
                 switch-tab(id) => { root.switch-tab(id); }
@@ -432,6 +577,7 @@ export component OnyxWindow inherits Window {
                 can-undo: root.can-undo;
                 can-paste: root.can-paste;
                 has-selection: root.has-selection;
+                has-archive-selection: root.has-archive-selection;
                 action-new-folder => { root.action-new-folder(); }
                 action-cut => { root.action-cut(); }
                 action-copy => { root.action-copy(); }
@@ -440,6 +586,9 @@ export component OnyxWindow inherits Window {
                 action-duplicate => { root.action-duplicate(); }
                 action-recycle => { root.action-recycle(); }
                 action-undo => { root.action-undo(); }
+                action-compress-zip => { root.action-compress-zip(); }
+                action-extract-here => { root.action-extract-here(); }
+                action-external-drag => { root.action-external-drag(); }
                 sort-by(pane, col) => { root.sort-by(pane, col); }
                 toggle-view-mode => { root.toggle-view-mode(); }
                 toggle-hidden => { root.toggle-hidden(); }
@@ -449,6 +598,7 @@ export component OnyxWindow inherits Window {
                 action-properties => { root.action-properties(); }
                 toggle-theme => { root.toggle-theme(); }
                 toggle-command-palette => { root.toggle-command-palette(); }
+                toggle-settings => { root.toggle-settings(); }
             }
 
             // Center Workspace: Sidebar + Primary/Secondary File Panes + Docked Preview Pane
@@ -476,6 +626,7 @@ export component OnyxWindow inherits Window {
                     pane-index: 0;
                     is-active: root.active-pane == 0;
                     show-active-indicator: root.dual-pane;
+                    dual-pane: root.dual-pane;
                     current-path: root.primary-path;
                     entries: root.primary-entries;
                     sort-column: root.primary-sort-column;
@@ -483,6 +634,18 @@ export component OnyxWindow inherits Window {
                     view-mode: root.view-mode;
                     is-loading: root.primary-loading;
                     error-message: root.primary-error;
+                    dragging-active <=> root.dragging-active;
+                    drag-source-path <=> root.drag-source-path;
+                    drag-source-name <=> root.drag-source-name;
+                    drag-source-dir <=> root.drag-source-dir;
+                    drag-source-is-dir <=> root.drag-source-is-dir;
+                    drag-source-pane <=> root.drag-source-pane;
+                    drag-x <=> root.drag-x;
+                    drag-y <=> root.drag-y;
+                    drag-hover-folder-path <=> root.drag-hover-folder-path;
+                    drag-hover-folder-name <=> root.drag-hover-folder-name;
+                    drag-hover-pane <=> root.drag-hover-pane;
+                    drag-hover-pane-path <=> root.drag-hover-pane-path;
                     select-entry(pane, idx) => {
                         root.primary-selected-index = idx;
                         key-handler.focus();
@@ -501,6 +664,8 @@ export component OnyxWindow inherits Window {
                         root.set-active-pane(pane);
                     }
                     sort-by(pane, col) => { root.sort-by(pane, col); }
+                    finish-internal-drag(copy-mode) => { root.complete-internal-drag(copy-mode); }
+                    cancel-internal-drag => { root.clear-drag-state(); }
                 }
 
                 // Pane divider in Dual-Pane mode
@@ -515,6 +680,7 @@ export component OnyxWindow inherits Window {
                     pane-index: 1;
                     is-active: root.active-pane == 1;
                     show-active-indicator: true;
+                    dual-pane: root.dual-pane;
                     current-path: root.secondary-path;
                     entries: root.secondary-entries;
                     sort-column: root.secondary-sort-column;
@@ -522,6 +688,18 @@ export component OnyxWindow inherits Window {
                     view-mode: root.view-mode;
                     is-loading: root.secondary-loading;
                     error-message: root.secondary-error;
+                    dragging-active <=> root.dragging-active;
+                    drag-source-path <=> root.drag-source-path;
+                    drag-source-name <=> root.drag-source-name;
+                    drag-source-dir <=> root.drag-source-dir;
+                    drag-source-is-dir <=> root.drag-source-is-dir;
+                    drag-source-pane <=> root.drag-source-pane;
+                    drag-x <=> root.drag-x;
+                    drag-y <=> root.drag-y;
+                    drag-hover-folder-path <=> root.drag-hover-folder-path;
+                    drag-hover-folder-name <=> root.drag-hover-folder-name;
+                    drag-hover-pane <=> root.drag-hover-pane;
+                    drag-hover-pane-path <=> root.drag-hover-pane-path;
                     select-entry(pane, idx) => {
                         root.secondary-selected-index = idx;
                         key-handler.focus();
@@ -540,6 +718,8 @@ export component OnyxWindow inherits Window {
                         root.set-active-pane(pane);
                     }
                     sort-by(pane, col) => { root.sort-by(pane, col); }
+                    finish-internal-drag(copy-mode) => { root.complete-internal-drag(copy-mode); }
+                    cancel-internal-drag => { root.clear-drag-state(); }
                 }
 
                 // Docked Preview Pane
@@ -643,6 +823,103 @@ export component OnyxWindow inherits Window {
             cancel => {
                 root.modal-cancel();
                 key-handler.focus();
+            }
+        }
+
+        // Settings Overlay Modal (Ctrl+,)
+        settings-modal := SettingsOverlayModal {
+            visible: root.settings-open;
+            width: parent.width;
+            height: parent.height;
+            theme-mode: root.settings-theme-mode;
+            default-view: root.settings-default-view;
+            show-hidden: root.settings-show-hidden;
+            show-system: root.settings-show-system;
+            show-preview-pane: root.settings-show-preview;
+            dual-pane-default: root.settings-dual-pane-default;
+            default-terminal: root.settings-default-terminal;
+            excluded-dirs: root.settings-excluded-dirs;
+            set-theme(mode) => { root.settings-set-theme(mode); }
+            set-default-view(mode) => { root.settings-set-default-view(mode); }
+            set-show-hidden(val) => { root.settings-set-show-hidden(val); }
+            set-show-system(val) => { root.settings-set-show-system(val); }
+            set-show-preview(val) => { root.settings-set-show-preview(val); }
+            set-dual-pane-default(val) => { root.settings-set-dual-pane-default(val); }
+            set-default-terminal(val) => { root.settings-set-default-terminal(val); }
+            add-excluded-dir(val) => { root.settings-add-excluded-dir(val); }
+            remove-excluded-dir(val) => { root.settings-remove-excluded-dir(val); }
+            close => {
+                root.toggle-settings();
+                key-handler.focus();
+            }
+        }
+
+        // Archive Browser Overlay Modal
+        archive-modal := ArchiveBrowserModal {
+            visible: root.archive-open;
+            width: parent.width;
+            height: parent.height;
+            archive-title: root.archive-title;
+            archive-path: root.archive-path;
+            archive-summary: root.archive-summary;
+            is-loading: root.archive-loading;
+            error-message: root.archive-error;
+            entries: root.archive-entries;
+            extract-here => { root.archive-extract-here(); }
+            extract-to-folder => { root.archive-extract-to-folder(); }
+            close => {
+                root.close-archive-browser();
+                key-handler.focus();
+            }
+        }
+
+        // Lightweight floating internal drag badge
+        if root.dragging-active : Rectangle {
+            x: Math.clamp(root.drag-x + 14px, 8px, parent.width - self.width - 8px);
+            y: Math.clamp(root.drag-y + 14px, 8px, parent.height - self.height - 8px);
+            max-width: 280px;
+            border-radius: OnyxTheme.radius-md;
+            border-width: 1px;
+            border-color: root.resolved-drop-target-path != "" ? OnyxTheme.accent-bright : OnyxTheme.border-strong;
+            background: OnyxTheme.bg-elevated;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 12px;
+                padding-top: 7px;
+                padding-bottom: 7px;
+                spacing: 8px;
+
+                VerticalLayout {
+                    alignment: center;
+                    OnyxIcon {
+                        name: root.drag-source-is-dir ? "folder" : "file";
+                        size: OnyxIconSize.standard;
+                        icon-color: root.drag-source-is-dir ? OnyxTheme.folder-tint : OnyxTheme.accent-bright;
+                    }
+                }
+
+                VerticalLayout {
+                    spacing: 1px;
+                    alignment: center;
+
+                    Text {
+                        text: root.drag-source-name;
+                        font-size: OnyxTheme.font-xs;
+                        font-weight: 600;
+                        color: OnyxTheme.text-primary;
+                        overflow: elide;
+                    }
+
+                    Text {
+                        text: root.resolved-drop-target-label != ""
+                            ? ("Drop into " + root.resolved-drop-target-label + " (Ctrl = Copy)")
+                            : "Drag onto a folder, tab, or pane";
+                        font-size: 11px;
+                        color: root.resolved-drop-target-label != "" ? OnyxTheme.accent-bright : OnyxTheme.text-muted;
+                        overflow: elide;
+                    }
+                }
             }
         }
     }

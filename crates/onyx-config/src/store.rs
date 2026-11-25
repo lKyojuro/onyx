@@ -195,6 +195,7 @@ mod tests {
             default_view: ViewMode::Grid,
             dual_pane_default: true,
             show_preview_pane: false,
+            default_terminal: "pwsh".to_string(),
             favorites: vec![FavoriteItem {
                 name: "Projects".to_string(),
                 path: PathBuf::from(r"D:\Projects"),
@@ -209,6 +210,7 @@ mod tests {
         // Overwrite existing file cleanly without leaving temp files behind.
         cfg.theme = ThemeMode::System;
         cfg.accent_hex = Some("#FF5500".to_string());
+        cfg.default_terminal = "cmd".to_string();
         store.save_config(&cfg).unwrap();
         assert_eq!(store.load_config(), cfg);
 
@@ -278,5 +280,59 @@ mod tests {
         cfg.record_recent(PathBuf::from(r"C:\Dir10"));
         assert_eq!(cfg.recent_locations.len(), MAX_RECENT_LOCATIONS);
         assert_eq!(cfg.recent_locations[0], PathBuf::from(r"C:\Dir10"));
+    }
+
+    #[test]
+    fn legacy_config_without_default_terminal_loads_with_default_wt() {
+        let tmp = TempDir::new().unwrap();
+        let store = ConfigStore::with_dir(tmp.path().to_path_buf());
+
+        let legacy_toml = r#"
+theme = "Dark"
+show_hidden = true
+show_system = false
+default_view = "Grid"
+dual_pane_default = false
+show_preview_pane = true
+excluded_index_dirs = ['C:\Windows']
+"#;
+        fs::write(store.config_path(), legacy_toml).unwrap();
+
+        let loaded = store.load_config();
+        assert_eq!(loaded.default_terminal, "wt");
+        assert_eq!(loaded.normalized_terminal(), "wt");
+        assert!(loaded.show_hidden);
+        assert_eq!(loaded.default_view, ViewMode::Grid);
+        assert_eq!(
+            loaded.excluded_index_dirs,
+            vec![PathBuf::from(r"C:\Windows")]
+        );
+    }
+
+    #[test]
+    fn default_terminal_and_excluded_dir_helpers() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.default_terminal, "wt");
+        assert_eq!(cfg.normalized_terminal(), "wt");
+
+        cfg.set_default_terminal("pwsh");
+        assert_eq!(cfg.default_terminal, "pwsh");
+        assert_eq!(cfg.normalized_terminal(), "pwsh");
+
+        cfg.set_default_terminal("cmd");
+        assert_eq!(cfg.default_terminal, "cmd");
+        assert_eq!(cfg.normalized_terminal(), "cmd");
+
+        cfg.set_default_terminal("unknown-shell");
+        assert_eq!(cfg.default_terminal, "wt");
+
+        assert!(cfg.add_excluded_index_dir(PathBuf::from(r"C:\Temp")));
+        assert!(!cfg.add_excluded_index_dir(PathBuf::from(r"c:\temp\")));
+        assert!(!cfg.add_excluded_index_dir(PathBuf::new()));
+        assert_eq!(cfg.excluded_index_dirs.len(), 1);
+
+        assert!(cfg.remove_excluded_index_dir(Path::new(r"C:\Temp")));
+        assert!(!cfg.remove_excluded_index_dir(Path::new(r"C:\Temp")));
+        assert!(cfg.excluded_index_dirs.is_empty());
     }
 }

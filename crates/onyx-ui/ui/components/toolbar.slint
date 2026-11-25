@@ -1,5 +1,6 @@
 import { OnyxTheme } from "../tokens.slint";
 import { FluentButton, VerticalDivider } from "common.slint";
+import { OnyxIcon } from "icons.slint";
 
 export component Toolbar inherits Rectangle {
     in property <int> active-pane: 0;
@@ -13,6 +14,7 @@ export component Toolbar inherits Rectangle {
     in property <bool> can-undo: false;
     in property <bool> can-paste: false;
     in property <bool> has-selection: false;
+    in property <bool> has-archive-selection: false;
 
     callback action-new-folder();
     callback action-cut();
@@ -22,6 +24,9 @@ export component Toolbar inherits Rectangle {
     callback action-duplicate();
     callback action-recycle();
     callback action-undo();
+    callback action-compress-zip();
+    callback action-extract-here();
+    callback action-external-drag();
     callback sort-by(int, int);
     callback toggle-view-mode();
     callback toggle-hidden();
@@ -31,6 +36,7 @@ export component Toolbar inherits Rectangle {
     callback action-properties();
     callback toggle-theme();
     callback toggle-command-palette();
+    callback toggle-settings();
 
     pure function sort-icon(column: int) -> string {
         return root.sort-column == column ? (root.sort-ascending ? "sort-ascending" : "sort-descending") : "";
@@ -125,6 +131,83 @@ export component Toolbar inherits Rectangle {
                 compact: true;
                 enabled: root.can-undo;
                 clicked => { root.action-undo(); }
+            }
+
+            FluentButton {
+                icon-name: "archive";
+                a11y-label: "Compress to ZIP";
+                compact: true;
+                enabled: root.has-selection;
+                clicked => { root.action-compress-zip(); }
+            }
+
+            if root.has-archive-selection : FluentButton {
+                icon-name: "extract";
+                label: "Extract";
+                a11y-label: "Extract archive here";
+                compact: true;
+                clicked => { root.action-extract-here(); }
+            }
+
+            Rectangle {
+                width: 28px;
+                height: 26px;
+                border-radius: OnyxTheme.radius-sm;
+                background: !root.has-selection
+                    ? transparent
+                    : (ext-drag-ta.pressed ? OnyxTheme.bg-pressed : (ext-drag-ta.has-hover ? OnyxTheme.bg-hover : transparent));
+                animate background { duration: 110ms; easing: ease-out; }
+
+                accessible-role: button;
+                accessible-label: "Drag selected to external app";
+                accessible-enabled: root.has-selection;
+
+                OnyxIcon {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    name: "external-drag";
+                    icon-color: root.has-selection ? OnyxTheme.text-primary : OnyxTheme.text-muted;
+                    opacity: root.has-selection ? 1.0 : 0.38;
+                }
+
+                ext-drag-ta := TouchArea {
+                    property <bool> armed: false;
+                    property <bool> fired: false;
+                    property <length> press-x: 0px;
+                    property <length> press-y: 0px;
+
+                    enabled: root.has-selection;
+                    mouse-cursor: root.has-selection ? grab : default;
+
+                    pointer-event(event) => {
+                        if event.button == PointerEventButton.left && event.kind == PointerEventKind.down {
+                            self.armed = true;
+                            self.fired = false;
+                            self.press-x = self.mouse-x;
+                            self.press-y = self.mouse-y;
+                        }
+                        if event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel {
+                            self.armed = false;
+                        }
+                    }
+
+                    moved => {
+                        if self.armed && !self.fired
+                            && (Math.abs(self.mouse-x - self.press-x) + Math.abs(self.mouse-y - self.press-y) > 4px)
+                        {
+                            self.fired = true;
+                            self.armed = false;
+                            root.action-external-drag();
+                        }
+                    }
+
+                    clicked => {
+                        if !self.fired {
+                            root.action-external-drag();
+                        }
+                        self.fired = false;
+                    }
+                }
             }
 
             VerticalDivider { y: 5px; }
@@ -236,6 +319,13 @@ export component Toolbar inherits Rectangle {
                 a11y-label: root.dark-mode ? "Switch to light theme" : "Switch to dark theme";
                 compact: true;
                 clicked => { root.toggle-theme(); }
+            }
+
+            FluentButton {
+                icon-name: "settings";
+                a11y-label: "Settings";
+                compact: true;
+                clicked => { root.toggle-settings(); }
             }
         }
     }

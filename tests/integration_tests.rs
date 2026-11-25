@@ -668,6 +668,7 @@ fn e2e_config_session_and_cache_crash_recovery() {
         default_view: ViewMode::Grid,
         dual_pane_default: true,
         show_preview_pane: true,
+        default_terminal: "wt".to_string(),
         favorites: Vec::new(),
         excluded_index_dirs: vec![temp.path().join("node_modules")],
         recent_locations: Vec::new(),
