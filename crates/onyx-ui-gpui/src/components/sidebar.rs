@@ -6,7 +6,7 @@ use crate::icons::{OnyxGlyph, path_icon_key, render_glyph};
 use crate::theme::{FONT_SM, FONT_XS, OnyxTheme, RADIUS_MD, RADIUS_SM};
 use gpui_kit::{
     Context, FontWeight, ImageSource, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    RenderImage, StatefulInteractiveElement, Styled, div, img, px,
+    RenderImage, Role, StatefulInteractiveElement, Styled, div, img, px,
 };
 use onyx_config::{SIDEBAR_GROUP_DRIVES, SIDEBAR_GROUP_FAVORITES, SIDEBAR_GROUP_QUICK_ACCESS};
 use onyx_core::{KnownFolderKind, format_bytes, normalize_display_path};
@@ -204,6 +204,11 @@ pub fn render_sidebar(
                     format_bytes(drive.total_bytes)
                 )
             };
+            let drive_label = if free_label.is_empty() {
+                title.clone()
+            } else {
+                format!("{title}, {free_label}")
+            };
             let ratio = drive.usage_ratio().clamp(0.0, 1.0);
             let bar_color = if ratio > 0.90 {
                 theme.danger()
@@ -257,6 +262,9 @@ pub fn render_sidebar(
 
             let mut card = div()
                 .id(("sidebar-drive", idx))
+                .role(Role::Button)
+                .aria_label(drive_label)
+                .aria_selected(is_active)
                 .flex()
                 .flex_col()
                 .p(px(8.0))
@@ -300,6 +308,12 @@ pub fn render_sidebar(
                 // Usage progress bar
                 .child(
                     div()
+                        .id(("sidebar-drive-usage", idx))
+                        .role(Role::ProgressIndicator)
+                        .aria_label("Drive usage")
+                        .aria_numeric_value(f64::from(ratio) * 100.0)
+                        .aria_min_numeric_value(0.0)
+                        .aria_max_numeric_value(100.0)
                         .w_full()
                         .h(px(4.0))
                         .rounded(px(2.0))
@@ -333,6 +347,8 @@ pub fn render_sidebar(
     Some(
         div()
             .id("onyx-sidebar-scroll")
+            .role(Role::Navigation)
+            .aria_label("Sidebar")
             .flex()
             .flex_col()
             .w(px(width))
@@ -358,6 +374,9 @@ fn section_header(
 ) -> impl IntoElement {
     div()
         .id(id)
+        .role(Role::Button)
+        .aria_label(format!("{label} group"))
+        .aria_expanded(!collapsed)
         .flex()
         .flex_row()
         .items_center()
@@ -437,6 +456,9 @@ fn sidebar_nav_row(
 
     let mut row = div()
         .id(id)
+        .role(Role::Button)
+        .aria_label(label.to_string())
+        .aria_selected(active)
         .relative()
         .flex()
         .flex_row()
@@ -487,7 +509,9 @@ fn sidebar_nav_row(
     if removable && let Some(remove_cb) = on_remove {
         row = row.child(
             div()
-                .id("unpin-fav")
+                .id(format!("unpin-fav-{label}"))
+                .role(Role::Button)
+                .aria_label(format!("Unpin {label}"))
                 .flex()
                 .items_center()
                 .justify_center()

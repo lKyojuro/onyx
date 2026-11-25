@@ -4,15 +4,18 @@
 //! arrow/Enter/Escape handling. A query that starts with [`FILE_SEARCH_PREFIX`]
 //! switches the card to the indexed file search mode.
 
+use crate::components::a11y;
 use crate::explorer::OnyxExplorer;
 use crate::icons::{OnyxGlyph, render_glyph};
 use crate::search_index::{SearchRun, SearchStatus};
 use crate::theme::{FONT_SM, FONT_XS, OnyxTheme, RADIUS_LG, RADIUS_SM};
 use gpui_kit::{
-    Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Styled,
+    Context, Entity, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement, Role,
+    StatefulInteractiveElement, Styled,
     component::input::{Input, InputState},
-    deferred, div, px,
+    deferred, div,
+    prelude::FluentBuilder,
+    px,
 };
 use onyx_core::{FileEntry, normalize_display_path};
 
@@ -446,6 +449,7 @@ fn empty_row(text: &str, theme: OnyxTheme) -> impl IntoElement {
 fn render_command_row(
     command: &PaletteCommand,
     position: usize,
+    size: usize,
     is_selected: bool,
     theme: OnyxTheme,
     cx: &mut Context<OnyxExplorer>,
@@ -457,6 +461,14 @@ fn render_command_row(
 
     div()
         .id(("palette-row", position))
+        .role(Role::Button)
+        .aria_label(title.to_string())
+        .aria_description(format!("{category} command"))
+        .aria_keyshortcuts(shortcut.to_string())
+        .aria_selected(is_selected)
+        .aria_position_in_set(position + 1)
+        .aria_size_of_set(size.max(1))
+        .when(is_selected, |row| row.aria_active_descendant())
         .flex()
         .flex_row()
         .items_center()
@@ -527,6 +539,7 @@ fn render_command_row(
 fn render_hit_row(
     entry: &FileEntry,
     position: usize,
+    size: usize,
     is_selected: bool,
     theme: OnyxTheme,
     cx: &mut Context<OnyxExplorer>,
@@ -537,8 +550,21 @@ fn render_hit_row(
         .parent()
         .map_or_else(String::new, normalize_display_path);
 
+    let hit_description = if location.is_empty() {
+        "Search hit".to_string()
+    } else {
+        format!("Search hit in {location}")
+    };
+
     div()
         .id(("palette-hit", position))
+        .role(Role::Button)
+        .aria_label(name.clone())
+        .aria_description(hit_description)
+        .aria_selected(is_selected)
+        .aria_position_in_set(position + 1)
+        .aria_size_of_set(size.max(1))
+        .when(is_selected, |row| row.aria_active_descendant())
         .flex()
         .flex_row()
         .items_center()
@@ -622,8 +648,32 @@ pub fn render_command_palette(
     let query = state.filter.query.clone();
     let mode = state.mode();
 
+    // Tab order inside the palette: the result list, then back to the query field.
+    view.modals.palette.begin();
+    let list_focus = view.modals.palette.slot();
+
+    let (list_label, list_description) = match mode {
+        PaletteMode::Commands => (
+            "Command palette results",
+            format!(
+                "{} of {} commands",
+                state.filter.matches.len(),
+                COMMANDS.len()
+            ),
+        ),
+        PaletteMode::Files => (
+            "File search results",
+            format!("{} files", state.search.hits.len().min(MAX_VISIBLE_HITS)),
+        ),
+    };
+
     let mut list = div()
         .id("palette-list")
+        .role(Role::List)
+        .aria_label(list_label)
+        .aria_description(list_description)
+        .track_focus(&list_focus)
+        .focus_visible(|style| a11y::focus_ring_style(theme, style))
         .flex()
         .flex_col()
         .w_full()
@@ -649,6 +699,7 @@ pub fn render_command_palette(
                 list = list.child(render_command_row(
                     command,
                     position,
+                    count,
                     position == selected,
                     theme,
                     cx,
@@ -678,6 +729,7 @@ pub fn render_command_palette(
                 list = list.child(render_hit_row(
                     entry,
                     position,
+                    count,
                     position == selected,
                     theme,
                     cx,
@@ -697,6 +749,9 @@ pub fn render_command_palette(
 
     let card = div()
         .id("palette-card")
+        .role(Role::Dialog)
+        .aria_label("Command palette")
+        .aria_description("Type to filter commands, Enter runs the selected command")
         .flex()
         .flex_col()
         .w(px(CARD_WIDTH))
@@ -732,7 +787,12 @@ pub fn render_command_palette(
                         .min_w(px(0.0))
                         .text_size(FONT_SM)
                         .text_color(theme.text_primary())
-                        .child(Input::new(&state.input).appearance(false)),
+                        .child(
+                            Input::new(&state.input)
+                                .appearance(false)
+                                .aria_label("Search commands")
+                                .accessibility_id("command-palette-input"),
+                        ),
                 )
                 .child(
                     div()

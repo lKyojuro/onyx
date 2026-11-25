@@ -1,5 +1,6 @@
 //! Modular GPUI UI components achieving 1:1 visual parity with `crates/onyx-ui/ui/`.
 
+pub mod a11y;
 pub mod archive_overlay;
 pub mod command_palette;
 pub mod context_menu;
@@ -19,8 +20,9 @@ pub mod toolbar;
 use crate::icons::{OnyxGlyph, render_glyph};
 use crate::theme::{FONT_SM, FONT_XS, OnyxTheme, RADIUS_SM};
 use gpui_kit::{
-    App, ClickEvent, ElementId, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent,
-    ParentElement, Pixels, StatefulInteractiveElement, Styled, Window, div, px,
+    App, ClickEvent, Div, ElementId, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent,
+    ParentElement, Pixels, Role, Stateful, StatefulInteractiveElement, Styled, Toggled, Window,
+    div, prelude::FluentBuilder, px,
 };
 
 /// Subtle 1px vertical divider matching `VerticalDivider` in `common.slint`.
@@ -44,11 +46,13 @@ pub struct FluentButtonProps<'a> {
 }
 
 /// Fluent / Nocturne toolbar & navigation button matching `FluentButton` in `common.slint`.
+/// The button reports itself as an accessible button; icon-only callers add the
+/// spoken label with `.aria_label(..)` on the returned element.
 pub fn fluent_button(
     props: FluentButtonProps<'_>,
     theme: OnyxTheme,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> Stateful<Div> {
     let height = if props.compact { px(26.0) } else { px(28.0) };
     let fg = if !props.enabled {
         theme.text_muted()
@@ -76,6 +80,7 @@ pub fn fluent_button(
         .px(px_pad)
         .gap(px(5.0))
         .rounded(RADIUS_SM)
+        .role(Role::Button)
         .border_1()
         .border_color(if props.active {
             theme.accent_border()
@@ -111,7 +116,9 @@ pub fn fluent_button(
         if props.active {
             text_el = text_el.font_weight(gpui_kit::FontWeight::SEMIBOLD);
         }
-        base = base.child(text_el.child(label.to_string()));
+        base = base
+            .aria_label(label)
+            .child(text_el.child(label.to_string()));
     }
 
     if props.enabled {
@@ -132,7 +139,8 @@ pub fn fluent_button(
                 on_click(ev, window, cx);
             })
     } else {
-        base
+        // AccessKit has no disabled property in this API, so at least say so.
+        base.aria_description("unavailable")
     }
 }
 
@@ -163,7 +171,7 @@ pub fn fluent_action_button(
     props: ActionButtonProps<'_>,
     theme: OnyxTheme,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+) -> Stateful<Div> {
     let height = if props.compact { px(26.0) } else { px(30.0) };
     let fg = if !props.enabled {
         theme.text_muted()
@@ -221,6 +229,7 @@ pub fn fluent_action_button(
         .px(px_pad)
         .gap(px(5.0))
         .rounded(RADIUS_SM)
+        .role(Role::Button)
         .border_1()
         .border_color(border)
         .bg(bg);
@@ -246,7 +255,9 @@ pub fn fluent_action_button(
         if props.active || props.primary {
             text_el = text_el.font_weight(gpui_kit::FontWeight::SEMIBOLD);
         }
-        base = base.child(text_el.child(label.to_string()));
+        base = base
+            .aria_label(label)
+            .child(text_el.child(label.to_string()));
     }
 
     if let Some(trailing) = props.trailing_glyph {
@@ -283,7 +294,8 @@ pub fn fluent_action_button(
                 on_click(ev, window, cx);
             })
     } else {
-        base
+        // AccessKit has no disabled property in this API, so at least say so.
+        base.aria_description("unavailable")
     }
 }
 
@@ -295,9 +307,19 @@ pub fn fluent_chip(
     interactive: bool,
     theme: OnyxTheme,
     on_click: Option<ClickHandler>,
-) -> impl IntoElement {
+) -> Stateful<Div> {
+    // Toggle chips are buttons; read-only chips are plain labels, so a screen
+    // reader does not offer an action that does not exist.
     let mut chip = div()
         .id(id)
+        .when(interactive, |chip| {
+            chip.role(Role::Button).aria_toggled(if active {
+                Toggled::True
+            } else {
+                Toggled::False
+            })
+        })
+        .when(!interactive, |chip| chip.role(Role::Label))
         .flex()
         .flex_row()
         .items_center()
@@ -328,6 +350,7 @@ pub fn fluent_chip(
         } else {
             theme.text_secondary()
         })
+        .aria_label(label)
         .child(label.to_string());
 
     if interactive {

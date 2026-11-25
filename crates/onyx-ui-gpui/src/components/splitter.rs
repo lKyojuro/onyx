@@ -4,8 +4,8 @@
 use crate::explorer::OnyxExplorer;
 use crate::theme::OnyxTheme;
 use gpui_kit::{
-    Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Styled,
-    div, px,
+    Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, Orientation,
+    ParentElement, Role, StatefulInteractiveElement, Styled, div, px,
 };
 use onyx_config::{
     DEFAULT_PREVIEW_WIDTH_DUAL, DEFAULT_PREVIEW_WIDTH_SINGLE, MIN_PREVIEW_WIDTH, MIN_SIDEBAR_WIDTH,
@@ -33,6 +33,16 @@ impl SplitterKind {
             Self::Sidebar => "splitter-sidebar",
             Self::DualPane => "splitter-dual-pane",
             Self::Preview => "splitter-preview",
+        }
+    }
+
+    /// Spoken name of the boundary this splitter resizes.
+    #[must_use]
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Sidebar => "Resize the sidebar",
+            Self::DualPane => "Resize the file panes",
+            Self::Preview => "Resize the preview pane",
         }
     }
 }
@@ -212,6 +222,9 @@ pub fn render_splitter(
 
     div()
         .id(kind.element_id())
+        .role(Role::Splitter)
+        .aria_label(kind.label())
+        .aria_orientation(Orientation::Vertical)
         .flex()
         .items_center()
         .justify_center()

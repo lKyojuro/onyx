@@ -3,14 +3,16 @@
 //! Renders Text/Code previews, BGRA `RenderImage` image previews, Directory summaries,
 //! Binary/Document metadata with hex headers, Loading/Error states, and key-value details.
 
+use crate::components::a11y;
 use crate::components::{FluentButtonProps, fluent_button, fluent_chip};
 use crate::explorer::OnyxExplorer;
 use crate::icons::{OnyxGlyph, render_glyph, rgba_pixels_to_render_image};
 use crate::theme::{FONT_MD, FONT_SM, FONT_XS, OnyxTheme, RADIUS_LG, RADIUS_MD, RADIUS_SM};
 use gpui_kit::{
-    AnyElement, Context, FontWeight, ImageSource, InteractiveElement, IntoElement, MouseButton,
-    ObjectFit, ParentElement, RenderImage, StatefulInteractiveElement, Styled, StyledImage,
-    deferred, div, img, px, relative,
+    AnyElement, Context, ElementId, FocusHandle, FontWeight, ImageSource, InteractiveElement,
+    IntoElement, MouseButton, ObjectFit, ParentElement, RenderImage, Role,
+    StatefulInteractiveElement, Styled, StyledImage, deferred, div, img, prelude::FluentBuilder,
+    px, relative,
 };
 use onyx_core::{FileEntry, format_bytes, format_timestamp, normalize_display_path};
 use onyx_preview::PreviewContent;
@@ -286,6 +288,9 @@ pub fn render_preview_pane(
 
     Some(
         div()
+            .id("onyx-preview-pane")
+            .role(Role::Complementary)
+            .aria_label("Preview pane")
             .flex()
             .flex_col()
             .w(px(width))
@@ -293,7 +298,14 @@ pub fn render_preview_pane(
             .h_full()
             .bg(theme.bg_chrome())
             .overflow_hidden()
-            .child(render_preview_surface(&view.preview, false, theme, cx)),
+            .child(render_preview_surface(
+                &view.preview,
+                false,
+                theme,
+                None,
+                None,
+                cx,
+            )),
     )
 }
 
@@ -306,9 +318,23 @@ pub fn render_quick_look_modal(
         return None;
     }
     let theme = view.theme;
+    // Tab order inside Quick Look: open the entry (only present when there is
+    // something to open), then close the overlay.
+    let ring = &view.modals.quick_look;
+    ring.begin();
+    let open_focus = (view.preview.kind != PreviewKind::None).then(|| ring.slot());
+    let close_focus = ring.slot();
+    let card_label = if view.preview.title.is_empty() {
+        "Quick Look".to_string()
+    } else {
+        format!("Quick Look, {}", view.preview.title)
+    };
 
     let modal_card = div()
         .id("quick-look-card")
+        .role(Role::Dialog)
+        .aria_label(card_label)
+        .aria_description("Arrows navigate, Enter opens, Space or Escape closes")
         .relative()
         .flex()
         .flex_col()
@@ -334,7 +360,14 @@ pub fn render_quick_look_modal(
                 .h(px(1.0))
                 .bg(theme.border_specular()),
         )
-        .child(render_preview_surface(&view.preview, true, theme, cx))
+        .child(render_preview_surface(
+            &view.preview,
+            true,
+            theme,
+            open_focus.as_ref(),
+            Some(&close_focus),
+            cx,
+        ))
         .child(
             div()
                 .flex()
@@ -365,8 +398,8 @@ pub fn render_quick_look_modal(
                 .bg(theme.bg_backdrop())
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|explorer, _, _, cx| {
-                        explorer.close_quick_look(cx);
+                    cx.listener(|explorer, _, window, cx| {
+                        explorer.close_quick_look(window, cx);
                     }),
                 )
                 .child(modal_card),
@@ -379,6 +412,8 @@ fn render_preview_surface(
     preview: &PreviewState,
     is_quick_look: bool,
     theme: OnyxTheme,
+    open_focus: Option<&FocusHandle>,
+    close_focus: Option<&FocusHandle>,
     cx: &mut Context<OnyxExplorer>,
 ) -> impl IntoElement {
     let title = if !preview.title.is_empty() {
@@ -418,6 +453,14 @@ fn render_preview_surface(
     }
 
     let mut header = div()
+        .id(if is_quick_look {
+            "ql-preview-header"
+        } else {
+            "preview-header"
+        })
+        .role(Role::Group)
+        .aria_label(preview.title.clone())
+        .aria_description(preview.subtitle.clone())
         .flex()
         .flex_row()
         .items_center()
@@ -448,49 +491,73 @@ fn render_preview_surface(
     }
 
     if is_quick_look && preview.kind != PreviewKind::None {
-        header = header.child(fluent_button(
-            FluentButtonProps {
-                id: "ql-open-btn".into(),
-                glyph: None,
-                label: Some("Open"),
-                active: true,
-                enabled: true,
-                compact: true,
-                min_width: px(52.0),
-            },
-            theme,
-            cx.listener(|explorer, _, _, cx| {
-                explorer.open_selected_from_quick_look(cx);
+        header = header.child(
+            fluent_button(
+                FluentButtonProps {
+                    id: "ql-open-btn".into(),
+                    glyph: None,
+                    label: Some("Open"),
+                    active: true,
+                    enabled: true,
+                    compact: true,
+                    min_width: px(52.0),
+                },
+                theme,
+                cx.listener(|explorer, _, window, cx| {
+                    explorer.open_selected_from_quick_look(window, cx);
+                }),
+            )
+            .aria_label("Open the selected item")
+            .aria_keyshortcuts("Enter")
+            .when_some(open_focus, |button, focus| {
+                button
+                    .track_focus(focus)
+                    .focus_visible(|style| a11y::focus_ring_style(theme, style))
             }),
-        ));
+        );
     }
 
-    header = header.child(fluent_button(
-        FluentButtonProps {
-            id: if is_quick_look {
-                "ql-close-btn".into()
-            } else {
-                "preview-close-btn".into()
+    header = header.child(
+        fluent_button(
+            FluentButtonProps {
+                id: if is_quick_look {
+                    "ql-close-btn".into()
+                } else {
+                    "preview-close-btn".into()
+                },
+                glyph: Some(OnyxGlyph::Close),
+                label: None,
+                active: false,
+                enabled: true,
+                compact: true,
+                min_width: px(28.0),
             },
-            glyph: Some(OnyxGlyph::Close),
-            label: None,
-            active: false,
-            enabled: true,
-            compact: true,
-            min_width: px(28.0),
-        },
-        theme,
-        cx.listener(move |explorer, _, _, cx| {
-            if is_quick_look {
-                explorer.close_quick_look(cx);
-            } else {
-                explorer.close_preview_pane(cx);
-            }
+            theme,
+            cx.listener(move |explorer, _, window, cx| {
+                if is_quick_look {
+                    explorer.close_quick_look(window, cx);
+                } else {
+                    explorer.close_preview_pane(cx);
+                }
+            }),
+        )
+        .aria_label(if is_quick_look {
+            "Close Quick Look"
+        } else {
+            "Close the preview pane"
+        })
+        .when_some(close_focus, |button, focus| {
+            button
+                .track_focus(focus)
+                .focus_visible(|style| a11y::focus_ring_style(theme, style))
         }),
-    ));
+    );
 
     let body: AnyElement = match preview.kind {
         PreviewKind::None => div()
+            .id("preview-empty")
+            .role(Role::Status)
+            .aria_label("No preview available")
             .flex()
             .flex_col()
             .flex_1()
@@ -521,6 +588,9 @@ fn render_preview_surface(
             .into_any_element(),
 
         PreviewKind::Loading => div()
+            .id("preview-loading")
+            .role(Role::Status)
+            .aria_label("Loading preview")
             .flex()
             .flex_col()
             .flex_1()
@@ -541,6 +611,10 @@ fn render_preview_surface(
             .into_any_element(),
 
         PreviewKind::Error => div()
+            .id("preview-error")
+            .role(Role::Alert)
+            .aria_label("Preview failed")
+            .aria_description(preview.error.clone())
             .flex()
             .flex_1()
             .items_center()
@@ -656,6 +730,8 @@ fn render_preview_surface(
                 .child(
                     div()
                         .id(scroll_id)
+                        .role(Role::Document)
+                        .aria_label("File contents")
                         .flex_1()
                         .min_h(px(0.0))
                         .w_full()
@@ -668,7 +744,10 @@ fn render_preview_surface(
                         .font_family("Consolas")
                         .text_size(FONT_XS)
                         .text_color(theme.text_primary())
-                        .child(preview.text.clone()),
+                        .child(gpui_kit::Text::new(
+                            ElementId::Name(format!("{scroll_id}-text").into()),
+                            preview.text.clone().into(),
+                        )),
                 )
                 .into_any_element()
         }

@@ -3,13 +3,14 @@
 //! behavior, tooling and search-indexing rows that apply immediately and
 //! persist atomically through `ConfigStore`.
 
+use crate::components::a11y;
 use crate::components::{ActionButtonProps, fluent_action_button, fluent_chip, vertical_divider};
 use crate::explorer::OnyxExplorer;
 use crate::icons::{OnyxGlyph, render_glyph};
 use crate::theme::{FONT_LG, FONT_SM, FONT_XS, OnyxTheme, RADIUS_LG, RADIUS_MD, RADIUS_SM};
 use gpui_kit::{
     AnyElement, Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    Styled, Window, deferred, div, px,
+    Role, StatefulInteractiveElement, Styled, Window, deferred, div, px,
 };
 use onyx_core::{ThemeMode, ViewMode};
 use std::path::{Path, PathBuf};
@@ -187,9 +188,16 @@ pub fn render_settings_overlay(
     let hidden_excluded = hidden_excluded_count(&config.excluded_index_dirs);
     let excluded_count = config.excluded_index_dirs.len();
 
+    // Reading order: the header acts first, then every control row top to bottom.
+    let ring = &view.modals.settings;
+    ring.begin();
+    let esc_focus = ring.slot();
+    let close_focus = ring.slot();
+
     let theme_controls: Vec<AnyElement> = [ThemeMode::Dark, ThemeMode::Light, ThemeMode::System]
         .into_iter()
         .map(|mode| {
+            let handle = ring.slot();
             fluent_chip(
                 format!("settings-theme-{}", theme_label(mode)).into(),
                 theme_label(mode),
@@ -200,6 +208,11 @@ pub fn render_settings_overlay(
                     explorer.set_theme_mode(mode, window, cx);
                 }))),
             )
+            .role(Role::RadioButton)
+            .aria_label(format!("Theme: {}", theme_label(mode)))
+            .aria_selected(theme_mode == mode)
+            .track_focus(&handle)
+            .focus_visible(move |style| a11y::focus_ring_style(theme, style))
             .into_any_element()
         })
         .collect();
@@ -207,31 +220,40 @@ pub fn render_settings_overlay(
     let view_controls: Vec<AnyElement> = [ViewMode::Details, ViewMode::Grid]
         .into_iter()
         .map(|mode| {
+            let handle = ring.slot();
+            let is_active = matches!(
+                (default_view, mode),
+                (ViewMode::Grid, ViewMode::Grid)
+                    | (ViewMode::Details | ViewMode::List, ViewMode::Details)
+            );
             fluent_chip(
                 format!("settings-view-{}", view_label(mode)).into(),
                 view_label(mode),
-                matches!(
-                    (default_view, mode),
-                    (ViewMode::Grid, ViewMode::Grid)
-                        | (ViewMode::Details | ViewMode::List, ViewMode::Details)
-                ),
+                is_active,
                 true,
                 theme,
                 Some(Box::new(cx.listener(move |explorer, _, _, cx| {
                     explorer.set_default_view(mode, cx);
                 }))),
             )
+            .role(Role::RadioButton)
+            .aria_label(format!("Default view: {}", view_label(mode)))
+            .aria_selected(is_active)
+            .track_focus(&handle)
+            .focus_visible(move |style| a11y::focus_ring_style(theme, style))
             .into_any_element()
         })
         .collect();
 
     let boolean_controls = |id: &'static str,
+                            title: &'static str,
                             on: bool,
                             set: fn(&mut OnyxExplorer, bool, &mut Context<OnyxExplorer>)|
      -> Vec<AnyElement> {
         [false, true]
             .into_iter()
             .map(|value| {
+                let handle = ring.slot();
                 fluent_chip(
                     format!("{id}-{}", toggle_label(value)).into(),
                     toggle_label(value),
@@ -242,15 +264,53 @@ pub fn render_settings_overlay(
                         set(explorer, value, cx);
                     }))),
                 )
+                .role(Role::CheckBox)
+                .aria_label(format!("{title}: {}", toggle_label(value)))
+                .track_focus(&handle)
+                .focus_visible(move |style| a11y::focus_ring_style(theme, style))
                 .into_any_element()
             })
             .collect()
     };
 
+    // Tab order follows the reading order, so the boolean rows claim their
+    // focus stops before the terminal and exclusion controls are built.
+    let hidden_controls = boolean_controls(
+        "settings-hidden",
+        "Hidden files",
+        show_hidden,
+        OnyxExplorer::set_show_hidden,
+    );
+    let system_controls = boolean_controls(
+        "settings-system",
+        "Protected system files",
+        show_system,
+        OnyxExplorer::set_show_system,
+    );
+    let preview_controls = boolean_controls(
+        "settings-preview",
+        "Preview pane",
+        preview_visible,
+        OnyxExplorer::set_preview_visible,
+    );
+    let dual_controls = boolean_controls(
+        "settings-dual",
+        "Dual pane by default",
+        dual_pane_default,
+        OnyxExplorer::set_dual_pane_default,
+    );
+    let size_controls = boolean_controls(
+        "settings-sizes",
+        "Calculate folder sizes",
+        calculate_folder_sizes,
+        OnyxExplorer::set_calculate_folder_sizes,
+    );
+
     let terminal_controls: Vec<AnyElement> = TERMINAL_CHOICES
         .iter()
         .map(|(id, label)| {
             let profile = *id;
+            let handle = ring.slot();
             fluent_chip(
                 format!("settings-terminal-{profile}").into(),
                 label,
@@ -261,10 +321,16 @@ pub fn render_settings_overlay(
                     explorer.set_default_terminal(profile, cx);
                 }))),
             )
+            .role(Role::RadioButton)
+            .aria_label(format!("Default terminal: {label}"))
+            .aria_selected(terminal == profile)
+            .track_focus(&handle)
+            .focus_visible(move |style| a11y::focus_ring_style(theme, style))
             .into_any_element()
         })
         .collect();
 
+    let terminal_next_focus = ring.slot();
     let terminal_cycle_controls: Vec<AnyElement> = vec![
         fluent_action_button(
             ActionButtonProps {
@@ -285,9 +351,13 @@ pub fn render_settings_overlay(
                 explorer.set_default_terminal(next, cx);
             }),
         )
+        .aria_label("Next terminal profile")
+        .track_focus(&terminal_next_focus)
+        .focus_visible(move |style| a11y::focus_ring_style(theme, style))
         .into_any_element(),
     ];
 
+    let add_excluded_focus = ring.slot();
     let mut excluded_controls: Vec<AnyElement> = vec![
         fluent_action_button(
             ActionButtonProps {
@@ -308,9 +378,13 @@ pub fn render_settings_overlay(
                 explorer.add_excluded_index_dir(path, cx);
             }),
         )
+        .aria_label("Add the current folder to the excluded index folders")
+        .track_focus(&add_excluded_focus)
+        .focus_visible(move |style| a11y::focus_ring_style(theme, style))
         .into_any_element(),
     ];
     if excluded_count > 0 {
+        let clear_excluded_focus = ring.slot();
         excluded_controls.push(
             fluent_action_button(
                 ActionButtonProps {
@@ -328,6 +402,9 @@ pub fn render_settings_overlay(
                 theme,
                 cx.listener(|explorer, _, _, cx| explorer.clear_excluded_index_dirs(cx)),
             )
+            .aria_label("Clear all excluded index folders")
+            .track_focus(&clear_excluded_focus)
+            .focus_visible(move |style| a11y::focus_ring_style(theme, style))
             .into_any_element(),
         );
     }
@@ -360,51 +437,31 @@ pub fn render_settings_overlay(
             "Hidden files",
             "Show files and folders marked hidden.",
             theme,
-            boolean_controls(
-                "settings-hidden",
-                show_hidden,
-                OnyxExplorer::set_show_hidden,
-            ),
+            hidden_controls,
         ))
         .child(settings_row(
             "Protected system files",
             "Also list protected operating-system files.",
             theme,
-            boolean_controls(
-                "settings-system",
-                show_system,
-                OnyxExplorer::set_show_system,
-            ),
+            system_controls,
         ))
         .child(settings_row(
             "Preview pane",
             "Dock the preview beside the file panes.",
             theme,
-            boolean_controls(
-                "settings-preview",
-                preview_visible,
-                OnyxExplorer::set_preview_visible,
-            ),
+            preview_controls,
         ))
         .child(settings_row(
             "Dual pane by default",
             "Start every window with two file panes.",
             theme,
-            boolean_controls(
-                "settings-dual",
-                dual_pane_default,
-                OnyxExplorer::set_dual_pane_default,
-            ),
+            dual_controls,
         ))
         .child(settings_row(
             "Calculate folder sizes",
             "Recursively size folders in the background.",
             theme,
-            boolean_controls(
-                "settings-sizes",
-                calculate_folder_sizes,
-                OnyxExplorer::set_calculate_folder_sizes,
-            ),
+            size_controls,
         ))
         .child(section("TOOLS", theme))
         .child(settings_row(
@@ -423,6 +480,7 @@ pub fn render_settings_overlay(
             theme,
             boolean_controls(
                 "settings-indexed-search",
+                "Indexed search",
                 view.indexed_search,
                 OnyxExplorer::set_indexed_search,
             ),
@@ -441,11 +499,22 @@ pub fn render_settings_overlay(
         );
 
     if !excluded_labels.is_empty() {
-        let mut list = div().flex().flex_col().w_full().gap(px(4.0)).pl(px(4.0));
+        let mut list = div()
+            .id("settings-excluded-list")
+            .role(Role::List)
+            .aria_label("Excluded index folders")
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap(px(4.0))
+            .pl(px(4.0));
         for label in excluded_labels {
+            let remove_focus = ring.slot();
             list = list.child(
                 div()
                     .id(format!("settings-excluded-{label}"))
+                    .role(Role::ListItem)
+                    .aria_label(format!("Excluded folder {label}"))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -468,6 +537,10 @@ pub fn render_settings_overlay(
                     .child(
                         div()
                             .id(format!("settings-remove-excluded-{label}"))
+                            .role(Role::Button)
+                            .aria_label(format!("Remove excluded folder {label}"))
+                            .track_focus(&remove_focus)
+                            .focus_visible(move |style| a11y::focus_ring_style(theme, style))
                             .flex()
                             .items_center()
                             .justify_center()
@@ -541,33 +614,44 @@ pub fn render_settings_overlay(
                 .items_center()
                 .flex_shrink_0()
                 .gap(px(8.0))
-                .child(fluent_chip(
-                    "settings-esc-chip".into(),
-                    "Esc",
-                    false,
-                    true,
-                    theme,
-                    Some(Box::new(cx.listener(|explorer, _, window, cx| {
-                        explorer.close_settings(window, cx);
-                    }))),
-                ))
+                .child(
+                    fluent_chip(
+                        "settings-esc-chip".into(),
+                        "Esc",
+                        false,
+                        true,
+                        theme,
+                        Some(Box::new(cx.listener(|explorer, _, window, cx| {
+                            explorer.close_settings(window, cx);
+                        }))),
+                    )
+                    .aria_label("Close settings")
+                    .aria_keyshortcuts("Escape")
+                    .track_focus(&esc_focus)
+                    .focus_visible(|style| a11y::focus_ring_style(theme, style)),
+                )
                 .child(vertical_divider(theme, px(14.0)))
-                .child(fluent_action_button(
-                    ActionButtonProps {
-                        id: "settings-close".into(),
-                        glyph: Some(OnyxGlyph::Close),
-                        trailing_glyph: None,
-                        label: None,
-                        active: false,
-                        primary: false,
-                        danger: false,
-                        enabled: true,
-                        compact: true,
-                        min_width: px(28.0),
-                    },
-                    theme,
-                    cx.listener(|explorer, _, window, cx| explorer.close_settings(window, cx)),
-                )),
+                .child(
+                    fluent_action_button(
+                        ActionButtonProps {
+                            id: "settings-close".into(),
+                            glyph: Some(OnyxGlyph::Close),
+                            trailing_glyph: None,
+                            label: None,
+                            active: false,
+                            primary: false,
+                            danger: false,
+                            enabled: true,
+                            compact: true,
+                            min_width: px(28.0),
+                        },
+                        theme,
+                        cx.listener(|explorer, _, window, cx| explorer.close_settings(window, cx)),
+                    )
+                    .aria_label("Close settings")
+                    .track_focus(&close_focus)
+                    .focus_visible(|style| a11y::focus_ring_style(theme, style)),
+                ),
         );
 
     let viewport = window.viewport_size();
@@ -578,6 +662,11 @@ pub fn render_settings_overlay(
 
     let card = div()
         .id("settings-card")
+        .role(Role::Dialog)
+        .aria_label("Settings")
+        .aria_description(format!(
+            "Appearance, browsing behavior, terminal and search indexing, {excluded_count} excluded index folders"
+        ))
         .flex()
         .flex_col()
         .w(px(card_w))

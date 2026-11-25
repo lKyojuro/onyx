@@ -1,6 +1,7 @@
 //! Primary Onyx GPUI explorer coordinator wired to `onyx-core`, `onyx-fs`,
 //! `onyx-cache`, `onyx-config`, and `onyx-windows`.
 
+use crate::components::a11y::{self, ModalSurface, Modals};
 use crate::components::archive_overlay::{self, ArchiveViewState};
 use crate::components::command_palette::{
     self, CommandPaletteState, PaletteMode, file_search_query, palette_mode,
@@ -24,8 +25,8 @@ use crate::theme::OnyxTheme;
 use gpui_kit::{
     AppContext, ClipboardItem, Context, DispatchPhase, Entity, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, Render, RenderImage, ScrollEvent, ScrollHandle, Styled,
-    Subscription, UniformListScrollHandle, Window, canvas,
+    ParentElement, Pixels, Point, Render, RenderImage, Role, ScrollEvent, ScrollHandle,
+    StatefulInteractiveElement, Styled, Subscription, UniformListScrollHandle, Window, canvas,
     component::input::{InputEvent, InputState},
     div, point, px,
 };
@@ -445,6 +446,11 @@ pub struct OnyxExplorer {
     pub(crate) runtime: Arc<Runtime>,
     pub(crate) theme: OnyxTheme,
     pub(crate) focus_handle: FocusHandle,
+    /// Focus handles of the two file panes; the active pane owns the keyboard so
+    /// the screen reader reads its list and rows while navigating.
+    pub(crate) pane_focus: [FocusHandle; 2],
+    /// Focus rings of the modal surfaces, used for `Tab` trapping and focus return.
+    pub(crate) modals: Modals,
     pub(crate) tabs: TabManager,
     pub(crate) home_path: PathBuf,
     pub(crate) favorites: Vec<FavoriteItem>,
@@ -583,6 +589,8 @@ impl OnyxExplorer {
 
         let focus_handle = cx.focus_handle();
         let prompt_focus_handle = cx.focus_handle();
+        let pane_focus = [cx.focus_handle(), cx.focus_handle()];
+        let modals = Modals::new(cx);
         let home_path = dirs::home_dir().unwrap_or_else(|| initial_path.clone());
         let address_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter path and press Enter..."));
@@ -680,6 +688,8 @@ impl OnyxExplorer {
             runtime,
             theme,
             focus_handle,
+            pane_focus,
+            modals,
             tabs: TabManager::new(initial_path.clone()),
             home_path,
             favorites: Vec::new(),
@@ -779,6 +789,7 @@ impl OnyxExplorer {
         explorer.start_index_event_loop(index_events_rx, cx);
         explorer.spawn_bootstrap_sidebar_and_config(cx);
         explorer.load_directory(initial_path, false, true, cx);
+        window.focus(&explorer.pane_focus[0], cx);
         explorer
     }
 
@@ -1151,13 +1162,24 @@ impl OnyxExplorer {
         self.pane_path(self.active_pane).to_path_buf()
     }
 
-    pub fn set_active_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+    pub fn set_active_pane(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_pane == pane {
             return;
         }
         self.active_pane = pane;
+        // Keyboard focus follows the active pane so assistive technology keeps
+        // reading the list the user is navigating.
+        window.focus(self.pane_focus_handle(pane), cx);
         self.update_preview(cx);
         cx.notify();
+    }
+
+    /// Focus handle of a file pane, used by its list container.
+    pub(crate) fn pane_focus_handle(&self, pane: PaneId) -> &FocusHandle {
+        match pane {
+            PaneId::Primary => &self.pane_focus[0],
+            PaneId::Secondary => &self.pane_focus[1],
+        }
     }
 
     pub fn toggle_dual_pane(&mut self, cx: &mut Context<Self>) {
@@ -1628,8 +1650,14 @@ impl OnyxExplorer {
         self.address_editing = false;
         self.address_suggestions.clear();
         self.suggestion_index = None;
-        window.focus(&self.focus_handle, cx);
+        self.focus_active_pane(window, cx);
         cx.notify();
+    }
+
+    /// Moves the keyboard focus to the list of the active file pane, the surface
+    /// that owns arrow-key navigation.
+    pub fn focus_active_pane(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(self.pane_focus_handle(self.active_pane), cx);
     }
 
     fn on_address_changed(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -1740,7 +1768,7 @@ impl OnyxExplorer {
         self.address_editing = false;
         self.address_suggestions.clear();
         self.suggestion_index = None;
-        window.focus(&self.focus_handle, cx);
+        self.focus_active_pane(window, cx);
 
         if unquoted.is_empty() {
             cx.notify();
@@ -1786,7 +1814,7 @@ impl OnyxExplorer {
             self.update_preview(cx);
             self.queue_thumbnails(cx);
         }
-        window.focus(&self.focus_handle, cx);
+        self.focus_active_pane(window, cx);
         cx.notify();
     }
 
@@ -2190,9 +2218,9 @@ impl OnyxExplorer {
         }
     }
 
-    pub fn toggle_quick_look(&mut self, cx: &mut Context<Self>) {
+    pub fn toggle_quick_look(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.quick_look_open {
-            self.close_quick_look(cx);
+            self.close_quick_look(window, cx);
             return;
         }
         if self.overlay_open() {
@@ -2209,24 +2237,26 @@ impl OnyxExplorer {
             return;
         }
         self.quick_look_open = true;
+        a11y::open_modal(self, ModalSurface::QuickLook, 0, window, cx);
         self.update_preview(cx);
         cx.notify();
     }
 
-    pub fn close_quick_look(&mut self, cx: &mut Context<Self>) {
+    pub fn close_quick_look(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.quick_look_open {
             self.quick_look_open = false;
+            a11y::close_modal(self, ModalSurface::QuickLook, window, cx);
             self.update_preview(cx);
             cx.notify();
         }
     }
 
-    pub fn open_selected_from_quick_look(&mut self, cx: &mut Context<Self>) {
+    pub fn open_selected_from_quick_look(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.active_pane;
         let idx = self.pane_selected_index(pane);
-        self.close_quick_look(cx);
+        self.close_quick_look(window, cx);
         if let Some(idx) = idx {
-            self.activate_entry_in(pane, idx, cx);
+            self.activate_entry_in(pane, idx, window, cx);
         }
     }
 
@@ -2534,11 +2564,17 @@ impl OnyxExplorer {
         cx.notify();
     }
 
-    pub fn activate_entry(&mut self, idx: usize, cx: &mut Context<Self>) {
-        self.activate_entry_in(self.active_pane, idx, cx);
+    pub fn activate_entry(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate_entry_in(self.active_pane, idx, window, cx);
     }
 
-    pub fn activate_entry_in(&mut self, pane: PaneId, idx: usize, cx: &mut Context<Self>) {
+    pub fn activate_entry_in(
+        &mut self,
+        pane: PaneId,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(entry) = self.pane_entries(pane).get(idx).cloned() else {
             return;
         };
@@ -2548,7 +2584,7 @@ impl OnyxExplorer {
                 PaneId::Secondary => self.load_secondary_directory(entry.path, true, cx),
             }
         } else if entry_is_archive(&entry) {
-            self.open_archive_browser(entry.path, cx);
+            self.open_archive_browser(entry.path, window, cx);
         } else {
             let path = entry.path;
             self.runtime.spawn_blocking(move || {
@@ -3213,6 +3249,7 @@ impl OnyxExplorer {
             is_danger,
             show_input,
         });
+        a11y::open_modal(self, ModalSurface::Prompt, 0, window, cx);
         if show_input {
             let value = initial_input.to_string();
             self.prompt_input.update(cx, |input, cx| {
@@ -3221,13 +3258,42 @@ impl OnyxExplorer {
             });
         } else {
             window.focus(&self.prompt_focus_handle, cx);
+            a11y::focus_modal_slot(self, ModalSurface::Prompt, 0, window, cx);
         }
         cx.notify();
     }
 
+    /// Walks the prompt dialog stops: the name field (when it has one), Cancel
+    /// and Confirm. The text field lives in an `InputState`, so it is focused by
+    /// entity rather than through the ring slot it occupies.
+    fn step_prompt_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let show_input = self.prompt_state.as_ref().is_some_and(|p| p.show_input);
+        let input_focused = show_input
+            && self
+                .prompt_input
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window);
+        let focused_slot = a11y::modal_focused_slot(self, ModalSurface::Prompt, window);
+        let current = if input_focused {
+            Some(0)
+        } else {
+            focused_slot.map(|slot| if show_input { slot + 1 } else { slot })
+        };
+        let count = if show_input { 3 } else { 2 };
+        let next = a11y::next_stop(current, forward, count);
+        if show_input && next == 0 {
+            self.prompt_input
+                .update(cx, |input, cx| input.focus(window, cx));
+        } else {
+            let slot = if show_input { next - 1 } else { next };
+            a11y::focus_modal_slot(self, ModalSurface::Prompt, slot, window, cx);
+        }
+    }
+
     pub fn cancel_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.prompt_state = None;
-        window.focus(&self.focus_handle, cx);
+        a11y::close_modal(self, ModalSurface::Prompt, window, cx);
         cx.notify();
     }
 
@@ -3236,7 +3302,7 @@ impl OnyxExplorer {
             return;
         };
         let input_text = self.prompt_input.read(cx).value().to_string();
-        window.focus(&self.focus_handle, cx);
+        a11y::close_modal(self, ModalSurface::Prompt, window, cx);
 
         let operation = match prompt.kind {
             PromptKind::NewFolder(parent) => FileOperation::Create {
@@ -3489,6 +3555,7 @@ impl OnyxExplorer {
         &mut self,
         idx: usize,
         position: Point<Pixels>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let pane = self.active_pane;
@@ -3507,12 +3574,14 @@ impl OnyxExplorer {
             f32::from(position.y),
             self.can_paste,
         ));
+        a11y::open_modal(self, ModalSurface::ContextMenu, 0, window, cx);
         cx.notify();
     }
 
     pub fn open_background_context_menu(
         &mut self,
         position: Point<Pixels>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.context_menu = Some(ContextMenuState::new(
@@ -3523,11 +3592,13 @@ impl OnyxExplorer {
             f32::from(position.y),
             self.can_paste,
         ));
+        a11y::open_modal(self, ModalSurface::ContextMenu, 0, window, cx);
         cx.notify();
     }
 
-    pub fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+    pub fn close_context_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.context_menu.take().is_some() {
+            a11y::close_modal(self, ModalSurface::ContextMenu, window, cx);
             cx.notify();
         }
     }
@@ -3541,11 +3612,12 @@ impl OnyxExplorer {
         let Some(state) = self.context_menu.take() else {
             return;
         };
+        a11y::close_modal(self, ModalSurface::ContextMenu, window, cx);
         cx.notify();
 
         match (action, state.target) {
             (ContextMenuAction::Open, ContextMenuTarget::Item { index, .. }) => {
-                self.activate_entry(index, cx);
+                self.activate_entry(index, window, cx);
             }
             (
                 ContextMenuAction::OpenInNewTab,
@@ -3745,7 +3817,12 @@ impl OnyxExplorer {
     // ---- Archive browser & ZIP actions (Stage 3B) ----
 
     /// Opens the archive browser for `path` and lists its entries asynchronously.
-    pub fn open_archive_browser(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    pub fn open_archive_browser(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.archive_cancel.cancel();
         let cancel = CancellationToken::new();
         self.archive_cancel = cancel.clone();
@@ -3759,6 +3836,7 @@ impl OnyxExplorer {
         self.prompt_state = None;
         self.drag = None;
         self.archive = Some(ArchiveViewState::new(path.clone()));
+        a11y::open_modal(self, ModalSurface::Archive, 1, window, cx);
         cx.notify();
 
         let runtime = Arc::clone(&self.runtime);
@@ -3798,7 +3876,7 @@ impl OnyxExplorer {
     pub fn close_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.archive.take().is_some() {
             self.archive_cancel.cancel();
-            window.focus(&self.focus_handle, cx);
+            a11y::close_modal(self, ModalSurface::Archive, window, cx);
             cx.notify();
         }
     }
@@ -3932,7 +4010,7 @@ impl OnyxExplorer {
     }
 
     /// Opens the archive browser for the selected archive.
-    pub fn browse_selected_archive(&mut self, cx: &mut Context<Self>) {
+    pub fn browse_selected_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.selected_entry() else {
             return;
         };
@@ -3942,7 +4020,7 @@ impl OnyxExplorer {
             return;
         }
         let path = entry.path.clone();
-        self.open_archive_browser(path, cx);
+        self.open_archive_browser(path, window, cx);
     }
 
     // ---- Internal drag & drop (Stage 3B) ----
@@ -4161,6 +4239,25 @@ impl OnyxExplorer {
 
     /// Reports whether a blocking overlay owns the keyboard right now.
     #[must_use]
+    /// Modal surface that currently owns the keyboard, in key-routing order.
+    pub(crate) fn active_modal_surface(&self) -> Option<ModalSurface> {
+        if self.context_menu.is_some() {
+            Some(ModalSurface::ContextMenu)
+        } else if self.prompt_state.is_some() {
+            Some(ModalSurface::Prompt)
+        } else if self.command_palette.is_some() {
+            Some(ModalSurface::Palette)
+        } else if self.archive.is_some() {
+            Some(ModalSurface::Archive)
+        } else if self.settings_open {
+            Some(ModalSurface::Settings)
+        } else if self.quick_look_open {
+            Some(ModalSurface::QuickLook)
+        } else {
+            None
+        }
+    }
+
     pub fn overlay_open(&self) -> bool {
         self.command_palette.is_some() || self.settings_open || self.archive_is_open()
     }
@@ -4170,6 +4267,7 @@ impl OnyxExplorer {
         self.prompt_state = None;
         self.settings_open = false;
         self.quick_look_open = false;
+        a11y::remember_modal_focus(self, ModalSurface::Palette, window, cx);
         self.palette_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.focus(window, cx);
@@ -4182,7 +4280,7 @@ impl OnyxExplorer {
         if let Some(mut palette) = self.command_palette.take() {
             // A palette file search dies with the modal that asked for it.
             palette.search.cancel();
-            window.focus(&self.focus_handle, cx);
+            a11y::close_modal(self, ModalSurface::Palette, window, cx);
             cx.notify();
         }
     }
@@ -4345,7 +4443,7 @@ impl OnyxExplorer {
             "refresh" => self.refresh(cx),
             "up" => self.go_up(cx),
             "favorite" => self.toggle_favorite(cx),
-            "quick-look" => self.toggle_quick_look(cx),
+            "quick-look" => self.toggle_quick_look(window, cx),
             "theme" => self.toggle_theme(window, cx),
             "view-mode" => self.toggle_view_mode(cx),
             "hidden" => self.set_show_hidden(!self.show_hidden, cx),
@@ -4369,7 +4467,7 @@ impl OnyxExplorer {
             "compress-zip" => self.compress_selection_to_zip(cx),
             "extract-here" => self.extract_selected_archive(cx),
             "extract-to-folder" => self.extract_selection_to_folder(cx),
-            "browse-archive" => self.browse_selected_archive(cx),
+            "browse-archive" => self.browse_selected_archive(window, cx),
             "index" => self.toggle_indexed_search(cx),
             "index-rebuild" => self.rebuild_index(cx),
             _ => {}
@@ -4392,14 +4490,16 @@ impl OnyxExplorer {
         self.prompt_state = None;
         self.quick_look_open = false;
         self.settings_open = true;
-        window.focus(&self.focus_handle, cx);
+        // Start on the first settings control; the header close affordances are
+        // reachable with Shift+Tab.
+        a11y::open_modal(self, ModalSurface::Settings, 2, window, cx);
         cx.notify();
     }
 
     pub fn close_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings_open {
             self.settings_open = false;
-            window.focus(&self.focus_handle, cx);
+            a11y::close_modal(self, ModalSurface::Settings, window, cx);
             cx.notify();
         }
     }
@@ -4561,10 +4661,27 @@ impl OnyxExplorer {
         let key = ev.keystroke.key.as_str();
         let mods = &ev.keystroke.modifiers;
 
+        // Modal surfaces own the keyboard: Tab walks their stops in reading order
+        // and wraps there, so it can never reach the panes behind the surface.
+        if let Some(surface) = self.active_modal_surface()
+            && key == "tab"
+        {
+            match surface {
+                ModalSurface::Palette if a11y::modal_slot_is_focused(self, surface, 0, window) => {
+                    self.palette_input
+                        .update(cx, |input, cx| input.focus(window, cx));
+                }
+                ModalSurface::Prompt => self.step_prompt_focus(!mods.shift, window, cx),
+                _ => a11y::step_modal_focus(self, surface, !mods.shift, window, cx),
+            }
+            cx.stop_propagation();
+            return;
+        }
+
         if let Some(menu) = &mut self.context_menu {
             match key {
                 "escape" => {
-                    self.close_context_menu(cx);
+                    self.close_context_menu(window, cx);
                     cx.stop_propagation();
                     return;
                 }
@@ -4602,6 +4719,10 @@ impl OnyxExplorer {
         // The command palette stays modal: it owns the keyboard while open and
         // routes Escape/arrows/Enter itself.
         if self.command_palette.is_some() {
+            // Enter runs the highlighted command while the result list itself
+            // owns the keyboard; the query field handles Enter through its own
+            // submit listener.
+            let list_focused = a11y::modal_slot_is_focused(self, ModalSurface::Palette, 0, window);
             match key {
                 "escape" => {
                     self.close_command_palette(window, cx);
@@ -4615,6 +4736,14 @@ impl OnyxExplorer {
                 }
                 "down" => {
                     self.palette_move_focus(1, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                "enter" if list_focused => {
+                    let selected = self.palette_selected_id();
+                    if let Some(id) = selected {
+                        self.run_palette_command(id, window, cx);
+                    }
                     cx.stop_propagation();
                     return;
                 }
@@ -4752,7 +4881,7 @@ impl OnyxExplorer {
         if self.quick_look_open {
             match key {
                 "escape" | "space" | " " => {
-                    self.close_quick_look(cx);
+                    self.close_quick_look(window, cx);
                     cx.stop_propagation();
                 }
                 "left" | "up" => {
@@ -4764,7 +4893,7 @@ impl OnyxExplorer {
                     cx.stop_propagation();
                 }
                 "enter" => {
-                    self.open_selected_from_quick_look(cx);
+                    self.open_selected_from_quick_look(window, cx);
                     cx.stop_propagation();
                 }
                 _ => {}
@@ -4773,7 +4902,7 @@ impl OnyxExplorer {
         }
 
         if !mods.control && !mods.alt && (key == "space" || key == " ") {
-            self.toggle_quick_look(cx);
+            self.toggle_quick_look(window, cx);
             cx.stop_propagation();
             return;
         }
@@ -4847,7 +4976,7 @@ impl OnyxExplorer {
                 "down" => self.move_selection(cols, cx),
                 "enter" => {
                     if let Some(idx) = self.pane_selected_index(self.active_pane) {
-                        self.activate_entry(idx, cx);
+                        self.activate_entry(idx, window, cx);
                     }
                 }
                 "backspace" => self.go_up(cx),
@@ -4859,7 +4988,7 @@ impl OnyxExplorer {
                 "down" => self.move_selection(1, cx),
                 "enter" => {
                     if let Some(idx) = self.pane_selected_index(self.active_pane) {
-                        self.activate_entry(idx, cx);
+                        self.activate_entry(idx, window, cx);
                     }
                 }
                 "backspace" => self.go_up(cx),
@@ -4937,6 +5066,8 @@ impl Render for OnyxExplorer {
 
         let mut root = div()
             .id("onyx-root")
+            .role(Role::Application)
+            .aria_label("Onyx")
             .relative()
             .flex()
             .flex_col()

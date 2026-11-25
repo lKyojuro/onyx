@@ -5,8 +5,8 @@ use crate::explorer::OnyxExplorer;
 use crate::icons::{OnyxGlyph, render_glyph, render_onyx_emblem};
 use crate::theme::{FONT_SM, OnyxTheme, RADIUS_SM};
 use gpui_kit::{
-    Context, FontWeight, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, Window, WindowControlArea, div, px,
+    Context, FontWeight, InteractiveElement, IntoElement, MouseButton, Orientation, ParentElement,
+    Role, StatefulInteractiveElement, Styled, Window, WindowControlArea, div, px,
 };
 use onyx_core::ViewMode;
 
@@ -23,6 +23,10 @@ pub fn render_tab_bar(
     let is_maximized = window.is_maximized();
 
     let mut tab_strip = div()
+        .id("win11-tab-strip")
+        .role(Role::TabList)
+        .aria_label("Folder tabs")
+        .aria_orientation(Orientation::Horizontal)
         .flex()
         .flex_row()
         .items_end()
@@ -45,6 +49,11 @@ pub fn render_tab_bar(
 
         let mut tab_card = div()
             .id(("win11-tab", tab_id))
+            .role(Role::Tab)
+            .aria_label(title.clone())
+            .aria_selected(is_active)
+            .aria_position_in_set(idx + 1)
+            .aria_size_of_set(tab_count)
             .relative()
             .flex()
             .flex_row()
@@ -140,12 +149,14 @@ pub fn render_tab_bar(
         if is_active {
             title_el = title_el.font_weight(FontWeight::SEMIBOLD);
         }
-        tab_card = tab_card.child(title_el.child(title));
+        tab_card = tab_card.child(title_el.child(title.clone()));
 
         if tab_count > 1 && idx > 0 {
             tab_card = tab_card.child(
                 div()
                     .id(("tab-left", tab_id))
+                    .role(Role::Button)
+                    .aria_label("Move tab left")
                     .flex()
                     .items_center()
                     .justify_center()
@@ -173,6 +184,8 @@ pub fn render_tab_bar(
             tab_card = tab_card.child(
                 div()
                     .id(("tab-right", tab_id))
+                    .role(Role::Button)
+                    .aria_label("Move tab right")
                     .flex()
                     .items_center()
                     .justify_center()
@@ -200,6 +213,8 @@ pub fn render_tab_bar(
         tab_card = tab_card.child(
             div()
                 .id(("tab-close", tab_id))
+                .role(Role::Button)
+                .aria_label(format!("Close tab {title}"))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -251,19 +266,22 @@ pub fn render_tab_bar(
                 .h(px(34.0))
                 .pl(px(4.0))
                 .pb(px(2.0))
-                .child(fluent_button(
-                    FluentButtonProps {
-                        id: "new-tab-btn".into(),
-                        glyph: Some(OnyxGlyph::Plus),
-                        label: None,
-                        active: false,
-                        enabled: true,
-                        compact: true,
-                        min_width: px(28.0),
-                    },
-                    theme,
-                    cx.listener(|explorer, _, _, cx| explorer.new_tab(cx)),
-                )),
+                .child(
+                    fluent_button(
+                        FluentButtonProps {
+                            id: "new-tab-btn".into(),
+                            glyph: Some(OnyxGlyph::Plus),
+                            label: None,
+                            active: false,
+                            enabled: true,
+                            compact: true,
+                            min_width: px(28.0),
+                        },
+                        theme,
+                        cx.listener(|explorer, _, _, cx| explorer.new_tab(cx)),
+                    )
+                    .aria_label("New tab"),
+                ),
         )
         // Native Windows 11 draggable caption area filling remaining titlebar width
         .child(
@@ -288,81 +306,111 @@ pub fn render_tab_bar(
         .flex_shrink_0()
         .gap(px(4.0))
         .pr(px(6.0))
-        .child(fluent_button(
-            FluentButtonProps {
-                id: "toggle-sidebar-btn".into(),
-                glyph: Some(OnyxGlyph::PanelLeft),
-                label: None,
-                active: view.sidebar_visible,
-                enabled: true,
-                compact: true,
-                min_width: px(28.0),
-            },
-            theme,
-            cx.listener(|explorer, _, _, cx| explorer.toggle_sidebar(cx)),
-        ))
-        .child(fluent_button(
-            FluentButtonProps {
-                id: "toggle-view-btn".into(),
-                glyph: Some(match view.view_mode {
-                    ViewMode::Grid => OnyxGlyph::Grid,
-                    ViewMode::Details | ViewMode::List => OnyxGlyph::List,
-                }),
-                label: Some(match view.view_mode {
-                    ViewMode::Grid => "Grid",
-                    ViewMode::Details | ViewMode::List => "Details",
-                }),
-                active: false,
-                enabled: true,
-                compact: true,
-                min_width: px(28.0),
-            },
-            theme,
-            cx.listener(|explorer, _, _, cx| explorer.toggle_view_mode(cx)),
-        ))
-        .child(fluent_button(
-            FluentButtonProps {
-                id: "toggle-hidden-btn".into(),
-                glyph: Some(OnyxGlyph::Eye),
-                label: None,
-                active: view.show_hidden,
-                enabled: true,
-                compact: true,
-                min_width: px(28.0),
-            },
-            theme,
-            cx.listener(|explorer, _, _, cx| explorer.toggle_hidden(cx)),
-        ))
-        .child(fluent_button(
-            FluentButtonProps {
-                id: "toggle-preview-btn".into(),
-                glyph: Some(OnyxGlyph::PanelRight),
-                label: None,
-                active: view.preview_visible,
-                enabled: true,
-                compact: true,
-                min_width: px(28.0),
-            },
-            theme,
-            cx.listener(|explorer, _, _, cx| explorer.toggle_preview_pane(cx)),
-        ))
-        .child(fluent_button(
-            FluentButtonProps {
-                id: "toggle-theme-btn".into(),
-                glyph: Some(if theme.dark_mode {
-                    OnyxGlyph::Sun
-                } else {
-                    OnyxGlyph::Moon
-                }),
-                label: None,
-                active: false,
-                enabled: true,
-                compact: true,
-                min_width: px(28.0),
-            },
-            theme,
-            cx.listener(|explorer, _, window, cx| explorer.toggle_theme(window, cx)),
-        ));
+        .child(
+            fluent_button(
+                FluentButtonProps {
+                    id: "toggle-sidebar-btn".into(),
+                    glyph: Some(OnyxGlyph::PanelLeft),
+                    label: None,
+                    active: view.sidebar_visible,
+                    enabled: true,
+                    compact: true,
+                    min_width: px(28.0),
+                },
+                theme,
+                cx.listener(|explorer, _, _, cx| explorer.toggle_sidebar(cx)),
+            )
+            .aria_label(if view.sidebar_visible {
+                "Hide the sidebar"
+            } else {
+                "Show the sidebar"
+            }),
+        )
+        .child(
+            fluent_button(
+                FluentButtonProps {
+                    id: "toggle-view-btn".into(),
+                    glyph: Some(match view.view_mode {
+                        ViewMode::Grid => OnyxGlyph::Grid,
+                        ViewMode::Details | ViewMode::List => OnyxGlyph::List,
+                    }),
+                    label: Some(match view.view_mode {
+                        ViewMode::Grid => "Grid",
+                        ViewMode::Details | ViewMode::List => "Details",
+                    }),
+                    active: false,
+                    enabled: true,
+                    compact: true,
+                    min_width: px(28.0),
+                },
+                theme,
+                cx.listener(|explorer, _, _, cx| explorer.toggle_view_mode(cx)),
+            )
+            .aria_label(match view.view_mode {
+                ViewMode::Grid => "Switch to details view",
+                ViewMode::Details | ViewMode::List => "Switch to grid view",
+            }),
+        )
+        .child(
+            fluent_button(
+                FluentButtonProps {
+                    id: "toggle-hidden-btn".into(),
+                    glyph: Some(OnyxGlyph::Eye),
+                    label: None,
+                    active: view.show_hidden,
+                    enabled: true,
+                    compact: true,
+                    min_width: px(28.0),
+                },
+                theme,
+                cx.listener(|explorer, _, _, cx| explorer.toggle_hidden(cx)),
+            )
+            .aria_label(if view.show_hidden {
+                "Hide hidden files"
+            } else {
+                "Show hidden files"
+            }),
+        )
+        .child(
+            fluent_button(
+                FluentButtonProps {
+                    id: "toggle-preview-btn".into(),
+                    glyph: Some(OnyxGlyph::PanelRight),
+                    label: None,
+                    active: view.preview_visible,
+                    enabled: true,
+                    compact: true,
+                    min_width: px(28.0),
+                },
+                theme,
+                cx.listener(|explorer, _, _, cx| explorer.toggle_preview_pane(cx)),
+            )
+            .aria_label("Toggle the preview pane"),
+        )
+        .child(
+            fluent_button(
+                FluentButtonProps {
+                    id: "toggle-theme-btn".into(),
+                    glyph: Some(if theme.dark_mode {
+                        OnyxGlyph::Sun
+                    } else {
+                        OnyxGlyph::Moon
+                    }),
+                    label: None,
+                    active: false,
+                    enabled: true,
+                    compact: true,
+                    min_width: px(28.0),
+                },
+                theme,
+                cx.listener(|explorer, _, window, cx| explorer.toggle_theme(window, cx)),
+            )
+            .aria_label(if theme.dark_mode {
+                "Switch to the light theme"
+            } else {
+                "Switch to the dark theme"
+            }),
+        );
 
     // Native Windows 11 window control buttons (`WindowControlArea::Min/Max/Close`)
     let window_controls = div()
@@ -373,6 +421,7 @@ pub fn render_tab_bar(
         .h_full()
         .child(win_control_btn(
             "win-min",
+            "Minimize",
             OnyxGlyph::WindowMinimize,
             WindowControlArea::Min,
             false,
@@ -380,6 +429,7 @@ pub fn render_tab_bar(
         ))
         .child(win_control_btn(
             "win-max",
+            if is_maximized { "Restore" } else { "Maximize" },
             if is_maximized {
                 OnyxGlyph::WindowRestore
             } else {
@@ -391,6 +441,7 @@ pub fn render_tab_bar(
         ))
         .child(win_control_btn(
             "win-close",
+            "Close",
             OnyxGlyph::Close,
             WindowControlArea::Close,
             true,
@@ -436,6 +487,7 @@ pub fn render_tab_bar(
 
 fn win_control_btn(
     id: &'static str,
+    label: &'static str,
     glyph: OnyxGlyph,
     area: WindowControlArea,
     is_close: bool,
@@ -443,6 +495,8 @@ fn win_control_btn(
 ) -> impl IntoElement {
     div()
         .id(id)
+        .role(Role::Button)
+        .aria_label(label)
         .flex()
         .items_center()
         .justify_center()

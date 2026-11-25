@@ -2,13 +2,14 @@
 //! - `PromptDialogModal` (New Folder, Rename, Permanent Delete confirmation)
 //! - `OperationProgressCard` (bottom-right floating progress toast with Cancel)
 
+use crate::components::a11y;
 use crate::components::{ActionButtonProps, fluent_action_button};
 use crate::explorer::OnyxExplorer;
 use crate::icons::{OnyxGlyph, render_glyph};
 use crate::theme::{FONT_LG, FONT_MD, FONT_SM, FONT_XS, RADIUS_LG, RADIUS_MD};
 use gpui_kit::{
     Context, FontWeight, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
-    Styled, component::input::Input, deferred, div, px,
+    Role, StatefulInteractiveElement, Styled, component::input::Input, deferred, div, px,
 };
 
 const PROGRESS_TRACK_WIDTH: f32 = 306.0;
@@ -24,11 +25,25 @@ pub fn render_prompt_dialog(
     let show_input = prompt.show_input;
     let title = prompt.title.clone();
     let message = prompt.message.clone();
+    // Name + explanation for the dialog and its input, kept before the visible
+    // text nodes take ownership of the strings.
+    let a11y_title = title.clone();
+    let description = if message.is_empty() {
+        title.clone()
+    } else {
+        format!("{title}. {message}")
+    };
     let confirm_label = if prompt.confirm_label.is_empty() {
         "Confirm".to_string()
     } else {
         prompt.confirm_label.clone()
     };
+
+    // Tab order inside the dialog: Cancel, then Confirm.
+    let ring = &view.modals.prompt;
+    ring.begin();
+    let cancel_focus = ring.slot();
+    let confirm_focus = ring.slot();
 
     let mut header = div().flex().flex_row().items_center().gap(px(8.0));
     if is_danger {
@@ -90,7 +105,12 @@ pub fn render_prompt_dialog(
                         .min_w(px(0.0))
                         .text_size(FONT_MD)
                         .text_color(theme.text_primary())
-                        .child(Input::new(&view.prompt_input).appearance(false)),
+                        .child(
+                            Input::new(&view.prompt_input)
+                                .appearance(false)
+                                .aria_label(a11y_title.clone())
+                                .accessibility_id("prompt-name-input"),
+                        ),
                 ),
         );
     }
@@ -101,43 +121,60 @@ pub fn render_prompt_dialog(
         .items_center()
         .justify_end()
         .gap(px(8.0))
-        .child(fluent_action_button(
-            ActionButtonProps {
-                id: "prompt-cancel-btn".into(),
-                glyph: None,
-                trailing_glyph: None,
-                label: Some("Cancel"),
-                active: false,
-                primary: false,
-                danger: false,
-                enabled: true,
-                compact: false,
-                min_width: px(72.0),
-            },
-            theme,
-            cx.listener(|explorer, _, window, cx| explorer.cancel_prompt(window, cx)),
-        ))
-        .child(fluent_action_button(
-            ActionButtonProps {
-                id: "prompt-confirm-btn".into(),
-                glyph: None,
-                trailing_glyph: None,
-                label: Some(&confirm_label),
-                active: false,
-                primary: true,
-                danger: is_danger,
-                enabled: true,
-                compact: false,
-                min_width: px(84.0),
-            },
-            theme,
-            cx.listener(|explorer, _, window, cx| explorer.confirm_prompt(window, cx)),
-        ));
+        .child(
+            fluent_action_button(
+                ActionButtonProps {
+                    id: "prompt-cancel-btn".into(),
+                    glyph: None,
+                    trailing_glyph: None,
+                    label: Some("Cancel"),
+                    active: false,
+                    primary: false,
+                    danger: false,
+                    enabled: true,
+                    compact: false,
+                    min_width: px(72.0),
+                },
+                theme,
+                cx.listener(|explorer, _, window, cx| explorer.cancel_prompt(window, cx)),
+            )
+            .track_focus(&cancel_focus)
+            .focus_visible(|style| a11y::focus_ring_style(theme, style))
+            .aria_keyshortcuts("Escape"),
+        )
+        .child(
+            fluent_action_button(
+                ActionButtonProps {
+                    id: "prompt-confirm-btn".into(),
+                    glyph: None,
+                    trailing_glyph: None,
+                    label: Some(&confirm_label),
+                    active: false,
+                    primary: true,
+                    danger: is_danger,
+                    enabled: true,
+                    compact: false,
+                    min_width: px(84.0),
+                },
+                theme,
+                cx.listener(|explorer, _, window, cx| explorer.confirm_prompt(window, cx)),
+            )
+            .track_focus(&confirm_focus)
+            .focus_visible(|style| a11y::focus_ring_style(theme, style))
+            .aria_keyshortcuts("Enter"),
+        );
 
     body = body.child(footer);
 
     let card = div()
         .id("prompt-dialog-card")
+        .role(if is_danger {
+            Role::AlertDialog
+        } else {
+            Role::Dialog
+        })
+        .aria_label(a11y_title)
+        .aria_description(description)
         .relative()
         .flex()
         .flex_col()
@@ -265,6 +302,12 @@ pub fn render_operation_progress_toast(
     }
 
     let progress_track = div()
+        .id("op-progress-bar")
+        .role(Role::ProgressIndicator)
+        .aria_label(title.to_string())
+        .aria_numeric_value(f64::from(clamped) * 100.0)
+        .aria_min_numeric_value(0.0)
+        .aria_max_numeric_value(100.0)
         .w_full()
         .h(px(6.0))
         .rounded(px(3.0))
@@ -294,22 +337,25 @@ pub fn render_operation_progress_toast(
                 .text_color(theme.text_muted())
                 .child(op.detail.clone()),
         )
-        .child(fluent_action_button(
-            ActionButtonProps {
-                id: "op-toast-cancel".into(),
-                glyph: None,
-                trailing_glyph: None,
-                label: Some("Cancel"),
-                active: false,
-                primary: false,
-                danger: true,
-                enabled: true,
-                compact: true,
-                min_width: px(56.0),
-            },
-            theme,
-            cx.listener(|explorer, _, _, cx| explorer.cancel_operation(cx)),
-        ));
+        .child(
+            fluent_action_button(
+                ActionButtonProps {
+                    id: "op-toast-cancel".into(),
+                    glyph: None,
+                    trailing_glyph: None,
+                    label: Some("Cancel"),
+                    active: false,
+                    primary: false,
+                    danger: true,
+                    enabled: true,
+                    compact: true,
+                    min_width: px(56.0),
+                },
+                theme,
+                cx.listener(|explorer, _, _, cx| explorer.cancel_operation(cx)),
+            )
+            .aria_label("Cancel file operation"),
+        );
 
     content = content.child(progress_track).child(footer);
 
@@ -317,6 +363,8 @@ pub fn render_operation_progress_toast(
         deferred(
             div()
                 .id("op-progress-toast")
+                .role(Role::Status)
+                .aria_label(format!("{title}, {pct} percent"))
                 .absolute()
                 .right(px(16.0))
                 .bottom(px(42.0))

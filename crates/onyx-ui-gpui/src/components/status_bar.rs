@@ -1,10 +1,14 @@
 //! Status bar matching `status_bar.slint` + animated 7x7 Amber LED Dot-Matrix Pill.
 
+use crate::components::a11y;
 use crate::components::{fluent_chip, vertical_divider};
 use crate::explorer::OnyxExplorer;
 use crate::led_pill::render_led_status_pill;
 use crate::theme::FONT_XS;
-use gpui_kit::{Context, FontWeight, IntoElement, ParentElement, Styled, div, px};
+use gpui_kit::{
+    Context, FontWeight, InteractiveElement, IntoElement, ParentElement, Role,
+    StatefulInteractiveElement, Styled, div, px,
+};
 use onyx_core::{ViewMode, normalize_display_path};
 
 /// Renders the 30px bottom status bar with counts, selection info, path, mode badges, and LED pill.
@@ -32,6 +36,14 @@ pub fn render_status_bar(view: &OnyxExplorer, cx: &mut Context<OnyxExplorer>) ->
 
     let display_path = normalize_display_path(view.pane_path(view.active_pane));
     let search_status = view.search_status_label();
+
+    // One spoken sentence for the whole bar: counts, selection, path and modes.
+    let summary = format!(
+        "{items_text}, {}, {display_path}, {} view{}",
+        selection_text.as_deref().unwrap_or("nothing selected"),
+        a11y::view_mode_label(view.view_mode),
+        if view.dual_pane { ", dual pane" } else { "" },
+    );
 
     let mut left_group = div()
         .flex()
@@ -123,6 +135,19 @@ pub fn render_status_bar(view: &OnyxExplorer, cx: &mut Context<OnyxExplorer>) ->
                 explorer.toggle_dual_pane(cx);
             }))),
         ))
+        .child(
+            fluent_chip(
+                "status-dual-chip".into(),
+                "Dual",
+                view.dual_pane,
+                true,
+                theme,
+                Some(Box::new(cx.listener(|explorer, _, _, cx| {
+                    explorer.toggle_dual_pane(cx);
+                }))),
+            )
+            .aria_label("Dual-pane layout"),
+        )
         .child(fluent_chip(
             "status-view-chip".into(),
             match view.view_mode {
@@ -142,6 +167,9 @@ pub fn render_status_bar(view: &OnyxExplorer, cx: &mut Context<OnyxExplorer>) ->
         ));
 
     div()
+        .id("onyx-status-bar")
+        .role(Role::Status)
+        .aria_label(summary)
         .flex()
         .flex_row()
         .items_center()
