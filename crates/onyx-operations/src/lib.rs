@@ -13,9 +13,9 @@ pub mod types;
 pub mod undo;
 
 pub use archive::{
-    ArchiveEntry, ArchiveLimits, DEFAULT_MAX_ARCHIVE_ENTRIES,
+    ArchiveEntry, ArchiveFormat, ArchiveLimits, DEFAULT_MAX_ARCHIVE_ENTRIES,
     DEFAULT_MAX_ARCHIVE_UNCOMPRESSED_BYTES, DEFAULT_MAX_COMPRESSION_RATIO, create_archive,
-    extract_archive, extract_archive_with_limits, list_archive_entries,
+    extract_archive, extract_archive_with_limits, is_supported_archive_path, list_archive_entries,
     list_archive_entries_with_limits,
 };
 pub use engine::FileOperationsEngine;
