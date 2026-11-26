@@ -205,6 +205,10 @@ pub fn rgba_icon_to_render_image(icon: &RgbaIcon) -> Option<Arc<RenderImage>> {
     rgba_pixels_to_render_image(icon.width, icon.height, &icon.pixels)
 }
 
+/// Cache key prefix for the Windows stock Recycle Bin icons. The suffix is the
+/// state (`:empty` or `:full`); there is no filesystem path to key on.
+pub const RECYCLE_BIN_ICON_PREFIX: &str = "shell:recycle-bin";
+
 /// Computes the cache key for a filesystem path (sidebar folders, drives, executables).
 #[must_use]
 pub fn path_icon_key(path: &Path) -> String {

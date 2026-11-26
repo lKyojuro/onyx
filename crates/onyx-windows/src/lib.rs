@@ -33,6 +33,7 @@ pub use dwm::{
 pub use icons::{
     IconSize, RgbaIcon, extract_existing_icon_rgba, extract_file_icon_rgba,
     extract_file_icon_rgba_sized, extract_path_icon_rgba, extract_path_icon_rgba_sized,
+    recycle_bin_icon_rgba,
 };
 pub use known_folders::enumerate_known_folders;
 pub use mouse_nav::{

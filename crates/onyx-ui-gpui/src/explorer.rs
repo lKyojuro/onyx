@@ -17,7 +17,10 @@ use crate::components::splitter::{self, ActiveSplitterDrag, SplitterKind};
 use crate::components::{
     context_menu, file_pane, nav_bar, overlays, preview_pane, sidebar, status_bar, tab_bar, toolbar,
 };
-use crate::icons::{ShellIconStore, entry_icon_key, path_icon_key, rgba_pixels_to_render_image};
+use crate::icons::{
+    RECYCLE_BIN_ICON_PREFIX, ShellIconStore, entry_icon_key, path_icon_key,
+    rgba_pixels_to_render_image,
+};
 use crate::search_index::{
     self, IndexController, IndexEvent, IndexStatus, ListMode, SearchRun, SearchStatus,
 };
@@ -56,7 +59,8 @@ use onyx_windows::{
     DragImageSource, DragOutcome, RecycleBinItem, RgbaIcon, TerminalProfile, enumerate_drives,
     enumerate_known_folders, enumerate_recycle_bin, extract_file_icon_rgba, extract_path_icon_rgba,
     get_clipboard_files, launch_terminal_with_profile, open_file, open_with_dialog,
-    set_clipboard_files, show_context_menu, show_properties_dialog, start_external_file_drag,
+    recycle_bin_icon_rgba, set_clipboard_files, show_context_menu, show_properties_dialog,
+    start_external_file_drag,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -600,6 +604,16 @@ impl OnyxExplorer {
     ) -> Self {
         let theme = OnyxTheme::default();
         theme.sync_gpui_theme(Some(window), cx);
+
+        // The executable carries the Onyx icon as resource 1 (see `build.rs`); pushing it
+        // onto the window gives the taskbar and Alt-Tab the same mark. Off the UI thread
+        // because loading the icon hits the image loader.
+        if let Some(hwnd) = extract_window_hwnd(window) {
+            let runtime = Arc::clone(&runtime);
+            runtime.spawn_blocking(move || {
+                let _ = onyx_windows::set_window_icon_from_exe(hwnd);
+            });
+        }
 
         let focus_handle = cx.focus_handle();
         let prompt_focus_handle = cx.focus_handle();
@@ -1380,6 +1394,18 @@ impl OnyxExplorer {
                 explorer.known_folders = known_folders;
                 explorer.drives = drives;
                 explorer.icons.insert_batch(sidebar_icons);
+
+                // Recycle Bin is a Shell namespace folder: its icon comes from the
+                // stock icon set, one key per state (`:empty` / `:full`).
+                let recycle_work: Vec<(String, PathBuf, bool)> = [":empty", ":full"]
+                    .iter()
+                    .map(|state| {
+                        let key = format!("{RECYCLE_BIN_ICON_PREFIX}{state}");
+                        explorer.icons.mark_pending(key.clone());
+                        (key, PathBuf::new(), true)
+                    })
+                    .collect();
+                explorer.spawn_icon_batch(recycle_work, cx);
 
                 // Ensure home path icon is extracted too if not in known_folders
                 let home = explorer.home_path.clone();
@@ -3027,7 +3053,10 @@ impl OnyxExplorer {
         runtime.spawn_blocking(move || {
             let mut batch = Vec::with_capacity(24);
             for (key, path, is_dir) in work {
-                let icon = if key.starts_with("path:") {
+                let icon = if key.starts_with(RECYCLE_BIN_ICON_PREFIX) {
+                    // Windows stock icons: they have no path, the key carries the state.
+                    recycle_bin_icon_rgba(key.ends_with(":full"))
+                } else if key.starts_with("path:") {
                     extract_path_icon_rgba(&path, is_dir)
                 } else {
                     extract_file_icon_rgba(&path, is_dir)

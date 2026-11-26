@@ -15,7 +15,8 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::UI::Shell::{
     SHFILEINFOW, SHGFI_FLAGS, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SMALLICON,
-    SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW,
+    SHGFI_USEFILEATTRIBUTES, SHGSI_ICON, SHGSI_LARGEICON, SHGetFileInfoW, SHGetStockIconInfo,
+    SHSTOCKICONINFO, SIID_RECYCLER, SIID_RECYCLERFULL,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, HICON, ICONINFO};
 use windows::core::PCWSTR;
@@ -259,6 +260,32 @@ pub fn extract_file_icon_rgba_sized(path: &Path, is_dir: bool, size: IconSize) -
     decode_icon_rgba(&icon_guard)
 }
 
+/// Resolves the Windows stock icon for the Recycle Bin, empty or full.
+///
+/// This is the artwork Explorer itself draws, so the sidebar does not have to
+/// fake a trash glyph. Call from a blocking worker like the other shell lookups.
+#[must_use]
+pub fn recycle_bin_icon_rgba(full: bool) -> Option<RgbaIcon> {
+    let _com = ComGuard::init_sta().ok();
+
+    let mut info = SHSTOCKICONINFO {
+        cbSize: u32::try_from(size_of::<SHSTOCKICONINFO>()).ok()?,
+        ..Default::default()
+    };
+    let id = if full {
+        SIID_RECYCLERFULL
+    } else {
+        SIID_RECYCLER
+    };
+    // SAFETY: `info` is a `SHSTOCKICONINFO` with `cbSize` set as the API requires, and the
+    // returned `HICON` is owned, so it is wrapped in `IconGuard` before anything can leak it.
+    let status = unsafe { SHGetStockIconInfo(id, SHGSI_ICON | SHGSI_LARGEICON, &raw mut info) };
+    if status.is_err() || info.hIcon.is_invalid() {
+        return None;
+    }
+    decode_icon_rgba(&IconGuard(info.hIcon))
+}
+
 /// Resolves the large (32x32 at 100% DPI) Shell icon for an existing item, including known
 /// folders and drive roots, without falling back to `SHGFI_USEFILEATTRIBUTES`.
 /// Call from a blocking worker because the Shell may access the filesystem or network.
@@ -318,6 +345,18 @@ pub fn extract_path_icon_rgba_sized(path: &Path, is_dir: bool, size: IconSize) -
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The Shell's image lists are process-wide, so concurrent icon requests on
+    /// different test threads make each other fail intermittently. The icon tests
+    /// that go through `SHGetFileInfo` / `SHGetStockIconInfo` take turns instead.
+    static SHELL_ICON_LOCK: Mutex<()> = Mutex::new(());
+
+    fn shell_icon_guard() -> MutexGuard<'static, ()> {
+        SHELL_ICON_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     fn assert_valid_rgba_icon(icon: &RgbaIcon, min_dim: u32) {
         assert!(
@@ -336,6 +375,7 @@ mod tests {
 
     #[test]
     fn resolves_shell_icon_for_existing_folder() {
+        let _shell = shell_icon_guard();
         let folder = tempfile::TempDir::new().unwrap();
         let icon = extract_existing_icon_rgba(folder.path())
             .expect("Windows should resolve the existing folder icon");
@@ -344,6 +384,7 @@ mod tests {
 
     #[test]
     fn extract_large_icons_for_file_and_directory() {
+        let _shell = shell_icon_guard();
         let file_icon = extract_file_icon_rgba(Path::new("example.txt"), false)
             .expect("Windows should provide a large icon for .txt");
         assert_valid_rgba_icon(&file_icon, 32);
@@ -360,7 +401,21 @@ mod tests {
     }
 
     #[test]
+    fn stock_recycle_bin_icons_decode_in_both_states() {
+        let _shell = shell_icon_guard();
+        let empty = recycle_bin_icon_rgba(false)
+            .expect("Windows should provide the stock empty Recycle Bin icon");
+        assert_valid_rgba_icon(&empty, 32);
+
+        let full = recycle_bin_icon_rgba(true)
+            .expect("Windows should provide the stock full Recycle Bin icon");
+        assert_valid_rgba_icon(&full, 32);
+        assert_eq!(empty.width, full.width);
+    }
+
+    #[test]
     fn extract_path_icons_for_real_drive_folder_and_missing_fallback() {
+        let _shell = shell_icon_guard();
         let drive_icon = extract_path_icon_rgba(Path::new("C:\\"), true)
             .expect("Windows should provide a large shell icon for C:\\");
         assert_valid_rgba_icon(&drive_icon, 32);

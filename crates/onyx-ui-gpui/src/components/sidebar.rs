@@ -2,7 +2,7 @@
 
 use crate::components::{ClickHandler, MouseMoveHandler};
 use crate::explorer::{OnyxExplorer, same_path};
-use crate::icons::{OnyxGlyph, path_icon_key, render_glyph};
+use crate::icons::{OnyxGlyph, RECYCLE_BIN_ICON_PREFIX, path_icon_key, render_glyph};
 use crate::theme::{FONT_SM, FONT_XS, OnyxTheme, RADIUS_MD, RADIUS_SM};
 use gpui_kit::{
     Context, FontWeight, ImageSource, InteractiveElement, IntoElement, MouseButton, ParentElement,
@@ -172,11 +172,22 @@ pub fn render_sidebar(
 
     // Recycle Bin: a Shell namespace folder, so it sits beside the drives and not
     // among the known folders that resolve to a filesystem path.
+    // The Recycle Bin has no filesystem path, so it uses the Windows stock icon
+    // (one per state) instead of a shell-extracted one.
+    let recycle_state = if view.recycle_items.is_empty() {
+        ":empty"
+    } else {
+        ":full"
+    };
+    let recycle_icon = view
+        .icons
+        .get(&format!("{RECYCLE_BIN_ICON_PREFIX}{recycle_state}"))
+        .cloned();
     let recycle_row = sidebar_nav_row(
         "sidebar-recycle-bin".into(),
         "Recycle Bin",
         OnyxGlyph::Trash,
-        None,
+        recycle_icon,
         view.is_recycle_bin_mode(),
         false,
         theme,

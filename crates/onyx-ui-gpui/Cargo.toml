@@ -29,6 +29,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 [dev-dependencies]
 tempfile = "3"
 
+[build-dependencies]
+winresource = "0.1"
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "warn"
 missing_debug_implementations = "warn"
