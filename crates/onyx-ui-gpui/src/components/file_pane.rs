@@ -10,11 +10,15 @@ use crate::explorer::{OnyxExplorer, PaneId};
 use crate::icons::{OnyxGlyph, entry_icon_key, render_glyph};
 use crate::theme::{FONT_MD, FONT_SM, FONT_XS, OnyxTheme, RADIUS_LG, RADIUS_MD, RADIUS_SM};
 use gpui_kit::{
-    Context, FontWeight, ImageSource, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ObjectFit, ParentElement, Pixels, RenderImage, Role, ScrollEvent, StatefulInteractiveElement,
-    Styled, StyledImage, div, img, prelude::FluentBuilder, px, relative, uniform_list,
+    Context, ExternalPaths, FontWeight, ImageSource, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ObjectFit, ParentElement, Pixels, RenderImage, Role, ScrollEvent,
+    StatefulInteractiveElement, Styled, StyledImage, div, img, prelude::FluentBuilder, px,
+    relative, uniform_list,
 };
-use onyx_core::{FileEntry, SortColumn, SortDirection, ViewMode, format_bytes, format_timestamp};
+use onyx_core::{
+    FileEntry, GroupByMode, SortColumn, SortDirection, ViewMode, format_bytes, format_timestamp,
+    group_entries,
+};
 use std::sync::Arc;
 
 /// Computes responsive grid column count matching `file_pane.slint` (`140px` min card width).
@@ -492,33 +496,171 @@ pub fn render_file_pane(
         } else {
             VIEWPORT_FALLBACK_PX
         };
-        let rows = visible_rows(offset, viewport, DETAILS_ROW_HEIGHT, count);
-        let mut row_els = Vec::with_capacity(rows.len());
-        for idx in rows {
-            let Some(entry) = view.pane_entries(pane_id).get(idx) else {
-                continue;
-            };
-            let is_selected = view.pane_selected_index(pane_id) == Some(idx);
-            let is_drop_hover = view.drag_hover_is(&entry.path);
-            let native_icon = view.icons.get(&entry_icon_key(entry)).map(Arc::clone);
-            let (size_label, size_ratio) = view.entry_size_info_for(pane_id, entry);
-            row_els.push(render_details_row(
-                pane_id,
-                idx,
-                count,
-                entry,
-                is_selected,
-                is_drop_hover,
-                native_icon,
-                size_label,
-                size_ratio,
-                show_date_col,
-                show_type_col,
-                size_col_w,
-                view.theme,
-                cx,
-            ));
-        }
+
+        let (total_visual_rows, row_els) = if view.group_by == GroupByMode::None {
+            let rows = visible_rows(offset, viewport, DETAILS_ROW_HEIGHT, count);
+            let mut els = Vec::with_capacity(rows.len());
+            for idx in rows {
+                let Some(entry) = view.pane_entries(pane_id).get(idx) else {
+                    continue;
+                };
+                let is_selected = view.pane_selected_index(pane_id) == Some(idx);
+                let is_drop_hover = view.drag_hover_is(&entry.path);
+                let native_icon = view.icons.get(&entry_icon_key(entry)).map(Arc::clone);
+                let (size_label, size_ratio) = view.entry_size_info_for(pane_id, entry);
+                els.push(
+                    render_details_row(
+                        pane_id,
+                        idx,
+                        count,
+                        entry,
+                        is_selected,
+                        is_drop_hover,
+                        native_icon,
+                        size_label,
+                        size_ratio,
+                        show_date_col,
+                        show_type_col,
+                        size_col_w,
+                        view.theme,
+                        cx,
+                    )
+                    .into_any_element(),
+                );
+            }
+            (count, els)
+        } else {
+            enum GroupedRow {
+                Header {
+                    key: String,
+                    label: String,
+                    count: usize,
+                    collapsed: bool,
+                },
+                Entry(usize),
+            }
+            let groups = group_entries(entries, view.group_by);
+            let mut flat: Vec<GroupedRow> = Vec::with_capacity(count + groups.len());
+            let mut entry_cursor = 0usize;
+            for group in groups {
+                let collapsed = view.is_group_collapsed(&group.key);
+                let group_len = group.len();
+                flat.push(GroupedRow::Header {
+                    key: group.key,
+                    label: group.label,
+                    count: group_len,
+                    collapsed,
+                });
+                if !collapsed {
+                    for _ in 0..group_len {
+                        flat.push(GroupedRow::Entry(entry_cursor));
+                        entry_cursor += 1;
+                    }
+                } else {
+                    entry_cursor += group_len;
+                }
+            }
+            let total_rows = flat.len();
+            let rows = visible_rows(offset, viewport, DETAILS_ROW_HEIGHT, total_rows);
+            let mut els = Vec::with_capacity(rows.len());
+            for row_idx in rows {
+                match &flat[row_idx] {
+                    GroupedRow::Header {
+                        key,
+                        label,
+                        count: group_count,
+                        collapsed,
+                    } => {
+                        let toggle_key = key.clone();
+                        let header_id = format!("grp-hdr-{pane_index}-{key}");
+                        let count_badge = if *group_count == 1 {
+                            "1 item".to_string()
+                        } else {
+                            format!("{group_count} items")
+                        };
+                        els.push(
+                            div()
+                                .id(header_id)
+                                .role(Role::Button)
+                                .aria_label(format!("{label}, {count_badge}"))
+                                .aria_expanded(!collapsed)
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .w_full()
+                                .h(px(DETAILS_ROW_HEIGHT))
+                                .px(px(10.0))
+                                .gap(px(6.0))
+                                .bg(theme.bg_surface_alt())
+                                .border_b_1()
+                                .border_color(theme.border_subtle())
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(theme.bg_hover()))
+                                .on_click(cx.listener(move |explorer, _, _, cx| {
+                                    explorer.toggle_group_collapsed(&toggle_key, cx);
+                                }))
+                                .child(render_glyph(
+                                    if *collapsed {
+                                        OnyxGlyph::ChevronRight
+                                    } else {
+                                        OnyxGlyph::ChevronDown
+                                    },
+                                    px(12.0),
+                                    theme.text_muted(),
+                                ))
+                                .child(
+                                    div()
+                                        .text_size(FONT_XS)
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme.text_primary())
+                                        .child(label.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(6.0))
+                                        .py(px(1.0))
+                                        .rounded(RADIUS_SM)
+                                        .bg(theme.bg_badge())
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_muted())
+                                        .child(count_badge),
+                                )
+                                .into_any_element(),
+                        );
+                    }
+                    GroupedRow::Entry(idx) => {
+                        let Some(entry) = view.pane_entries(pane_id).get(*idx) else {
+                            continue;
+                        };
+                        let is_selected = view.pane_selected_index(pane_id) == Some(*idx);
+                        let is_drop_hover = view.drag_hover_is(&entry.path);
+                        let native_icon = view.icons.get(&entry_icon_key(entry)).map(Arc::clone);
+                        let (size_label, size_ratio) = view.entry_size_info_for(pane_id, entry);
+                        els.push(
+                            render_details_row(
+                                pane_id,
+                                *idx,
+                                count,
+                                entry,
+                                is_selected,
+                                is_drop_hover,
+                                native_icon,
+                                size_label,
+                                size_ratio,
+                                show_date_col,
+                                show_type_col,
+                                size_col_w,
+                                view.theme,
+                                cx,
+                            )
+                            .into_any_element(),
+                        );
+                    }
+                }
+            }
+            (total_rows, els)
+        };
+
         let first_row = (offset / DETAILS_ROW_HEIGHT).floor().max(0.0) as usize;
         div()
             .id(list_id)
@@ -540,7 +682,7 @@ pub fn render_file_pane(
                     .flex()
                     .flex_col()
                     .w_full()
-                    .h(px(content_height(count, DETAILS_ROW_HEIGHT)))
+                    .h(px(content_height(total_visual_rows, DETAILS_ROW_HEIGHT)))
                     .pt(px(first_row as f32 * DETAILS_ROW_HEIGHT))
                     .children(row_els),
             )
@@ -552,6 +694,7 @@ pub fn render_file_pane(
         PaneId::Secondary => "onyx-file-pane-body-secondary",
     };
 
+    let pane_drop_hover = view.drag_hover_is_pane(pane_id);
     pane.child(
         div()
             .id(body_id)
@@ -570,12 +713,26 @@ pub fn render_file_pane(
             .on_mouse_move(cx.listener(move |explorer, _, _, cx| {
                 explorer.set_drop_hover(DropTarget::Pane(pane_id), cx);
             }))
-            .border_1()
-            .border_color(if view.drag_hover_is_pane(pane_id) {
+            .border_2()
+            .border_color(if pane_drop_hover {
                 theme.accent_bright()
             } else {
                 gpui_kit::transparent_black()
             })
+            .when(pane_drop_hover, |el| el.bg(theme.accent_subtle()))
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style
+                    .border_2()
+                    .border_color(theme.accent_bright())
+                    .bg(theme.accent_subtle())
+            })
+            .on_drop(
+                cx.listener(move |explorer, paths: &ExternalPaths, _window, cx| {
+                    cx.stop_propagation();
+                    let dest = explorer.pane_path(pane_id).to_path_buf();
+                    explorer.handle_external_paths_drop_to(paths, dest, cx);
+                }),
+            )
             .child(body),
     )
 }
@@ -753,6 +910,7 @@ fn render_details_row(
     let is_dir = entry.is_dir();
     let drag_path = entry.path.clone();
     let hover_path = entry.path.clone();
+    let external_drop_path = entry.path.clone();
     let modified_text = format_timestamp(entry.modified);
     let hidden_opacity = if entry.attributes.hidden { 0.62 } else { 1.0 };
     let row_prefix = match pane_id {
@@ -830,6 +988,21 @@ fn render_details_row(
                 explorer.set_drop_hover(DropTarget::Directory(hover_path.clone()), cx);
             }
         }));
+
+    if is_dir {
+        inner = inner
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style
+                    .bg(theme.accent_subtle())
+                    .border_color(theme.accent_bright())
+            })
+            .on_drop(
+                cx.listener(move |explorer, paths: &ExternalPaths, _window, cx| {
+                    cx.stop_propagation();
+                    explorer.handle_external_paths_drop_to(paths, external_drop_path.clone(), cx);
+                }),
+            );
+    }
 
     if is_selected {
         inner = inner.child(
@@ -1053,6 +1226,20 @@ fn render_grid_card(
                 explorer.set_drop_hover(DropTarget::Directory(hover_path.clone()), cx);
             }
         }))
+        .when(is_dir, |card| {
+            let drop_dir = entry.path.clone();
+            card.drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style
+                    .bg(theme.accent_subtle())
+                    .border_color(theme.accent_bright())
+            })
+            .on_drop(cx.listener(
+                move |explorer, paths: &ExternalPaths, _window, cx| {
+                    cx.stop_propagation();
+                    explorer.handle_external_paths_drop_to(paths, drop_dir.clone(), cx);
+                },
+            ))
+        })
         .child(if let Some(thumb_img) = thumbnail {
             div()
                 .flex()

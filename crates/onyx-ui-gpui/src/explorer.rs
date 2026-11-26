@@ -40,10 +40,10 @@ use onyx_cache::{
 };
 use onyx_config::{AppConfig, ConfigStore, PreviewSide, SessionState};
 use onyx_core::{
-    DriveInfo, FavoriteItem, FileAttributes, FileEntry, FileKind, GenerationId, KnownFolder,
-    NavHistory, OnyxError, OnyxResult, SortColumn, SortDirection, SortSpec, TabManager, TabState,
-    ThemeMode, ViewMode, expand_env_vars, format_bytes, natural_cmp, normalize_display_path,
-    sort_entries, split_autocomplete_prefix,
+    DriveInfo, FavoriteItem, FileAttributes, FileEntry, FileKind, GenerationId, GroupByMode,
+    KnownFolder, NavHistory, OnyxError, OnyxResult, SortColumn, SortDirection, SortSpec,
+    TabManager, TabState, ThemeMode, ViewMode, expand_env_vars, format_bytes, fuzzy_match,
+    group_entries, natural_cmp, normalize_display_path, sort_entries, split_autocomplete_prefix,
 };
 use onyx_fs::{
     DEFAULT_MAX_FOLDER_SIZE_ENTRIES, DirectoryWatcher, EnumerationOptions, FolderSizeResult,
@@ -617,6 +617,8 @@ pub struct OnyxExplorer {
     pub(crate) preview_generation: GenerationId,
     pub(crate) preview_cancel: CancellationToken,
     pub(crate) view_mode: ViewMode,
+    pub(crate) group_by: GroupByMode,
+    pub(crate) collapsed_groups: HashSet<String>,
     pub(crate) show_hidden: bool,
     pub(crate) calculate_folder_sizes: bool,
     pub(crate) sort_spec: SortSpec,
@@ -880,6 +882,8 @@ impl OnyxExplorer {
             preview_generation: GenerationId::new(0),
             preview_cancel: CancellationToken::new(),
             view_mode: ViewMode::Details,
+            group_by: GroupByMode::None,
+            collapsed_groups: HashSet::new(),
             show_hidden: false,
             calculate_folder_sizes: true,
             sort_spec: SortSpec::default(),
@@ -2814,19 +2818,75 @@ impl OnyxExplorer {
         if self.list_mode == ListMode::Search {
             return;
         }
-        let needle = self.search_query.trim().to_ascii_lowercase();
-        self.entries = build_view_entries(
+        let needle = self.search_query.trim();
+        let mut primary = build_view_entries(
             &self.all_entries,
             self.sort_spec,
-            &needle,
+            needle,
             &self.folder_sizes,
         );
-        self.secondary.entries = build_view_entries(
+        let mut secondary = build_view_entries(
             &self.secondary.all_entries,
             self.secondary.sort_spec,
-            &needle,
+            needle,
             &self.folder_sizes,
         );
+        if self.group_by != GroupByMode::None {
+            primary = group_entries(&primary, self.group_by)
+                .into_iter()
+                .flat_map(|g| g.entries)
+                .collect();
+            secondary = group_entries(&secondary, self.group_by)
+                .into_iter()
+                .flat_map(|g| g.entries)
+                .collect();
+        }
+        self.entries = primary;
+        self.secondary.entries = secondary;
+    }
+
+    /// Short display label for a [`GroupByMode`].
+    #[must_use]
+    pub const fn group_by_label(mode: GroupByMode) -> &'static str {
+        match mode {
+            GroupByMode::None => "Group",
+            GroupByMode::Kind => "Group: Type",
+            GroupByMode::Extension => "Group: Ext",
+            GroupByMode::ModifiedDate => "Group: Date",
+            GroupByMode::Size => "Group: Size",
+        }
+    }
+
+    /// Cycles the active Group-By mode (`None -> Kind -> Extension -> ModifiedDate -> Size -> None`).
+    pub fn cycle_group_by(&mut self, cx: &mut Context<Self>) {
+        self.group_by = match self.group_by {
+            GroupByMode::None => GroupByMode::Kind,
+            GroupByMode::Kind => GroupByMode::Extension,
+            GroupByMode::Extension => GroupByMode::ModifiedDate,
+            GroupByMode::ModifiedDate => GroupByMode::Size,
+            GroupByMode::Size => GroupByMode::None,
+        };
+        self.collapsed_groups.clear();
+        self.apply_filter_and_sort();
+        self.status_message = Some(match self.group_by {
+            GroupByMode::None => "Grouping turned off.".to_string(),
+            mode => format!("Grouped by {}.", Self::group_by_label(mode)),
+        });
+        cx.notify();
+    }
+
+    /// Toggles whether a group section header is collapsed in Details view.
+    pub fn toggle_group_collapsed(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !self.collapsed_groups.remove(key) {
+            self.collapsed_groups.insert(key.to_string());
+        }
+        cx.notify();
+    }
+
+    /// Returns whether the given group key is currently collapsed.
+    #[must_use]
+    pub fn is_group_collapsed(&self, key: &str) -> bool {
+        self.collapsed_groups.contains(key)
     }
 
     pub fn toggle_view_mode(&mut self, cx: &mut Context<Self>) {
@@ -5020,10 +5080,23 @@ impl OnyxExplorer {
     }
 
     /// Handles files dropped into Onyx from Windows Explorer, the Desktop, or another
-    /// application via GPUI's `ExternalPaths` drag-and-drop pipeline (`.on_drop`).
+    /// application via GPUI's `ExternalPaths` drag-and-drop pipeline (`.on_drop`),
+    /// targeting the active directory as fallback when dropped outside a specific pane/folder.
     pub(crate) fn handle_external_paths_drop(
         &mut self,
         paths: &ExternalPaths,
+        cx: &mut Context<Self>,
+    ) {
+        let destination = self.active_directory();
+        self.handle_external_paths_drop_to(paths, destination, cx);
+    }
+
+    /// Handles files dropped into a specific destination folder (a pane's current directory,
+    /// a hovered folder row/card, a tab, or a sidebar entry).
+    pub(crate) fn handle_external_paths_drop_to(
+        &mut self,
+        paths: &ExternalPaths,
+        destination: PathBuf,
         cx: &mut Context<Self>,
     ) {
         // When Onyx itself is the active OLE drag source, releasing back inside our own
@@ -5034,14 +5107,16 @@ impl OnyxExplorer {
             cx.notify();
             return;
         }
-        if self.refuse_in_recycle_bin("Dropping files here", cx) {
+        if Self::is_recycle_bin_path(&destination) {
+            self.status_message =
+                Some("Dropping files here is not available in Recycle Bin.".to_string());
+            cx.notify();
             return;
         }
         let raw_paths = paths.paths();
         if raw_paths.is_empty() {
             return;
         }
-        let destination = self.active_directory();
         let mut valid_sources = Vec::with_capacity(raw_paths.len());
         let mut last_reject = None;
         for path in raw_paths {
@@ -5466,6 +5541,7 @@ impl OnyxExplorer {
             "quick-look" => self.toggle_quick_look(window, cx),
             "theme" => self.toggle_theme(window, cx),
             "view-mode" => self.toggle_view_mode(cx),
+            "group-by" => self.cycle_group_by(cx),
             "hidden" => self.set_show_hidden(!self.show_hidden, cx),
             "system-files" => self.set_show_system(!self.config.show_system, cx),
             "sidebar" => self.toggle_sidebar(cx),
@@ -6202,9 +6278,6 @@ impl Render for OnyxExplorer {
                     explorer.finish_drag(cx);
                 }),
             )
-            .drag_over::<ExternalPaths>(move |style, _, _, _| {
-                style.border_2().border_color(theme.accent_bright())
-            })
             .on_drop(cx.listener(|explorer, paths: &ExternalPaths, _window, cx| {
                 explorer.handle_external_paths_drop(paths, cx);
             }))
@@ -6442,27 +6515,49 @@ fn build_view_entries(
     needle: &str,
     folder_sizes: &FolderSizeCache,
 ) -> Vec<FileEntry> {
-    let mut filtered: Vec<FileEntry> = if needle.is_empty() {
-        all_entries.to_vec()
-    } else {
-        all_entries
-            .iter()
-            .filter(|entry| {
-                entry.name.to_ascii_lowercase().contains(needle)
-                    || entry.type_label.to_ascii_lowercase().contains(needle)
-            })
-            .cloned()
-            .collect()
-    };
-    for entry in &mut filtered {
-        if entry.is_dir()
-            && let Some(cached) = folder_sizes.get(&entry.path)
-        {
-            entry.size = cached.total_bytes;
+    let query = needle.trim();
+    if query.is_empty() {
+        let mut entries = all_entries.to_vec();
+        for entry in &mut entries {
+            if entry.is_dir()
+                && let Some(cached) = folder_sizes.get(&entry.path)
+            {
+                entry.size = cached.total_bytes;
+            }
         }
+        sort_entries(&mut entries, sort_spec);
+        return entries;
     }
-    sort_entries(&mut filtered, sort_spec);
-    filtered
+
+    // Inline fuzzy filter: matches filename or type label using `onyx_core::fuzzy_match`
+    // and ranks stronger hits (exact / prefix / CamelCase / word-boundary) first.
+    let mut scored: Vec<(i64, FileEntry)> = all_entries
+        .iter()
+        .filter_map(|entry| {
+            let name_score = fuzzy_match(query, &entry.name).map(|m| m.score);
+            let type_score = fuzzy_match(query, &entry.type_label).map(|m| m.score - 20);
+            let best = match (name_score, type_score) {
+                (Some(a), Some(b)) => a.max(b),
+                (Some(a), None) => a,
+                (None, Some(b)) => b,
+                (None, None) => return None,
+            };
+            let mut cloned = entry.clone();
+            if cloned.is_dir()
+                && let Some(cached) = folder_sizes.get(&cloned.path)
+            {
+                cloned.size = cached.total_bytes;
+            }
+            Some((best, cloned))
+        })
+        .collect();
+
+    scored.sort_by(|(score_a, entry_a), (score_b, entry_b)| {
+        score_b
+            .cmp(score_a)
+            .then_with(|| natural_cmp(&entry_a.name, &entry_b.name))
+    });
+    scored.into_iter().map(|(_, entry)| entry).collect()
 }
 
 fn compute_size_ratio(known_bytes: Option<u64>, max_bytes: u64) -> f32 {

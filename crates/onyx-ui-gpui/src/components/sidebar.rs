@@ -5,8 +5,8 @@ use crate::explorer::{OnyxExplorer, same_path};
 use crate::icons::{OnyxGlyph, RECYCLE_BIN_ICON_PREFIX, path_icon_key, render_glyph};
 use crate::theme::{FONT_SM, FONT_XS, OnyxTheme, RADIUS_MD, RADIUS_SM};
 use gpui_kit::{
-    Context, FontWeight, ImageSource, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    RenderImage, Role, StatefulInteractiveElement, Styled, div, img, px,
+    Context, ExternalPaths, FontWeight, ImageSource, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, RenderImage, Role, StatefulInteractiveElement, Styled, div, img, px,
 };
 use onyx_config::{SIDEBAR_GROUP_DRIVES, SIDEBAR_GROUP_FAVORITES, SIDEBAR_GROUP_QUICK_ACCESS};
 use onyx_core::{KnownFolderKind, format_bytes, normalize_display_path};
@@ -35,6 +35,7 @@ pub fn render_sidebar(
     let home_target = view.home_path.clone();
     let home_drop_hover = view.drag_hover_is(&view.home_path);
     let home_hover_target = view.home_path.clone();
+    let home_external_drop = view.home_path.clone();
     let home_row = sidebar_nav_row(
         "sidebar-home".into(),
         "Home",
@@ -54,6 +55,8 @@ pub fn render_sidebar(
                 cx,
             );
         }))),
+        Some(home_external_drop),
+        cx,
     );
 
     // Favorites section
@@ -84,6 +87,7 @@ pub fn render_sidebar(
                 let nav_target = fav.path.clone();
                 let unpin_target = fav.path.clone();
                 let hover_target = fav.path.clone();
+                let fav_external_drop = fav.path.clone();
                 let fav_drop_hover = view.drag_hover_is(&fav.path);
                 let native_icon = view.icons.get(&path_icon_key(&fav.path)).map(Arc::clone);
                 fav_col = fav_col.child(sidebar_nav_row(
@@ -109,6 +113,8 @@ pub fn render_sidebar(
                             cx,
                         );
                     }))),
+                    Some(fav_external_drop),
+                    cx,
                 ));
             }
         }
@@ -143,6 +149,7 @@ pub fn render_sidebar(
             let is_active = same_path(current, &folder.path);
             let target = folder.path.clone();
             let qa_hover_target = folder.path.clone();
+            let qa_external_drop = folder.path.clone();
             let qa_drop_hover = view.drag_hover_is(&folder.path);
             let native_icon = view.icons.get(&path_icon_key(&folder.path)).map(Arc::clone);
             qa_col = qa_col.child(sidebar_nav_row(
@@ -166,6 +173,8 @@ pub fn render_sidebar(
                         cx,
                     );
                 }))),
+                Some(qa_external_drop),
+                cx,
             ));
         }
     }
@@ -197,6 +206,8 @@ pub fn render_sidebar(
         None,
         false,
         None,
+        None,
+        cx,
     );
 
     // Drives section
@@ -216,6 +227,7 @@ pub fn render_sidebar(
             let is_active = same_path(current, &drive.root);
             let target: PathBuf = drive.root.clone();
             let drive_hover_target: PathBuf = drive.root.clone();
+            let drive_external_drop: PathBuf = drive.root.clone();
             let drive_drop_hover = view.drag_hover_is(&drive.root);
             let native_icon = view.icons.get(&path_icon_key(&drive.root)).map(Arc::clone);
             let root_display = normalize_display_path(&drive.root);
@@ -333,6 +345,21 @@ pub fn render_sidebar(
                         cx,
                     );
                 }))
+                .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                    style
+                        .bg(theme.accent_subtle())
+                        .border_color(theme.accent_bright())
+                })
+                .on_drop(
+                    cx.listener(move |explorer, paths: &ExternalPaths, _window, cx| {
+                        cx.stop_propagation();
+                        explorer.handle_external_paths_drop_to(
+                            paths,
+                            drive_external_drop.clone(),
+                            cx,
+                        );
+                    }),
+                )
                 .child(top_row)
                 // Usage progress bar
                 .child(
@@ -437,7 +464,9 @@ fn section_header(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sidebar_nav_row(
+fn sidebar_nav_row<
+    T: Fn(&gpui_kit::ClickEvent, &mut gpui_kit::Window, &mut gpui_kit::App) + 'static,
+>(
     id: gpui_kit::ElementId,
     label: &str,
     fallback_glyph: OnyxGlyph,
@@ -445,11 +474,13 @@ fn sidebar_nav_row(
     active: bool,
     removable: bool,
     theme: OnyxTheme,
-    on_click: impl Fn(&gpui_kit::ClickEvent, &mut gpui_kit::Window, &mut gpui_kit::App) + 'static,
+    on_click: T,
     on_remove: Option<ClickHandler>,
     drop_hover: bool,
     on_hover: Option<MouseMoveHandler>,
-) -> impl IntoElement {
+    external_drop_dir: Option<PathBuf>,
+    cx: &mut Context<OnyxExplorer>,
+) -> impl IntoElement + use<T> {
     let icon_el = if let Some(render_img) = native_icon {
         img(ImageSource::Render(render_img))
             .w(px(20.0))
@@ -519,6 +550,20 @@ fn sidebar_nav_row(
 
     if let Some(hover_cb) = on_hover {
         row = row.on_mouse_move(move |ev, window, cx| hover_cb(ev, window, cx));
+    }
+    if let Some(drop_dir) = external_drop_dir {
+        row = row
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style
+                    .bg(theme.accent_subtle())
+                    .border_color(theme.accent_bright())
+            })
+            .on_drop(
+                cx.listener(move |explorer, paths: &ExternalPaths, _window, cx| {
+                    cx.stop_propagation();
+                    explorer.handle_external_paths_drop_to(paths, drop_dir.clone(), cx);
+                }),
+            );
     }
 
     if active {

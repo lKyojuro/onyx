@@ -139,6 +139,12 @@ pub const COMMANDS: &[PaletteCommand] = &[
         category: "View",
     },
     PaletteCommand {
+        id: "group-by",
+        title: "Cycle Group By (Off / Type / Extension / Date / Size)",
+        shortcut: "",
+        category: "View",
+    },
+    PaletteCommand {
         id: "hidden",
         title: "Toggle Hidden Files",
         shortcut: "",

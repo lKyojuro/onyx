@@ -7,7 +7,7 @@ use gpui_kit::{
     Context, InteractiveElement, IntoElement, Orientation, ParentElement, Role,
     StatefulInteractiveElement, Styled, Window, div, px,
 };
-use onyx_core::{SortColumn, SortDirection, ViewMode};
+use onyx_core::{GroupByMode, SortColumn, SortDirection, ViewMode};
 
 fn sort_trailing_glyph(view: &OnyxExplorer, column: SortColumn) -> Option<OnyxGlyph> {
     let sort_spec = view.pane_sort_spec(view.active_pane);
@@ -385,6 +385,26 @@ pub fn render_toolbar(
                 }),
             )
             .aria_label("Sort by size"),
+        )
+        .child(vertical_divider(theme, px(16.0)))
+        .child(
+            fluent_action_button(
+                ActionButtonProps {
+                    id: "tb-group-by".into(),
+                    glyph: Some(OnyxGlyph::List),
+                    trailing_glyph: None,
+                    label: Some(OnyxExplorer::group_by_label(view.group_by)),
+                    active: view.group_by != GroupByMode::None,
+                    primary: false,
+                    danger: false,
+                    enabled: true,
+                    compact: true,
+                    min_width: px(28.0),
+                },
+                theme,
+                cx.listener(|explorer, _, _, cx| explorer.cycle_group_by(cx)),
+            )
+            .aria_label("Cycle group by mode"),
         );
 
     let is_grid = view.view_mode == ViewMode::Grid;

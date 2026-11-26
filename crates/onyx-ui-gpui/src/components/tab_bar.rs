@@ -5,8 +5,8 @@ use crate::explorer::OnyxExplorer;
 use crate::icons::{OnyxGlyph, render_glyph};
 use crate::theme::{FONT_SM, OnyxTheme, RADIUS_SM};
 use gpui_kit::{
-    Context, FontWeight, InteractiveElement, IntoElement, MouseButton, Orientation, ParentElement,
-    Role, StatefulInteractiveElement, Styled, Window, WindowControlArea, div, px,
+    Context, ExternalPaths, FontWeight, InteractiveElement, IntoElement, MouseButton, Orientation,
+    ParentElement, Role, StatefulInteractiveElement, Styled, Window, WindowControlArea, div, px,
 };
 use onyx_core::ViewMode;
 
@@ -41,6 +41,7 @@ pub fn render_tab_bar(
         let next_is_active = idx + 1 == active_idx;
         let tab_id = tab.id;
         let drop_path = tab.path.clone();
+        let external_drop_path = tab.path.clone();
         let is_drop_hover = view.drag_hover_is(&tab.path);
         let title = if tab.title.is_empty() {
             "New Tab".to_string()
@@ -91,7 +92,19 @@ pub fn render_tab_bar(
                     crate::components::drag_drop::DropTarget::Directory(drop_path.clone()),
                     cx,
                 );
-            }));
+            }))
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style
+                    .bg(theme.accent_subtle())
+                    .border_1()
+                    .border_color(theme.accent_bright())
+            })
+            .on_drop(
+                cx.listener(move |explorer, paths: &ExternalPaths, _window, cx| {
+                    cx.stop_propagation();
+                    explorer.handle_external_paths_drop_to(paths, external_drop_path.clone(), cx);
+                }),
+            );
 
         if is_active {
             tab_card = tab_card
