@@ -36,9 +36,9 @@ use onyx_cache::{
 };
 use onyx_config::{AppConfig, ConfigStore, SessionState};
 use onyx_core::{
-    DriveInfo, FavoriteItem, FileEntry, GenerationId, KnownFolder, NavHistory, OnyxError,
-    OnyxResult, SortColumn, SortDirection, SortSpec, TabManager, ThemeMode, ViewMode,
-    expand_env_vars, format_bytes, natural_cmp, normalize_display_path, sort_entries,
+    DriveInfo, FavoriteItem, FileAttributes, FileEntry, FileKind, GenerationId, KnownFolder,
+    NavHistory, OnyxError, OnyxResult, SortColumn, SortDirection, SortSpec, TabManager, ThemeMode,
+    ViewMode, expand_env_vars, format_bytes, natural_cmp, normalize_display_path, sort_entries,
     split_autocomplete_prefix,
 };
 use onyx_fs::{
@@ -53,10 +53,10 @@ use onyx_operations::{
 use onyx_preview::{PreviewEngine, ThumbnailEngine, is_thumbnail_supported};
 use onyx_search::{SearchIndex, SearchQuery, SearchResult, UnifiedSearchEngine};
 use onyx_windows::{
-    DragOutcome, RgbaIcon, TerminalProfile, enumerate_drives, enumerate_known_folders,
-    extract_file_icon_rgba, extract_path_icon_rgba, get_clipboard_files,
-    launch_terminal_with_profile, open_file, open_with_dialog, set_clipboard_files,
-    show_context_menu, show_properties_dialog, start_external_file_drag,
+    DragOutcome, RecycleBinItem, RgbaIcon, TerminalProfile, enumerate_drives,
+    enumerate_known_folders, enumerate_recycle_bin, extract_file_icon_rgba, extract_path_icon_rgba,
+    get_clipboard_files, launch_terminal_with_profile, open_file, open_with_dialog,
+    set_clipboard_files, show_context_menu, show_properties_dialog, start_external_file_drag,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -508,6 +508,9 @@ pub struct OnyxExplorer {
     pub(crate) search_run: SearchRun,
     /// Hits of the current list search run, in rank order.
     pub(crate) search_hits: Vec<FileEntry>,
+    /// Items of the Recycle Bin listing, kept beside the rendered rows because a
+    /// recycled item has no live path of its own to restore to.
+    pub(crate) recycle_items: Vec<RecycleBinItem>,
     /// Preferences for the library search: indexed when an index is open,
     /// otherwise a live walk of the current folder tree.
     pub(crate) search_engine: UnifiedSearchEngine,
@@ -747,6 +750,7 @@ impl OnyxExplorer {
             list_mode: ListMode::Browse,
             search_run: SearchRun::default(),
             search_hits: Vec::new(),
+            recycle_items: Vec::new(),
             search_engine: UnifiedSearchEngine::live_only(),
             search_index: None,
             index,
@@ -1535,6 +1539,12 @@ impl OnyxExplorer {
         use_cache: bool,
         cx: &mut Context<Self>,
     ) {
+        // The Recycle Bin is a Shell namespace folder without a filesystem path, so
+        // its tab path is routed to the Shell enumeration instead of `onyx-fs`.
+        if Self::is_recycle_bin_path(&path) {
+            self.load_recycle_bin(record_history, cx);
+            return;
+        }
         if !same_path(&path, self.current_path()) {
             self.context_menu = None;
             self.reset_list_scroll(PaneId::Primary);
@@ -1569,6 +1579,11 @@ impl OnyxExplorer {
         // keeps filtering the new folder, which is what the browse list does.
         if self.list_mode == ListMode::Search {
             self.cancel_list_search();
+        }
+        // A folder listing always leaves the Recycle Bin list behind.
+        if self.list_mode == ListMode::RecycleBin {
+            self.list_mode = ListMode::Browse;
+            self.recycle_items.clear();
         }
         if self.indexed_search {
             self.index.watch(self.index_roots());
@@ -1642,6 +1657,177 @@ impl OnyxExplorer {
             });
         })
         .detach();
+    }
+
+    // ---- Windows Recycle Bin (Shell namespace folder) ----
+
+    /// Shell namespace path of the Recycle Bin.
+    ///
+    /// The bin has no filesystem path of its own, so the tab carries this identifier
+    /// and [`Self::pane_location_label`] shows the plain name for it.
+    #[must_use]
+    pub fn recycle_bin_path() -> PathBuf {
+        PathBuf::from(r"::{645FF040-5081-101B-9F08-00AA002F954E}")
+    }
+
+    /// Whether `path` is the Recycle Bin's Shell namespace path.
+    #[must_use]
+    fn is_recycle_bin_path(path: &Path) -> bool {
+        same_path(path, &Self::recycle_bin_path())
+    }
+
+    /// Whether the primary pane — the only pane that can show it — lists the Recycle Bin.
+    #[must_use]
+    pub fn is_recycle_bin_mode(&self) -> bool {
+        self.list_mode == ListMode::RecycleBin
+    }
+
+    /// Whether `pane` currently lists the Recycle Bin.
+    #[must_use]
+    pub fn pane_shows_recycle_bin(&self, pane: PaneId) -> bool {
+        self.is_recycle_bin_mode() && pane == PaneId::Primary
+    }
+
+    /// Location label of one pane, used by the breadcrumbs, the pane header and the
+    /// status bar; the Recycle Bin shows its name instead of the namespace path.
+    #[must_use]
+    pub fn pane_location_label(&self, pane: PaneId) -> String {
+        if self.pane_shows_recycle_bin(pane) {
+            "Recycle Bin".to_string()
+        } else {
+            normalize_display_path(self.pane_path(pane))
+        }
+    }
+
+    /// Original location of the selected Recycle Bin item, when one is selected.
+    #[must_use]
+    pub fn selected_recycle_original(&self) -> Option<&Path> {
+        let entry = self.selected_entry()?;
+        self.recycle_items
+            .iter()
+            .find(|item| item.shell_path == entry.path)?
+            .original_path
+            .as_deref()
+    }
+
+    /// Opens the Windows Recycle Bin in the primary pane.
+    pub fn open_recycle_bin(&mut self, cx: &mut Context<Self>) {
+        if self.is_recycle_bin_mode() {
+            self.refresh(cx);
+            return;
+        }
+        self.navigate_to(Self::recycle_bin_path(), cx);
+    }
+
+    /// Fills the primary pane with the Recycle Bin listing.
+    ///
+    /// The Shell enumeration runs on the blocking pool; its result is dropped when the
+    /// pane moved on, so a fast navigation never shows a stale bin.
+    fn load_recycle_bin(&mut self, record_history: bool, cx: &mut Context<Self>) {
+        if !self.is_recycle_bin_mode() {
+            self.context_menu = None;
+            self.reset_list_scroll(PaneId::Primary);
+        }
+        self.address_editing = false;
+        self.address_suggestions.clear();
+        self.suggestion_index = None;
+
+        self.cancel_token.cancel();
+        self.folder_size_cancel.cancel();
+        self.thumbnail_cancel.cancel();
+        let cancel = CancellationToken::new();
+        self.cancel_token = cancel.clone();
+        self.folder_size_cancel = cancel.child_token();
+        self.thumbnail_cancel = cancel.child_token();
+        self.active_folder_size_tasks = 0;
+        self.thumbnails.clear();
+
+        self.generation = self.generation.next();
+        let generation = self.generation;
+
+        if let Some(tab) = self.tabs.active_tab_mut() {
+            tab.navigate(Self::recycle_bin_path(), record_history);
+            self.sort_spec = tab.sort;
+        }
+        // The bin is a list source of its own: neither a search result nor the browse
+        // list of a folder on disk.
+        self.cancel_list_search();
+        self.list_mode = ListMode::RecycleBin;
+        self.search_hits.clear();
+        self.recycle_items.clear();
+        self.all_entries.clear();
+        self.entries.clear();
+        self.selected_index = None;
+        self.error_message = None;
+        self.is_loading = true;
+        // Shell namespace items are not watched; the previous folder keeps its watcher
+        // and its events no longer match the open location.
+        self.watched_path = None;
+        cx.notify();
+
+        let (tx, rx) = oneshot::channel();
+        self.runtime.spawn_blocking(move || {
+            let _ = tx.send(enumerate_recycle_bin());
+        });
+
+        cx.spawn(async move |this, cx| {
+            let Ok(result) = rx.await else {
+                return;
+            };
+            let _ = this.update(cx, |explorer, cx| {
+                explorer.finish_recycle_load(generation, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Applies the enumeration of `generation`; superseded results are dropped.
+    fn finish_recycle_load(
+        &mut self,
+        generation: GenerationId,
+        result: OnyxResult<Vec<RecycleBinItem>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.generation != generation || !self.is_recycle_bin_mode() {
+            return;
+        }
+        self.is_loading = false;
+        match result {
+            Ok(items) => {
+                self.recycle_items = items;
+                self.all_entries = self.recycle_items.iter().map(recycle_bin_row).collect();
+                self.error_message = None;
+                self.apply_filter_and_sort();
+                self.selected_index = if self.entries.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
+                self.queue_entry_icons(cx);
+                self.update_preview(cx);
+            }
+            Err(err) => {
+                self.recycle_items.clear();
+                self.all_entries.clear();
+                self.entries.clear();
+                self.selected_index = None;
+                self.error_message = Some(err.to_string());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Refuses a filesystem action while the Recycle Bin is on screen.
+    ///
+    /// Recycled items have no live path to act on, so the refusal explains itself in
+    /// the status bar instead of failing deep inside an operation.
+    fn refuse_in_recycle_bin(&mut self, action: &str, cx: &mut Context<Self>) -> bool {
+        if !self.is_recycle_bin_mode() {
+            return false;
+        }
+        self.status_message = Some(format!("{action} is not available in the Recycle Bin yet."));
+        cx.notify();
+        true
     }
 
     // ---- Address Bar (%ENV% expansion + Autocomplete) ----
@@ -1804,7 +1990,12 @@ impl OnyxExplorer {
         self.search_query = query;
         self.selected_index = None;
         self.secondary.selected_index = None;
-        if self.indexed_search && !self.search_query.trim().is_empty() {
+        // The Recycle Bin list is filtered in memory: an index run walks filesystem
+        // roots and cannot reach Shell namespace items.
+        if self.indexed_search
+            && !self.is_recycle_bin_mode()
+            && !self.search_query.trim().is_empty()
+        {
             self.start_list_search(true, cx);
             return;
         }
@@ -1834,7 +2025,9 @@ impl OnyxExplorer {
     fn cancel_list_search(&mut self) {
         self.search_run.cancel();
         self.search_hits.clear();
-        self.list_mode = ListMode::Browse;
+        if self.list_mode == ListMode::Search {
+            self.list_mode = ListMode::Browse;
+        }
     }
 
     /// Starts one search run over the open folder tree and feeds the hits into
@@ -2606,6 +2799,13 @@ impl OnyxExplorer {
         let Some(entry) = self.pane_entries(pane).get(idx).cloned() else {
             return;
         };
+        // A recycled item has no live path: opening it would either fail in the Shell
+        // or launch the leftover inside the bin's `$R` file.
+        if self.pane_shows_recycle_bin(pane)
+            && self.refuse_in_recycle_bin("Restoring recycled items", cx)
+        {
+            return;
+        }
         if entry.is_dir() {
             match pane {
                 PaneId::Primary => self.load_directory(entry.path, true, true, cx),
@@ -2864,6 +3064,11 @@ impl OnyxExplorer {
     // ---- Async Folder Size Calculation (onyx-cache + onyx-fs) ----
 
     fn queue_folder_sizes(&mut self, cx: &mut Context<Self>) {
+        // The Shell reports the size of a recycled folder itself, and its items have
+        // no live path to walk.
+        if self.is_recycle_bin_mode() {
+            return;
+        }
         self.queue_folder_sizes_for(PaneId::Primary, cx);
         if self.dual_pane {
             self.queue_folder_sizes_for(PaneId::Secondary, cx);
@@ -3400,6 +3605,9 @@ impl OnyxExplorer {
     }
 
     fn start_operation(&mut self, operation: FileOperation, cx: &mut Context<Self>) {
+        if self.refuse_in_recycle_bin("Editing recycled items", cx) {
+            return;
+        }
         if self.active_operation.is_some() {
             self.status_message = Some("A file operation is already in progress.".to_string());
             cx.notify();
@@ -3544,11 +3752,14 @@ impl OnyxExplorer {
     }
 
     fn spawn_shell_task(
-        &self,
+        &mut self,
         path: PathBuf,
         action: impl FnOnce(&Path) -> OnyxResult<()> + Send + 'static,
         cx: &mut Context<Self>,
     ) {
+        if self.refuse_in_recycle_bin("That Shell action", cx) {
+            return;
+        }
         let runtime = Arc::clone(&self.runtime);
         let (tx, rx) = oneshot::channel::<String>();
         runtime.spawn_blocking(move || {
@@ -3587,6 +3798,12 @@ impl OnyxExplorer {
         cx: &mut Context<Self>,
     ) {
         let pane = self.active_pane;
+        if self.pane_shows_recycle_bin(pane) {
+            // Recycled items only offer shell actions that need a live path, so the
+            // file context menu stays closed here.
+            self.refuse_in_recycle_bin("The file context menu", cx);
+            return;
+        }
         let Some(entry) = self.pane_entries(pane).get(idx).cloned() else {
             return;
         };
@@ -3612,6 +3829,9 @@ impl OnyxExplorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.refuse_in_recycle_bin("The background context menu", cx) {
+            return;
+        }
         self.context_menu = Some(ContextMenuState::new(
             ContextMenuTarget::Background {
                 dir_path: self.active_directory(),
@@ -4061,6 +4281,9 @@ impl OnyxExplorer {
         origin: (f32, f32),
         cx: &mut Context<Self>,
     ) {
+        if self.refuse_in_recycle_bin("Dragging recycled items", cx) {
+            return;
+        }
         let label = source.file_name().map_or_else(
             || source.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
@@ -4949,6 +5172,23 @@ impl OnyxExplorer {
             return;
         }
 
+        // Recycled items have no live path, so only selection and history keys act on
+        // the Recycle Bin list; every file operation key is inert there.
+        if self.is_recycle_bin_mode() {
+            match key {
+                "up" | "left" => self.move_selection(-1, cx),
+                "down" | "right" => self.move_selection(1, cx),
+                "backspace" => self.go_up(cx),
+                "enter" => {
+                    if let Some(idx) = self.pane_selected_index(self.active_pane) {
+                        self.activate_entry(idx, window, cx);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Quick Look modal captures Space, Escape, Enter, and Arrow keys
         if self.quick_look_open {
             match key {
@@ -5375,6 +5615,39 @@ pub(crate) fn same_path(first: &Path, second: &Path) -> bool {
     first == second || normalize(first) == normalize(second)
 }
 
+/// Builds the list row for one Recycle Bin item.
+///
+/// The row keeps the item's Shell path as its identity — unique per item and usable
+/// as the icon cache key — reports the deletion time in the date column, and shows
+/// the folder the item is restored to in the type column.
+fn recycle_bin_row(item: &RecycleBinItem) -> FileEntry {
+    let extension = Path::new(&item.name)
+        .extension()
+        .map(|ext| ext.to_string_lossy().into_owned())
+        .filter(|ext| !ext.is_empty());
+    FileEntry {
+        path: item.shell_path.clone(),
+        name: item.name.clone(),
+        extension,
+        kind: if item.is_dir {
+            FileKind::Directory
+        } else {
+            FileKind::File
+        },
+        size: item.size,
+        modified: item.deleted_at,
+        created: None,
+        attributes: FileAttributes::default(),
+        is_symlink: false,
+        symlink_target: None,
+        type_label: item
+            .original_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map_or_else(String::new, normalize_display_path),
+    }
+}
+
 /// Filters `all_entries` by `needle`, overlays cached folder sizes and sorts the
 /// result for one pane.
 fn build_view_entries(
@@ -5561,6 +5834,65 @@ mod tests {
             symlink_target: None,
             type_label: "File".to_string(),
         }
+    }
+
+    fn test_recycle_item(name: &str, is_dir: bool) -> RecycleBinItem {
+        RecycleBinItem {
+            name: name.to_string(),
+            shell_path: PathBuf::from(format!(r"C:\$Recycle.Bin\S-1-5-21\$RABCDEF.{name}")),
+            original_path: Some(PathBuf::from(format!(r"C:\Users\me\Desktop\{name}"))),
+            size: 4096,
+            deleted_at: Some(1_700_000_000),
+            is_dir,
+        }
+    }
+
+    #[test]
+    fn recycle_bin_row_maps_the_shell_item() {
+        let row = recycle_bin_row(&test_recycle_item("report.txt", false));
+        assert_eq!(row.name, "report.txt");
+        assert_eq!(row.extension.as_deref(), Some("txt"));
+        assert_eq!(row.kind, FileKind::File);
+        assert!(!row.is_dir());
+        assert_eq!(row.size, 4096);
+        // The date column shows when the item was deleted.
+        assert_eq!(row.modified, Some(1_700_000_000));
+        // The type column shows the folder the item is restored to.
+        assert_eq!(row.type_label, r"C:\Users\me\Desktop");
+        assert!(
+            row.path.to_string_lossy().contains("$RABCDEF"),
+            "the shell path identifies the item"
+        );
+    }
+
+    #[test]
+    fn recycle_bin_row_keeps_deleted_folders_folders() {
+        let row = recycle_bin_row(&test_recycle_item("photos", true));
+        assert_eq!(row.kind, FileKind::Directory);
+        assert!(row.is_dir());
+        assert_eq!(row.extension, None);
+    }
+
+    #[test]
+    fn recycle_bin_row_survives_a_missing_original_location() {
+        let mut item = test_recycle_item("report.txt", false);
+        item.original_path = None;
+        let row = recycle_bin_row(&item);
+        assert_eq!(row.type_label, "");
+        assert_eq!(row.name, "report.txt");
+    }
+
+    #[test]
+    fn the_recycle_bin_namespace_path_routes_to_the_shell_listing() {
+        let namespace = OnyxExplorer::recycle_bin_path();
+        assert!(OnyxExplorer::is_recycle_bin_path(&namespace));
+        assert!(OnyxExplorer::is_recycle_bin_path(&PathBuf::from(
+            r"::{645ff040-5081-101b-9f08-00aa002f954e}"
+        )));
+        assert!(!OnyxExplorer::is_recycle_bin_path(Path::new(r"C:\Users")));
+        assert!(!OnyxExplorer::is_recycle_bin_path(Path::new(
+            r"C:\$Recycle.Bin"
+        )));
     }
 
     #[test]

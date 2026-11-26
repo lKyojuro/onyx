@@ -47,6 +47,9 @@ pub enum ListMode {
     Browse,
     /// Ranked hits of the current indexed search run.
     Search,
+    /// Items of the Windows Recycle Bin, enumerated through the Shell namespace.
+    /// That folder has no filesystem path, so the browse listing cannot fill it.
+    RecycleBin,
 }
 
 /// State of one indexed search run.

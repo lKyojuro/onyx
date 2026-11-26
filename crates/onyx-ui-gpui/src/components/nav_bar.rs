@@ -2,7 +2,7 @@
 //! editable Address Bar (%ENV% expansion + async autocomplete), Favorite Star, and Search.
 
 use crate::components::{FluentButtonProps, fluent_button, fluent_chip};
-use crate::explorer::OnyxExplorer;
+use crate::explorer::{OnyxExplorer, PaneId};
 use crate::icons::{OnyxGlyph, render_glyph};
 use crate::theme::{FONT_MD, FONT_SM, FONT_XS, RADIUS_MD, RADIUS_SM};
 use gpui_kit::{
@@ -10,7 +10,7 @@ use gpui_kit::{
     ParentElement, Role, StatefulInteractiveElement, Styled, Window, component::input::Input,
     deferred, div, px,
 };
-use onyx_core::build_breadcrumbs;
+use onyx_core::{BreadcrumbSegment, build_breadcrumbs};
 
 /// Renders the 44px navigation bar matching `nav_bar.slint`.
 pub fn render_nav_bar(
@@ -142,9 +142,21 @@ pub fn render_nav_bar(
             )
             .into_any_element()
     } else {
-        let breadcrumbs = build_breadcrumbs(view.current_path());
+        // The Recycle Bin has no filesystem path to split into segments, so it shows
+        // one crumb with its name instead of the `::{...}` namespace identifier.
+        let breadcrumbs = if view.is_recycle_bin_mode() {
+            vec![BreadcrumbSegment {
+                label: "Recycle Bin".to_string(),
+                path: view.current_path().to_path_buf(),
+            }]
+        } else {
+            build_breadcrumbs(view.current_path())
+        };
         let crumb_len = breadcrumbs.len();
-        let crumb_row_label = format!("Current path, {}", view.current_path().display());
+        let crumb_row_label = format!(
+            "Current path, {}",
+            view.pane_location_label(PaneId::Primary)
+        );
         let mut crumb_row = div()
             .id("address-breadcrumbs")
             .role(Role::Group)

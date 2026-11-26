@@ -16,10 +16,12 @@ pub fn render_status_bar(view: &OnyxExplorer, cx: &mut Context<OnyxExplorer>) ->
     let theme = view.theme;
     let active = view.active_pane_state();
     let count = active.entries.len();
-    let items_text = if count == 1 {
-        "1 item".to_string()
-    } else {
-        format!("{count} items")
+    let in_recycle_bin = view.is_recycle_bin_mode();
+    let items_text = match (count, in_recycle_bin) {
+        (1, false) => "1 item".to_string(),
+        (1, true) => "1 item in the Recycle Bin".to_string(),
+        (count, false) => format!("{count} items"),
+        (count, true) => format!("{count} items in the Recycle Bin"),
     };
 
     let selection_text = active
@@ -34,7 +36,7 @@ pub fn render_status_bar(view: &OnyxExplorer, cx: &mut Context<OnyxExplorer>) ->
             }
         });
 
-    let display_path = normalize_display_path(view.pane_path(view.active_pane));
+    let display_path = view.pane_location_label(view.active_pane);
     let search_status = view.search_status_label();
 
     // One spoken sentence for the whole bar: counts, selection, path and modes.
@@ -68,6 +70,20 @@ pub fn render_status_bar(view: &OnyxExplorer, cx: &mut Context<OnyxExplorer>) ->
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.accent_bright())
                 .child(sel),
+        );
+    }
+
+    // A recycled item still has the location it would be restored to.
+    if let Some(original) = view.selected_recycle_original() {
+        left_group = left_group.child(vertical_divider(theme, px(12.0))).child(
+            div()
+                .flex_shrink_0()
+                .max_w(px(320.0))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_size(FONT_XS)
+                .text_color(theme.text_secondary())
+                .child(format!("Deleted from {}", normalize_display_path(original))),
         );
     }
 

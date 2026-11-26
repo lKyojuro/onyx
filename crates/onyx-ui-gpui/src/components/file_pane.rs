@@ -14,10 +14,7 @@ use gpui_kit::{
     ObjectFit, ParentElement, Pixels, RenderImage, Role, ScrollEvent, StatefulInteractiveElement,
     Styled, StyledImage, div, img, prelude::FluentBuilder, px, relative, uniform_list,
 };
-use onyx_core::{
-    FileEntry, SortColumn, SortDirection, ViewMode, format_bytes, format_timestamp,
-    normalize_display_path,
-};
+use onyx_core::{FileEntry, SortColumn, SortDirection, ViewMode, format_bytes, format_timestamp};
 use std::sync::Arc;
 
 /// Computes responsive grid column count matching `file_pane.slint` (`140px` min card width).
@@ -93,7 +90,7 @@ pub fn render_file_pane(
 
     // Dual-pane active focus indicator + compact pane path header
     if is_dual {
-        let display_path = normalize_display_path(view.pane_path(pane_id));
+        let display_path = view.pane_location_label(pane_id);
         let pane_label = match pane_id {
             PaneId::Primary => "Primary",
             PaneId::Secondary => "Secondary",
@@ -241,10 +238,15 @@ pub fn render_file_pane(
                 cx,
             ));
 
+        let recycle_bin = view.pane_shows_recycle_bin(pane_id);
         if show_date_col {
             header_row = header_row.child(column_header_btn(
                 pane_id,
-                "Date modified",
+                if recycle_bin {
+                    "Date deleted"
+                } else {
+                    "Date modified"
+                },
                 SortColumn::Modified,
                 sort_spec.column,
                 sort_spec.direction,
@@ -255,9 +257,15 @@ pub fn render_file_pane(
             ));
         }
         if show_type_col {
+            // A recycled item has no type label to show; the folder it is restored to
+            // is what the column reports instead.
             header_row = header_row.child(column_header_btn(
                 pane_id,
-                "Type",
+                if recycle_bin {
+                    "Original location"
+                } else {
+                    "Type"
+                },
                 SortColumn::Kind,
                 sort_spec.column,
                 sort_spec.direction,
@@ -345,14 +353,27 @@ pub fn render_file_pane(
             .into_any_element()
     } else if entries.is_empty() {
         let has_query = !view.search_query_text().trim().is_empty();
+        let recycle_bin = view.pane_shows_recycle_bin(pane_id);
+        let (empty_title, empty_hint) = if has_query {
+            (
+                "No matching items",
+                "Try a different search term or clear the search box.",
+            )
+        } else if recycle_bin {
+            (
+                "Recycle Bin is empty",
+                "Deleted files stay here until you empty the Recycle Bin.",
+            )
+        } else {
+            (
+                "This folder is empty",
+                "Navigate using the sidebar or address bar.",
+            )
+        };
         div()
             .id(("pane-empty", pane_index))
             .role(Role::Status)
-            .aria_label(if has_query {
-                "No matching items"
-            } else {
-                "This folder is empty"
-            })
+            .aria_label(empty_title)
             .flex()
             .flex_col()
             .flex_1()
@@ -362,6 +383,8 @@ pub fn render_file_pane(
             .child(render_glyph(
                 if has_query {
                     OnyxGlyph::Search
+                } else if recycle_bin {
+                    OnyxGlyph::Trash
                 } else {
                     OnyxGlyph::Folder
                 },
@@ -373,21 +396,13 @@ pub fn render_file_pane(
                     .text_size(FONT_MD)
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme.text_secondary())
-                    .child(if has_query {
-                        "No matching items"
-                    } else {
-                        "This folder is empty"
-                    }),
+                    .child(empty_title),
             )
             .child(
                 div()
                     .text_size(FONT_XS)
                     .text_color(theme.text_muted())
-                    .child(if has_query {
-                        "Try a different search term or clear the search box."
-                    } else {
-                        "Navigate using the sidebar or address bar."
-                    }),
+                    .child(empty_hint),
             )
             .into_any_element()
     } else if view.view_mode == ViewMode::Grid {
