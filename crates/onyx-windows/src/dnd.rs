@@ -1,28 +1,32 @@
 //! Native Windows external file Drag & Drop (`WM_DROPFILES` inbound + OLE `DoDragDrop` outbound).
 
+use crate::icons::{RgbaIcon, extract_path_icon_rgba};
 use crate::own_window;
 use onyx_core::{OnyxError, OnyxResult, normalize_display_path};
-use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString, c_void};
 use std::marker::PhantomData;
 use std::mem::{ManuallyDrop, size_of};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use windows::Win32::Foundation::{
-    DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_DVASPECT,
+    COLORREF, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS, DV_E_DVASPECT,
     DV_E_FORMATETC, DV_E_TYMED, E_FAIL, E_NOTIMPL, E_POINTER, FALSE, GlobalFree, HGLOBAL, HWND,
-    LPARAM, LRESULT, OLE_E_ADVISENOTSUPPORTED, POINT, RPC_E_CHANGED_MODE, S_FALSE, S_OK, TRUE,
-    WPARAM,
+    LPARAM, LRESULT, OLE_E_ADVISENOTSUPPORTED, POINT, RPC_E_CHANGED_MODE, S_FALSE, S_OK, SIZE,
+    TRUE, WPARAM,
+};
+use windows::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject, HBITMAP,
+    HGDIOBJ,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, CoCreateInstance, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink,
-    IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0,
-    TYMED_HGLOBAL,
+    IDataObject, IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, IStream, STATFLAG_NONAME,
+    STATSTG, STGMEDIUM, STGMEDIUM_0, STREAM_SEEK_SET, TYMED_HGLOBAL, TYMED_ISTREAM,
 };
-use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
 use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GMEM_ZEROINIT, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
@@ -35,8 +39,8 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, ReleaseCapture, VK_LBUTTON};
 use windows::Win32::UI::Shell::{
     CLSID_DragDropHelper, DROPFILES, DefSubclassProc, DragAcceptFiles, DragFinish, DragQueryFileW,
-    DragQueryPoint, HDROP, IDragSourceHelper, RemoveWindowSubclass, SHCreateStdEnumFmtEtc,
-    SetWindowSubclass,
+    DragQueryPoint, HDROP, IDragSourceHelper, RemoveWindowSubclass, SHCreateMemStream,
+    SHCreateStdEnumFmtEtc, SHDRAGIMAGE, SetWindowSubclass,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, WM_DROPFILES, WM_NCDESTROY,
@@ -523,12 +527,17 @@ fn hglobal_formatetc(cf_format: u16) -> FORMATETC {
 
 /// Clipboard format the shell's drag-drop helper stores the generated drag image under
 /// (`CFSTR_DRAGIMAGEBITS`), registered once per process.
+#[cfg(test)]
 fn drag_image_format() -> u16 {
-    static FORMAT: OnceLock<u16> = OnceLock::new();
+    static FORMAT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
     *FORMAT.get_or_init(|| {
         // SAFETY: The literal is a valid null-terminated wide string; registering a clipboard
         // format only returns its identifier and never touches the object being dragged.
-        let id = unsafe { RegisterClipboardFormatW(windows::core::w!("DragImageBits")) };
+        let id = unsafe {
+            windows::Win32::System::DataExchange::RegisterClipboardFormatW(windows::core::w!(
+                "DragImageBits"
+            ))
+        };
         u16::try_from(id).unwrap_or(0)
     })
 }
@@ -587,27 +596,82 @@ impl IDropSource_Impl for FileDropSource_Impl {
     }
 }
 
+#[derive(Clone)]
+enum StoredMedium {
+    HGlobal(Vec<u8>),
+    Stream(Vec<u8>),
+}
+
+impl StoredMedium {
+    fn tymed(&self) -> u32 {
+        match self {
+            Self::HGlobal(_) => TYMED_HGLOBAL.0 as u32,
+            Self::Stream(_) => TYMED_ISTREAM.0 as u32,
+        }
+    }
+}
+
+/// Reads the full byte contents of a COM `IStream` without consuming its ownership.
+fn read_istream_bytes(stream: &IStream) -> Option<Vec<u8>> {
+    // SAFETY: `stream` is a live COM `IStream` passed to `SetData`.
+    unsafe {
+        let mut stat = STATSTG::default();
+        let _ = stream.Stat(&raw mut stat, STATFLAG_NONAME);
+        let _ = stream.Seek(0, STREAM_SEEK_SET, None);
+        let cap = usize::try_from(stat.cbSize)
+            .unwrap_or(0)
+            .min(16 * 1024 * 1024);
+        let mut out = Vec::with_capacity(cap);
+        let mut chunk = [0u8; 4096];
+        loop {
+            let mut read_bytes = 0u32;
+            let hr = stream.Read(
+                chunk.as_mut_ptr().cast::<c_void>(),
+                chunk.len() as u32,
+                Some(&raw mut read_bytes),
+            );
+            if read_bytes > 0 {
+                out.extend_from_slice(&chunk[..read_bytes as usize]);
+            }
+            if hr.is_err() || read_bytes == 0 || out.len() >= 16 * 1024 * 1024 {
+                break;
+            }
+        }
+        Some(out)
+    }
+}
+
 #[implement(IDataObject)]
 struct FileDataObject {
     hdrop_payload: Vec<u8>,
-    /// Drag image bitmap the shell's `IDragSourceHelper` writes back through `SetData`; served
-    /// again through `GetData` so the OLE drag loop can paint it.
-    drag_image_bits: Mutex<Option<Vec<u8>>>,
+    /// Auxiliary formats written by the shell's `IDragSourceHelper`
+    /// (`DragImageBits`, `DragContext`, `IsShowingLayered`, `UsingDefaultDragImage`, etc.),
+    /// served back through `GetData` so Windows Explorer and other drop targets paint the
+    /// translucent drag icon under the cursor.
+    extra_formats: Mutex<HashMap<u16, StoredMedium>>,
 }
 
 impl FileDataObject {
     fn new(hdrop_payload: Vec<u8>) -> Self {
         Self {
             hdrop_payload,
-            drag_image_bits: Mutex::new(None),
+            extra_formats: Mutex::new(HashMap::new()),
         }
     }
 
-    fn drag_image_bytes(&self) -> Option<Vec<u8>> {
-        self.drag_image_bits
+    fn extra_format(&self, cf_format: u16) -> Option<StoredMedium> {
+        self.extra_formats
             .lock()
             .ok()
-            .and_then(|bits| bits.clone())
+            .and_then(|map| map.get(&cf_format).cloned())
+    }
+
+    fn extra_format_entries(&self) -> Vec<(u16, u32)> {
+        self.extra_formats
+            .lock()
+            .ok()
+            .map(|map| map.iter().map(|(&k, v)| (k, v.tymed())).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -636,27 +700,49 @@ impl IDataObject_Impl for FileDataObject_Impl {
         }
         // SAFETY: `pformatetcin` was verified non-null above.
         let fmt = unsafe { &*pformatetcin };
-        let payload: Cow<'_, [u8]> = if fmt.cfFormat == drag_image_format() {
-            if let Err(hr) = matches_hglobal_format(fmt, fmt.cfFormat) {
-                return Err(hr.into());
-            }
-            match self.drag_image_bytes() {
-                Some(bits) => Cow::Owned(bits),
-                None => return Err(DV_E_FORMATETC.into()),
-            }
-        } else {
+        if fmt.cfFormat == CF_HDROP.0 {
             if let Err(hr) = matches_hdrop_format(fmt) {
                 return Err(hr.into());
             }
-            Cow::Borrowed(&self.hdrop_payload)
-        };
+            let hglobal = alloc_hglobal_with_bytes(&self.hdrop_payload)?;
+            return Ok(STGMEDIUM {
+                tymed: TYMED_HGLOBAL.0 as u32,
+                u: STGMEDIUM_0 { hGlobal: hglobal },
+                pUnkForRelease: ManuallyDrop::new(None),
+            });
+        }
 
-        let hglobal = alloc_hglobal_with_bytes(&payload)?;
-        Ok(STGMEDIUM {
-            tymed: TYMED_HGLOBAL.0 as u32,
-            u: STGMEDIUM_0 { hGlobal: hglobal },
-            pUnkForRelease: ManuallyDrop::new(None),
-        })
+        let Some(stored) = self.extra_format(fmt.cfFormat) else {
+            return Err(DV_E_FORMATETC.into());
+        };
+        if (fmt.dwAspect & DVASPECT_CONTENT.0) == 0 {
+            return Err(DV_E_DVASPECT.into());
+        }
+        if (fmt.tymed & stored.tymed()) == 0 {
+            return Err(DV_E_TYMED.into());
+        }
+
+        match stored {
+            StoredMedium::HGlobal(bits) => {
+                let hglobal = alloc_hglobal_with_bytes(&bits)?;
+                Ok(STGMEDIUM {
+                    tymed: TYMED_HGLOBAL.0 as u32,
+                    u: STGMEDIUM_0 { hGlobal: hglobal },
+                    pUnkForRelease: ManuallyDrop::new(None),
+                })
+            }
+            StoredMedium::Stream(bits) => {
+                // SAFETY: `SHCreateMemStream` copies `bits` into a newly allocated COM `IStream`.
+                let stream = unsafe { SHCreateMemStream(Some(&bits)) }.ok_or(E_FAIL)?;
+                Ok(STGMEDIUM {
+                    tymed: TYMED_ISTREAM.0 as u32,
+                    u: STGMEDIUM_0 {
+                        pstm: ManuallyDrop::new(Some(stream)),
+                    },
+                    pUnkForRelease: ManuallyDrop::new(None),
+                })
+            }
+        }
     }
 
     fn GetDataHere(
@@ -673,16 +759,22 @@ impl IDataObject_Impl for FileDataObject_Impl {
         }
         // SAFETY: `pformatetc` was verified non-null above.
         let fmt = unsafe { &*pformatetc };
-        if fmt.cfFormat == drag_image_format()
-            && matches_hglobal_format(fmt, fmt.cfFormat).is_ok()
-            && self.drag_image_bytes().is_some()
-        {
+        if fmt.cfFormat == CF_HDROP.0 {
+            return match matches_hdrop_format(fmt) {
+                Ok(()) => S_OK,
+                Err(hr) => hr,
+            };
+        }
+        if let Some(stored) = self.extra_format(fmt.cfFormat) {
+            if (fmt.dwAspect & DVASPECT_CONTENT.0) == 0 {
+                return DV_E_DVASPECT;
+            }
+            if (fmt.tymed & stored.tymed()) == 0 {
+                return DV_E_TYMED;
+            }
             return S_OK;
         }
-        match matches_hdrop_format(fmt) {
-            Ok(()) => S_OK,
-            Err(hr) => hr,
-        }
+        DV_E_FORMATETC
     }
 
     fn GetCanonicalFormatEtc(
@@ -710,29 +802,42 @@ impl IDataObject_Impl for FileDataObject_Impl {
         }
         // SAFETY: Both pointers were verified non-null above and stay valid for the call.
         let (fmt, medium) = unsafe { (&*pformatetc, &*pmedium) };
-        // SAFETY: `medium.tymed` is checked before `u.hGlobal` is read, so the union field holds a
-        // global memory handle at that point.
-        let bytes = unsafe {
-            (fmt.cfFormat == drag_image_format()
-                && medium.tymed == TYMED_HGLOBAL.0 as u32
-                && !medium.u.hGlobal.is_invalid())
-            .then(|| read_hglobal_bytes(medium.u.hGlobal))
-            .flatten()
+        // SAFETY: `medium.tymed` is checked before reading the matching union field.
+        let stored = unsafe {
+            if fmt.cfFormat == 0 {
+                None
+            } else if medium.tymed == TYMED_HGLOBAL.0 as u32 && !medium.u.hGlobal.is_invalid() {
+                read_hglobal_bytes(medium.u.hGlobal).map(StoredMedium::HGlobal)
+            } else if medium.tymed == TYMED_ISTREAM.0 as u32 {
+                medium
+                    .u
+                    .pstm
+                    .as_ref()
+                    .and_then(read_istream_bytes)
+                    .map(StoredMedium::Stream)
+            } else {
+                None
+            }
         };
+        let Some(stored) = stored else {
+            // Per COM `IDataObject::SetData` contract, when returning an error the caller retains
+            // ownership of `pmedium` and will release it itself — never call `ReleaseStgMedium`
+            // on an error path or the caller will double-free (`STATUS_HEAP_CORRUPTION`).
+            return Err(E_NOTIMPL.into());
+        };
+        match self.extra_formats.lock() {
+            Ok(mut map) => {
+                map.insert(fmt.cfFormat, stored);
+            }
+            Err(_) => return Err(E_FAIL.into()),
+        }
         if frelease.as_bool() {
-            // SAFETY: `frelease == TRUE` hands ownership of the medium to this method, which
-            // therefore releases it after the bytes were copied.
+            // SAFETY: `SetData` succeeded with `frelease == TRUE`, so ownership of `pmedium` was
+            // transferred to us and we release it once now that the bytes have been copied.
             unsafe {
                 let mut owned = ptr::read(pmedium);
                 ReleaseStgMedium(&raw mut owned);
             }
-        }
-        let Some(bytes) = bytes else {
-            return Err(E_NOTIMPL.into());
-        };
-        match self.drag_image_bits.lock() {
-            Ok(mut slot) => *slot = Some(bytes),
-            Err(_) => return Err(E_FAIL.into()),
         }
         Ok(())
     }
@@ -742,8 +847,16 @@ impl IDataObject_Impl for FileDataObject_Impl {
             return Err(E_NOTIMPL.into());
         }
         let mut formats = vec![hdrop_formatetc()];
-        if self.drag_image_bytes().is_some() {
-            formats.push(hglobal_formatetc(drag_image_format()));
+        for (cf_format, tymed) in self.extra_format_entries() {
+            if cf_format != CF_HDROP.0 {
+                formats.push(FORMATETC {
+                    cfFormat: cf_format,
+                    ptd: ptr::null_mut(),
+                    dwAspect: DVASPECT_CONTENT.0,
+                    lindex: -1,
+                    tymed,
+                });
+            }
         }
         // SAFETY: `formats` is a valid slice of `FORMATETC` structs copied by `SHCreateStdEnumFmtEtc`.
         unsafe { SHCreateStdEnumFmtEtc(&formats) }
@@ -765,6 +878,138 @@ impl IDataObject_Impl for FileDataObject_Impl {
     fn EnumDAdvise(&self) -> windows::core::Result<IEnumSTATDATA> {
         Err(OLE_E_ADVISENOTSUPPORTED.into())
     }
+}
+
+/// Creates a 32-bit top-down premultiplied BGRA DIB section from a straight-alpha [`RgbaIcon`].
+fn create_premultiplied_bgra_dib(icon: &RgbaIcon) -> OnyxResult<HBITMAP> {
+    let width = i32::try_from(icon.width).map_err(|_| OnyxError::Platform {
+        message: "drag icon width exceeds i32".to_string(),
+    })?;
+    let height = i32::try_from(icon.height).map_err(|_| OnyxError::Platform {
+        message: "drag icon height exceeds i32".to_string(),
+    })?;
+    let expected = (icon.width as usize)
+        .checked_mul(icon.height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| OnyxError::Platform {
+            message: "drag icon dimensions overflow".to_string(),
+        })?;
+    if icon.width == 0 || icon.height == 0 || icon.pixels.len() != expected {
+        return Err(OnyxError::Platform {
+            message: "drag icon pixel buffer has invalid dimensions".to_string(),
+        });
+    }
+
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            // Negative height creates a top-down 32-bit DIB matching `RgbaIcon` row order.
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: 0,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        },
+        bmiColors: [Default::default()],
+    };
+
+    let mut bits_ptr: *mut c_void = ptr::null_mut();
+    // SAFETY: `bmi` describes a valid 32-bit top-down uncompressed DIB; `CreateDIBSection` writes
+    // the backing pixel buffer pointer into `bits_ptr` and returns an owned `HBITMAP`.
+    let hbitmap = unsafe {
+        CreateDIBSection(
+            None,
+            &raw const bmi,
+            DIB_RGB_COLORS,
+            &raw mut bits_ptr,
+            None,
+            0,
+        )
+    }
+    .map_err(|error| OnyxError::Platform {
+        message: format!("CreateDIBSection failed for drag icon: {error}"),
+    })?;
+
+    if bits_ptr.is_null() {
+        // SAFETY: `hbitmap` was just created and is unused on error.
+        let _ = unsafe { DeleteObject(HGDIOBJ(hbitmap.0)) };
+        return Err(OnyxError::Platform {
+            message: "CreateDIBSection returned a null pixel pointer".to_string(),
+        });
+    }
+
+    // SAFETY: `bits_ptr` points to `expected` writable bytes allocated by `CreateDIBSection`.
+    let dst = unsafe { std::slice::from_raw_parts_mut(bits_ptr.cast::<u8>(), expected) };
+    for (src_px, dst_px) in icon.pixels.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+        let a = u16::from(src_px[3]);
+        let r = ((u16::from(src_px[0]) * a + 127) / 255) as u8;
+        let g = ((u16::from(src_px[1]) * a + 127) / 255) as u8;
+        let b = ((u16::from(src_px[2]) * a + 127) / 255) as u8;
+        dst_px[0] = b;
+        dst_px[1] = g;
+        dst_px[2] = r;
+        dst_px[3] = src_px[3];
+    }
+
+    Ok(hbitmap)
+}
+
+/// Attaches the Windows Shell icon of `path` as a translucent cursor-following drag image via
+/// `IDragSourceHelper::InitializeFromBitmap`.
+///
+/// Unlike `InitializeFromWindow`, this works for DirectX / custom-rendered windows (GPUI) that do
+/// not handle the Win32 `DI_GETDRAGIMAGE` message.
+fn attach_icon_drag_image(path: &Path, data_object: &IDataObject) -> OnyxResult<()> {
+    let icon = extract_path_icon_rgba(path, path.is_dir()).ok_or_else(|| OnyxError::Platform {
+        message: format!("could not extract shell icon for {}", path.display()),
+    })?;
+    let hbitmap = create_premultiplied_bgra_dib(&icon)?;
+
+    // SAFETY: `CLSID_DragDropHelper` is an in-process COM class created on the calling STA
+    // thread, which the caller initialized via `OleGuard`.
+    let helper: IDragSourceHelper =
+        match unsafe { CoCreateInstance(&CLSID_DragDropHelper, None, CLSCTX_INPROC_SERVER) } {
+            Ok(helper) => helper,
+            Err(error) => {
+                // SAFETY: `hbitmap` was not transferred to `IDragSourceHelper`, so free it here.
+                let _ = unsafe { DeleteObject(HGDIOBJ(hbitmap.0)) };
+                return Err(OnyxError::Platform {
+                    message: format!("IDragSourceHelper is unavailable: {error}"),
+                });
+            }
+        };
+
+    let width = i32::try_from(icon.width).unwrap_or(32);
+    let height = i32::try_from(icon.height).unwrap_or(32);
+    let mut shdi = SHDRAGIMAGE {
+        sizeDragImage: SIZE {
+            cx: width,
+            cy: height,
+        },
+        ptOffset: POINT {
+            x: width / 2,
+            y: height / 2,
+        },
+        hbmpDragImage: hbitmap,
+        crColorKey: COLORREF(0xFFFF_FFFF),
+    };
+
+    // SAFETY: `shdi` points to a valid `SHDRAGIMAGE` with an owned 32-bit DIB, and `data_object`
+    // is a valid COM `IDataObject`. On success `InitializeFromBitmap` takes ownership of
+    // `hbmpDragImage`; on failure we delete `hbitmap` ourselves.
+    let res = unsafe { helper.InitializeFromBitmap(&raw mut shdi, data_object) };
+    if let Err(error) = res {
+        let _ = unsafe { DeleteObject(HGDIOBJ(hbitmap.0)) };
+        return Err(OnyxError::Platform {
+            message: format!("InitializeFromBitmap failed: {error}"),
+        });
+    }
+    Ok(())
 }
 
 /// Lets the shell's drag-drop helper snapshot the window area under `source` into the drag image
@@ -816,12 +1061,16 @@ pub fn start_external_file_drag(
     let _ = unsafe { ReleaseCapture() };
 
     let data_object: IDataObject = FileDataObject::new(hdrop_payload).into();
-    // The drag image is purely cosmetic, so a helper that cannot snapshot the window must not
-    // stop the drag itself.
-    if let Some(source) = drag_image
-        && let Err(error) = attach_drag_image(source, &data_object)
-    {
-        tracing::debug!(%error, "starting the external drag without a drag image");
+    // Prefer the real Windows Shell icon via `InitializeFromBitmap` (works natively on DirectX /
+    // GPUI windows where `InitializeFromWindow` / `DI_GETDRAGIMAGE` is unhandled), falling back to
+    // window snapshot only if icon extraction fails.
+    if let Err(icon_err) = attach_icon_drag_image(&paths[0], &data_object) {
+        tracing::debug!(%icon_err, "shell icon drag image failed, trying window snapshot");
+        if let Some(source) = drag_image
+            && let Err(error) = attach_drag_image(source, &data_object)
+        {
+            tracing::debug!(%error, "starting the external drag without a drag image");
+        }
     }
     let drop_source: IDropSource = FileDropSource.into();
     let mut effect = DROPEFFECT_NONE;
@@ -892,6 +1141,27 @@ mod tests {
 
         let result = attach_drag_image(DragImageSource::new(0, 10, 20), &data_object);
         assert!(matches!(result, Err(OnyxError::Platform { .. })));
+    }
+
+    #[test]
+    fn icon_drag_image_populates_data_object_formats() {
+        let temp = TempDir::new().unwrap();
+        let file = temp.path().join("sample.txt");
+        std::fs::write(&file, b"hello").unwrap();
+
+        let payload = encode_cf_hdrop(std::slice::from_ref(&file)).unwrap();
+        let data_object: IDataObject = FileDataObject::new(payload).into();
+        let _ole = OleGuard::init().expect("OLE should initialize on this test thread");
+
+        attach_icon_drag_image(&file, &data_object)
+            .expect("InitializeFromBitmap should attach the shell icon drag image");
+
+        let img_fmt = hglobal_formatetc(drag_image_format());
+        // SAFETY: `img_fmt` is a valid `FORMATETC` pointer.
+        assert_eq!(
+            unsafe { data_object.QueryGetData(&raw const img_fmt) },
+            S_OK
+        );
     }
 
     #[test]

@@ -7,12 +7,13 @@
 //! items can be dropped into Explorer, the desktop or other applications.
 
 use crate::explorer::{OnyxExplorer, PaneId, same_path};
-use crate::icons::{OnyxGlyph, render_glyph};
+use crate::icons::{OnyxGlyph, path_icon_key, render_glyph};
 use crate::theme::{FONT_XS, RADIUS_MD, RADIUS_SM};
 use gpui_kit::{
-    FontWeight, InteractiveElement, IntoElement, ParentElement, Styled, deferred, div, px,
+    FontWeight, InteractiveElement, IntoElement, ParentElement, Styled, deferred, div, img, px,
 };
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Pointer travel in logical pixels after which a press becomes a drag.
 pub const DRAG_THRESHOLD_PX: f32 = 8.0;
@@ -162,29 +163,62 @@ pub fn render_drag_ghost(view: &OnyxExplorer) -> Option<impl IntoElement> {
     } else {
         OnyxGlyph::File
     };
+    let icon_key = if drag.is_dir {
+        "directory".to_string()
+    } else {
+        let ext = drag
+            .source
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if ext == "exe" || ext == "lnk" || ext == "ico" {
+            path_icon_key(&drag.source)
+        } else {
+            format!("extension:{ext}")
+        }
+    };
+    let shell_icon = view
+        .thumbnails
+        .get(&drag.source)
+        .or_else(|| view.icons.get(&icon_key))
+        .cloned();
     let mode = drag_mode_label(drag.copy);
     let x = drag.pointer.0 + GHOST_OFFSET;
     let y = drag.pointer.1 + GHOST_OFFSET;
 
+    let mut ghost = div()
+        .id("drag-ghost")
+        .absolute()
+        .top(px(y))
+        .left(px(x))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .max_w(px(280.0))
+        .px(px(8.0))
+        .py(px(6.0))
+        .rounded(RADIUS_MD)
+        .border_1()
+        .border_color(theme.accent_bright())
+        .bg(theme.bg_elevated())
+        .opacity(0.94);
+
+    if let Some(icon_img) = shell_icon {
+        ghost = ghost.child(
+            img(Arc::clone(&icon_img))
+                .w(px(28.0))
+                .h(px(28.0))
+                .flex_shrink_0(),
+        );
+    } else {
+        ghost = ghost.child(render_glyph(glyph, px(22.0), theme.accent_bright()));
+    }
+
     Some(
         deferred(
-            div()
-                .id("drag-ghost")
-                .absolute()
-                .top(px(y))
-                .left(px(x))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(6.0))
-                .max_w(px(260.0))
-                .px(px(8.0))
-                .py(px(5.0))
-                .rounded(RADIUS_MD)
-                .border_1()
-                .border_color(theme.accent_bright())
-                .bg(theme.bg_elevated())
-                .child(render_glyph(glyph, px(14.0), theme.accent_bright()))
+            ghost
                 .child(
                     div()
                         .flex_1()

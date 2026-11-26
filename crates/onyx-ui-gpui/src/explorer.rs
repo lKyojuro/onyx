@@ -27,11 +27,11 @@ use crate::search_index::{
 };
 use crate::theme::OnyxTheme;
 use gpui_kit::{
-    AppContext, ClipboardItem, Context, DispatchPhase, Entity, FileDropEvent, FocusHandle,
-    Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, NavigationDirection, ParentElement, Pixels, Point, Render,
-    RenderImage, Role, ScrollEvent, ScrollHandle, StatefulInteractiveElement, Styled, Subscription,
-    UniformListScrollHandle, Window, canvas,
+    AppContext, ClipboardItem, Context, DispatchPhase, Entity, ExternalPaths, FileDropEvent,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, ParentElement, Pixels,
+    Point, Render, RenderImage, Role, ScrollEvent, ScrollHandle, StatefulInteractiveElement,
+    Styled, Subscription, UniformListScrollHandle, Window, canvas,
     component::input::{InputEvent, InputState},
     div, point, px,
 };
@@ -517,6 +517,83 @@ pub struct PaneSnapshot<'a> {
     pub selected_index: Option<usize>,
 }
 
+/// Timeout after which incremental type-ahead in the file list starts a fresh prefix.
+const TYPE_AHEAD_TIMEOUT: Duration = Duration::from_millis(850);
+
+/// Tracks incremental keyboard type-ahead prefix selection in the active file pane.
+#[derive(Debug, Default)]
+struct TypeAheadState {
+    buffer: String,
+    last_typed: Option<std::time::Instant>,
+    pane: Option<PaneId>,
+}
+
+/// Extracts a printable type-ahead character from a file-list keystroke, ignoring
+/// modifier shortcuts (`Ctrl`/`Alt`/`Win`) and non-name control keys.
+fn type_ahead_char(ev: &KeyDownEvent) -> Option<char> {
+    let mods = &ev.keystroke.modifiers;
+    if mods.control || mods.alt || mods.platform || mods.function {
+        return None;
+    }
+    if let Some(key_char) = ev.keystroke.key_char.as_deref() {
+        let mut chars = key_char.chars();
+        if let (Some(ch), None) = (chars.next(), chars.next())
+            && (ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        {
+            return Some(ch);
+        }
+    }
+    let mut chars = ev.keystroke.key.chars();
+    if let (Some(ch), None) = (chars.next(), chars.next())
+        && (ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+    {
+        return Some(ch);
+    }
+    None
+}
+
+/// Finds the next entry in `entries` whose name starts with `query` (case-insensitive).
+///
+/// - When `cycle_same_char` is `true` (e.g. pressing `d` repeatedly), advances past
+///   `current` and wraps around so the user cycles through all matching items.
+/// - For a multi-character prefix (e.g. `doc`), keeps `current` if it already matches,
+///   otherwise searches forward from `current` (or index `0`) with wrap-around.
+/// - For a fresh single-character press, jumps to the first match starting from index `0`
+///   unless `current` already starts with that character, in which case it advances to
+///   the next match.
+fn find_type_ahead_match(
+    entries: &[FileEntry],
+    query: &str,
+    current: Option<usize>,
+    cycle_same_char: bool,
+) -> Option<usize> {
+    if entries.is_empty() || query.is_empty() {
+        return None;
+    }
+    let needle = query.to_lowercase();
+    let len = entries.len();
+    let matches_at = |idx: usize| entries[idx].name.to_lowercase().starts_with(&needle);
+
+    let start = if cycle_same_char {
+        current.map_or(0, |idx| (idx + 1) % len)
+    } else if needle.chars().count() == 1 {
+        if let Some(idx) = current
+            && idx < len
+            && matches_at(idx)
+        {
+            (idx + 1) % len
+        } else {
+            0
+        }
+    } else {
+        current.filter(|&idx| idx < len).unwrap_or(0)
+    };
+
+    (0..len)
+        .map(|offset| (start + offset) % len)
+        .find(|&idx| matches_at(idx))
+}
+
 /// Main GPUI view for Onyx Stage 1 (visual parity with Slint UI).
 pub struct OnyxExplorer {
     pub(crate) runtime: Arc<Runtime>,
@@ -546,6 +623,7 @@ pub struct OnyxExplorer {
     pub(crate) all_entries: Vec<FileEntry>,
     pub(crate) entries: Vec<FileEntry>,
     pub(crate) selected_index: Option<usize>,
+    type_ahead: TypeAheadState,
     pub(crate) generation: GenerationId,
     pub(crate) cancel_token: CancellationToken,
     pub(crate) folder_size_cancel: CancellationToken,
@@ -631,9 +709,12 @@ pub struct OnyxExplorer {
     archive_generation: GenerationId,
     archive_cancel: CancellationToken,
     pub(crate) drag: Option<DragState>,
-    /// Set while the OLE drag loop runs on its own STA thread, so pointer
-    /// crossings of the window edge cannot start a second drag.
+    /// Set while the OLE drag loop runs, so pointer crossings of the window edge
+    /// cannot start a second drag and self-drops back into Onyx are safely ignored.
     external_drag_active: bool,
+    /// Set when the user drags an item out of Onyx, drags it back over Onyx, and
+    /// releases it inside our own window so `finish_external_drag` treats it as cancelled.
+    external_drag_returned_inside: bool,
     /// Last painted viewport size, used for layout clamping and session persistence.
     pub(crate) viewport_size: (f32, f32),
     watch_cmd_tx: mpsc::UnboundedSender<PathBuf>,
@@ -805,6 +886,7 @@ impl OnyxExplorer {
             all_entries: Vec::new(),
             entries: Vec::new(),
             selected_index: None,
+            type_ahead: TypeAheadState::default(),
             generation: GenerationId::new(0),
             cancel_token: CancellationToken::new(),
             folder_size_cancel: CancellationToken::new(),
@@ -874,6 +956,7 @@ impl OnyxExplorer {
             archive_cancel: CancellationToken::new(),
             drag: None,
             external_drag_active: false,
+            external_drag_returned_inside: false,
             viewport_size: (1320.0, 820.0),
             watch_cmd_tx,
             watched_path: None,
@@ -3274,6 +3357,61 @@ impl OnyxExplorer {
         cx.notify();
     }
 
+    /// Handles incremental letter/digit type-ahead jump in the active file pane.
+    fn handle_type_ahead(&mut self, ch: char, cx: &mut Context<Self>) -> bool {
+        let pane = self.active_pane;
+        if self.pane_entries(pane).is_empty() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        let expired = self.type_ahead.pane != Some(pane)
+            || self
+                .type_ahead
+                .last_typed
+                .is_none_or(|ts| now.duration_since(ts) > TYPE_AHEAD_TIMEOUT);
+        if expired {
+            self.type_ahead.buffer.clear();
+        }
+        let ch_lower: String = ch.to_lowercase().collect();
+        let cycle_same_char = !self.type_ahead.buffer.is_empty()
+            && self.type_ahead.buffer.chars().count() == 1
+            && self.type_ahead.buffer == ch_lower;
+        if !cycle_same_char {
+            self.type_ahead.buffer.push_str(&ch_lower);
+        }
+        self.type_ahead.last_typed = Some(now);
+        self.type_ahead.pane = Some(pane);
+
+        let current = self.pane_selected_index(pane);
+        let query = self.type_ahead.buffer.clone();
+        let mut matched =
+            find_type_ahead_match(self.pane_entries(pane), &query, current, cycle_same_char);
+        if matched.is_none() && query.chars().count() > 1 {
+            // Fall back to starting a fresh single-character jump if the longer prefix missed.
+            self.type_ahead.buffer = ch_lower;
+            matched = find_type_ahead_match(
+                self.pane_entries(pane),
+                &self.type_ahead.buffer,
+                current,
+                false,
+            );
+        }
+
+        let Some(idx) = matched else {
+            return false;
+        };
+        match pane {
+            PaneId::Primary => self.selected_index = Some(idx),
+            PaneId::Secondary => self.secondary.selected_index = Some(idx),
+        }
+        if self.view_mode != ViewMode::Grid {
+            self.reveal_list_row(pane, idx, cx);
+        }
+        self.update_preview(cx);
+        cx.notify();
+        true
+    }
+
     // ---- Async Grid Thumbnails (ThumbnailEngine, max 4 workers) ----
 
     fn queue_thumbnails(&mut self, cx: &mut Context<Self>) {
@@ -4881,10 +5019,77 @@ impl OnyxExplorer {
         self.start_external_drag(drag.source, drag_image, cx);
     }
 
+    /// Handles files dropped into Onyx from Windows Explorer, the Desktop, or another
+    /// application via GPUI's `ExternalPaths` drag-and-drop pipeline (`.on_drop`).
+    pub(crate) fn handle_external_paths_drop(
+        &mut self,
+        paths: &ExternalPaths,
+        cx: &mut Context<Self>,
+    ) {
+        // When Onyx itself is the active OLE drag source, releasing back inside our own
+        // window cancels cleanly instead of running a self-drop or recycling the file.
+        if self.external_drag_active {
+            self.external_drag_returned_inside = true;
+            self.external_drop = None;
+            cx.notify();
+            return;
+        }
+        if self.refuse_in_recycle_bin("Dropping files here", cx) {
+            return;
+        }
+        let raw_paths = paths.paths();
+        if raw_paths.is_empty() {
+            return;
+        }
+        let destination = self.active_directory();
+        let mut valid_sources = Vec::with_capacity(raw_paths.len());
+        let mut last_reject = None;
+        for path in raw_paths {
+            match validate_drop(path, &destination) {
+                Ok(_) => valid_sources.push(path.clone()),
+                Err(reject) => last_reject = Some(reject),
+            }
+        }
+        if valid_sources.is_empty() {
+            if let Some(reject) = last_reject {
+                self.status_message = Some(reject.message().to_string());
+                cx.notify();
+            }
+            return;
+        }
+        // Same volume moves, another volume copies — matching Windows Explorer's CF_HDROP rule.
+        let same_volume = valid_sources
+            .iter()
+            .all(|path| path.components().next() == destination.components().next());
+        let operation = if same_volume {
+            FileOperation::MoveItems {
+                sources: valid_sources,
+                destination,
+            }
+        } else {
+            FileOperation::CopyItems {
+                sources: valid_sources,
+                destination,
+            }
+        };
+        self.start_operation(operation, cx);
+    }
+
     /// Files another application drags into the window: remember them on
     /// `Entered`, follow the pointer on `Pending` and run the operation on
     /// `Submit`.
     pub(crate) fn handle_file_drop(&mut self, event: &FileDropEvent, cx: &mut Context<Self>) {
+        // When Onyx itself is the active OLE drag source, dragging the item back
+        // into our own window and releasing must cancel cleanly rather than running
+        // a self-drop operation or letting `finish_external_drag` recycle the file.
+        if self.external_drag_active {
+            if matches!(event, FileDropEvent::Submit { .. }) {
+                self.external_drag_returned_inside = true;
+                self.external_drop = None;
+                cx.notify();
+            }
+            return;
+        }
         match event {
             FileDropEvent::Entered { position, paths } => {
                 let paths = paths.paths().to_vec();
@@ -4937,14 +5142,15 @@ impl OnyxExplorer {
         }
     }
 
-    /// Runs the synchronous OLE `DoDragDrop` loop for one dragged item.
+    /// Schedules the synchronous OLE `DoDragDrop` loop for one dragged item on the
+    /// UI STA thread *outside* the active `MouseMoveEvent` / `Entity::update` borrow.
     ///
-    /// It blocks until the drop target answers, which is exactly how a native
-    /// drag behaves, and it has to run on the UI thread: `DoDragDrop` routes the
-    /// mouse messages through the capture this thread holds, and the helper's
-    /// `ReleaseCapture` only releases capture owned by the calling thread. A
-    /// worker thread therefore hands the drag over and then waits forever for a
-    /// release it never sees.
+    /// Running `DoDragDrop` directly inside `Entity::update` leaves `App` and
+    /// `OnyxExplorer` mutably borrowed while OLE pumps a nested Win32 message loop;
+    /// dragging the item back over Onyx then re-enters GPUI's `IDropTarget` and
+    /// panics with `BorrowMutError`. Deferring via `cx.spawn` runs `DoDragDrop` on
+    /// the same UI STA thread (so `ReleaseCapture` and mouse capture work) with zero
+    /// `App` borrows held.
     fn start_external_drag(
         &mut self,
         source: PathBuf,
@@ -4955,12 +5161,18 @@ impl OnyxExplorer {
             return;
         }
         self.external_drag_active = true;
+        self.external_drag_returned_inside = false;
         self.status_message = Some("Drag the selection into another application.".to_string());
         cx.notify();
 
-        let result = start_external_file_drag(std::slice::from_ref(&source), drag_image)
-            .map_err(|err| err.to_string());
-        self.finish_external_drag(result, &source, cx);
+        cx.spawn(async move |this, cx| {
+            let result = start_external_file_drag(std::slice::from_ref(&source), drag_image)
+                .map_err(|err| err.to_string());
+            let _ = this.update(cx, |explorer, cx| {
+                explorer.finish_external_drag(result, &source, cx);
+            });
+        })
+        .detach();
     }
 
     /// Reports the OLE outcome and keeps the panes in sync with the shell.
@@ -4971,6 +5183,12 @@ impl OnyxExplorer {
         cx: &mut Context<Self>,
     ) {
         self.external_drag_active = false;
+        let returned_inside = std::mem::take(&mut self.external_drag_returned_inside);
+        let result = if returned_inside {
+            Ok(DragOutcome::Cancelled)
+        } else {
+            result
+        };
         log_drag(format!(
             "finished source={} outcome={:?}",
             source.display(),
@@ -5694,7 +5912,13 @@ impl OnyxExplorer {
                 "delete" if mods.shift => {
                     self.prompt_empty_recycle_bin(window, cx);
                 }
-                _ => {}
+                _ => {
+                    if let Some(ch) = type_ahead_char(ev)
+                        && self.handle_type_ahead(ch, cx)
+                    {
+                        cx.stop_propagation();
+                    }
+                }
             }
             return;
         }
@@ -5807,7 +6031,13 @@ impl OnyxExplorer {
                     }
                 }
                 "backspace" => self.go_up(cx),
-                _ => {}
+                _ => {
+                    if let Some(ch) = type_ahead_char(ev)
+                        && self.handle_type_ahead(ch, cx)
+                    {
+                        cx.stop_propagation();
+                    }
+                }
             }
         } else {
             match key {
@@ -5821,7 +6051,13 @@ impl OnyxExplorer {
                     }
                 }
                 "backspace" => self.go_up(cx),
-                _ => {}
+                _ => {
+                    if let Some(ch) = type_ahead_char(ev)
+                        && self.handle_type_ahead(ch, cx)
+                    {
+                        cx.stop_propagation();
+                    }
+                }
             }
         }
     }
@@ -5966,6 +6202,12 @@ impl Render for OnyxExplorer {
                     explorer.finish_drag(cx);
                 }),
             )
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style.border_2().border_color(theme.accent_bright())
+            })
+            .on_drop(cx.listener(|explorer, paths: &ExternalPaths, _window, cx| {
+                explorer.handle_external_paths_drop(paths, cx);
+            }))
             .child(tab_bar::render_tab_bar(self, window, cx))
             .child(nav_bar::render_nav_bar(self, window, cx))
             .child(toolbar::render_toolbar(self, window, cx))
@@ -6833,5 +7075,48 @@ mod tests {
             &mut active_pane,
             Some(99),
         ));
+    }
+
+    #[test]
+    fn type_ahead_matches_prefix_cycles_and_handles_unicode() {
+        let make_dir = |name: &str| FileEntry {
+            path: PathBuf::from(format!(r"C:\Test\{name}")),
+            name: name.to_string(),
+            extension: None,
+            kind: FileKind::Directory,
+            size: 0,
+            modified: None,
+            created: None,
+            attributes: FileAttributes::default(),
+            is_symlink: false,
+            symlink_target: None,
+            type_label: "Folder".to_string(),
+        };
+        let entries = vec![
+            make_dir("Assets"),
+            make_dir("Desktop"),
+            make_dir("Documents"),
+            make_dir("Downloads"),
+            make_dir("Übungen"),
+        ];
+
+        // Fresh single-letter press jumps to the first matching folder.
+        assert_eq!(find_type_ahead_match(&entries, "d", None, false), Some(1));
+        // Repeated single-letter press cycles through Desktop -> Documents -> Downloads -> Desktop.
+        assert_eq!(find_type_ahead_match(&entries, "d", Some(1), true), Some(2));
+        assert_eq!(find_type_ahead_match(&entries, "d", Some(2), true), Some(3));
+        assert_eq!(find_type_ahead_match(&entries, "d", Some(3), true), Some(1));
+        // Multi-character prefix narrows directly to Downloads.
+        assert_eq!(
+            find_type_ahead_match(&entries, "dow", Some(1), false),
+            Some(3)
+        );
+        // Case-insensitive Unicode (German umlaut).
+        assert_eq!(
+            find_type_ahead_match(&entries, "ü", Some(0), false),
+            Some(4)
+        );
+        // Non-matching prefix returns None.
+        assert_eq!(find_type_ahead_match(&entries, "z", Some(0), false), None);
     }
 }

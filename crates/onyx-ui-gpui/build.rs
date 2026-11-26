@@ -14,5 +14,5 @@ fn main() -> std::io::Result<()> {
             "Onyx — Next-Generation Windows File Explorer",
         )
         .set("LegalCopyright", "Copyright © Onyx Contributors")
-        .compile_for("onyx-ui-gpui")
+        .compile_for("onyx")
 }

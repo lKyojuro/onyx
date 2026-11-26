@@ -63,13 +63,15 @@
 - [x] Asynchronous folder size calculation with LRU cache and proportional size bars in Details view
 - [x] `%ENV%` variable expansion (`%APPDATA%`, `%USERPROFILE%`, `%TEMP%`, …) and live address bar path autocomplete
 
-## Phase 8 — Path to v1.0 (Planned Ideas)
-- [ ] Inline filter & "Group By" view mode (fuzzy filter, flattened subtree view, grouping by type/date/size)
+## Phase 8 — Path to v1.0 (Active)
+- [x] Primary UI cutover to GPUI (`onyx-ui-gpui` with `gpui-kit` + `gpui-fast` on DirectX 11, ADR 0004; idle RAM reduced by ~75% to ~67 MB)
+- [x] Recycle Bin shell namespace view with stock icons and native app icon (`onyx-windows` + `onyx-ui-gpui`)
+- [ ] Inline filter & "Group By" view mode (core engine implemented in `onyx-core`; UI wiring & flattened subtree view pending)
 - [ ] Inline collapsible Tree View in the file list (nested folder expansion with chevrons)
 - [ ] Multi-selection polish (marquee/rubber-band selection, `Ctrl+Click` & `Shift+Click` range selection, inline rename)
 - [ ] Resizable & reorderable metadata columns with per-folder view inheritance
 - [ ] Live USB/removable drive hotplug & network share detection
-- [ ] Extended archive formats (`.7z`, `.tar.gz`)
-- [ ] Idle memory footprint optimization (target `< 50 MB` working set)
+- [ ] Extended archive formats (`.tar.gz`/`.tgz` implemented in `onyx-operations`; `.7z` pending)
+- [ ] Idle memory footprint optimization (stretch target `< 50 MB` working set)
 - [ ] Full NTFS USN Journal real-time indexing integration
 - [ ] Code-signed MSI/MSIX installers and official GitHub `v0.2.0` / `v1.0.0` release

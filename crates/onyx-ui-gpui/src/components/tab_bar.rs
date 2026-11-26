@@ -2,7 +2,7 @@
 
 use crate::components::{FluentButtonProps, fluent_button, vertical_divider};
 use crate::explorer::OnyxExplorer;
-use crate::icons::{OnyxGlyph, render_glyph, render_onyx_emblem};
+use crate::icons::{OnyxGlyph, render_glyph};
 use crate::theme::{FONT_SM, OnyxTheme, RADIUS_SM};
 use gpui_kit::{
     Context, FontWeight, InteractiveElement, IntoElement, MouseButton, Orientation, ParentElement,
@@ -33,6 +33,7 @@ pub fn render_tab_bar(
         .flex_1()
         .min_w(px(0.0))
         .h_full()
+        .pl(px(8.0))
         .gap(px(0.0));
 
     for (idx, tab) in tabs.iter().enumerate() {
@@ -75,6 +76,13 @@ pub fn render_tab_bar(
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
             })
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(move |explorer, _, _, cx| {
+                    cx.stop_propagation();
+                    explorer.close_tab(Some(tab_id), cx);
+                }),
+            )
             .on_click(cx.listener(move |explorer, _, _, cx| {
                 explorer.switch_tab(tab_id, cx);
             }))
@@ -495,19 +503,6 @@ pub fn render_tab_bar(
                 .right(px(0.0))
                 .h(px(1.0))
                 .bg(theme.border_subtle()),
-        )
-        // Left Onyx Emblem (draggable caption edge)
-        .child(
-            div()
-                .id("titlebar-emblem-zone")
-                .flex()
-                .items_center()
-                .justify_center()
-                .h_full()
-                .pl(px(10.0))
-                .pr(px(8.0))
-                .window_control_area(WindowControlArea::Drag)
-                .child(render_onyx_emblem(theme)),
         )
         .child(tab_strip)
         .child(quick_controls)

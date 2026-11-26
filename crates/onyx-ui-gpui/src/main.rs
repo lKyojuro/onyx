@@ -46,7 +46,7 @@ fn launch_mode() -> AppResult<Launch> {
         _ => Launch::Window(Some(arg.into())),
     };
     if args.next().is_some() {
-        return Err("usage: onyx-ui-gpui [PATH] | --version | --smoke-test".into());
+        return Err("usage: onyx [PATH] | --version | --smoke-test".into());
     }
     Ok(mode)
 }
@@ -56,10 +56,6 @@ fn default_initial_path(explicit: Option<PathBuf>) -> PathBuf {
         && path.is_dir()
     {
         return path;
-    }
-    let onyx_dir = PathBuf::from(r"D:\Onyx");
-    if onyx_dir.is_dir() {
-        return onyx_dir;
     }
     dirs::home_dir()
         .or_else(|| std::env::current_dir().ok())
@@ -73,9 +69,10 @@ fn async_worker_threads() -> usize {
 }
 
 fn main() -> AppResult<()> {
+    onyx_windows::attach_parent_console();
     let mode = launch_mode()?;
     if matches!(mode, Launch::Version) {
-        println!("onyx-ui-gpui {}", env!("CARGO_PKG_VERSION"));
+        println!("onyx {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 

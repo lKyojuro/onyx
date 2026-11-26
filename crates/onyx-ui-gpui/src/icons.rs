@@ -1,8 +1,7 @@
 //! Vector icons ported from `crates/onyx-ui/ui/components/icons.slint`
 //! and asynchronous Windows Shell icon decoding into `RenderImage` (BGRA).
 
-use crate::theme::OnyxTheme;
-use gpui_kit::{Hsla, IntoElement, ParentElement, Pixels, RenderImage, Styled, div, px, svg};
+use gpui_kit::{Hsla, IntoElement, Pixels, RenderImage, Styled, svg};
 use image::{Frame, RgbaImage};
 use onyx_cache::{IconCache, RgbaImageData};
 use onyx_core::{FileEntry, normalize_display_path};
@@ -133,44 +132,6 @@ pub fn render_glyph(glyph: OnyxGlyph, size: Pixels, color: Hsla) -> impl IntoEle
         .w(size)
         .h(size)
         .text_color(color)
-}
-
-/// Renders the crisp geometric Onyx hexagonal crystal emblem from `common.slint`.
-pub fn render_onyx_emblem(theme: OnyxTheme) -> impl IntoElement {
-    let hex_svg: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" fill-opacity="0.18" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><polygon points="12,2 20.5,7 20.5,17 12,22 3.5,17 3.5,7"/></svg>"#;
-    let border_col: Hsla = if theme.dark_mode {
-        gpui_kit::rgba(0xb4aaff44).into()
-    } else {
-        gpui_kit::rgba(0x6256d655).into()
-    };
-
-    div()
-        .relative()
-        .flex()
-        .items_center()
-        .justify_center()
-        .flex_shrink_0()
-        .w(px(22.0))
-        .h(px(22.0))
-        .rounded(px(6.0))
-        .bg(gpui_kit::rgb(0x14172b))
-        .border_1()
-        .border_color(border_col)
-        .child(
-            svg()
-                .data(hex_svg)
-                .w(px(16.0))
-                .h(px(16.0))
-                .text_color(theme.accent_bright()),
-        )
-        .child(
-            div()
-                .absolute()
-                .w(px(4.5))
-                .h(px(4.5))
-                .rounded_full()
-                .bg(theme.accent_bright()),
-        )
 }
 
 /// Converts straight RGBA8 pixel bytes into a GPUI `RenderImage` (BGRA pixel order).

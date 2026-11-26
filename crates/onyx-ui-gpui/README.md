@@ -1,10 +1,10 @@
-# `onyx-ui-gpui` — GPUI + `gpui-fast` Next-Gen UI Prototype
+# `onyx-ui-gpui` — Onyx GPUI (`gpui-fast`) Main UI
 
-Standalone Windows prototype exploring Onyx's next-generation UI built on [`gpui-kit`](https://crates.io/crates/gpui-kit) `0.11.0` with `features = ["gpui-fast"]` (`gpui-fast 0.1.19`), wired directly to `onyx-fs` and `onyx-core`.
+Primary Windows 11 desktop frontend for Onyx built on [`gpui-kit`](https://crates.io/crates/gpui-kit) `0.11.0` with `features = ["gpui-fast"]` (DirectX 11 + DirectWrite), wired directly to all 8 UI-free core crates and producing the main `onyx.exe` binary.
 
 ## Highlights
 
-- **Isolated Workspace**: Declares its own `[workspace]` table in `Cargo.toml` so the root workspace `Cargo.toml` and `Cargo.lock` remain untouched.
+- **Workspace Member**: Integrated into the root Cargo workspace (`[[bin]] name = "onyx"`), owning the workspace integration tests (`tests/integration_tests.rs`) and Criterion benchmarks (`benchmarks/fs_benchmarks.rs`).
 - **Direct Core Integration**: Uses `onyx-fs::FsEngine` and `onyx-core` (`GenerationId`, `NavHistory`, `FileEntry`, `build_breadcrumbs`, `format_bytes`, `format_timestamp`) with cancellation-aware async directory enumeration on a bounded Tokio/Rayon pool (never blocking the GPUI UI thread).
 - **Virtualized List & Navigation**: Renders entries via `gpui_kit::uniform_list` with Back / Forward / Up / Refresh controls, clickable breadcrumbs, sidebar quick-links, single-click selection, and double-click folder entry.
 - **Obsidian & LED Dot-Matrix Design**: Deep matte obsidian surfaces (`#080808`–`#141414`), subtle `#1e1e1e` borders, and a 7×7 warm-amber LED dot-matrix status pill (`src/led_pill.rs`) with animated scanning wave + typography shimmer while active and zero timer wakeups at idle.
@@ -33,9 +33,9 @@ Release profile: `opt-level = "s"`, `lto = "thin"`, `codegen-units = 16`, `strip
 ## Commands
 
 ```powershell
-cargo fmt --manifest-path crates/onyx-ui-gpui/Cargo.toml -- --check
-cargo clippy --manifest-path crates/onyx-ui-gpui/Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path crates/onyx-ui-gpui/Cargo.toml
-cargo build --release --manifest-path crates/onyx-ui-gpui/Cargo.toml
-.\scripts\measure-perf.ps1 -BinaryPath crates\onyx-ui-gpui\target\release\onyx-ui-gpui.exe -Runs 5 -IdleSeconds 3
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo build --release --bin onyx
+.\scripts\measure-perf.ps1 -BinaryPath target\release\onyx.exe -Runs 5 -IdleSeconds 3
 ```

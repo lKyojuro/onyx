@@ -15,7 +15,7 @@
 # Exit code 0 means the drag-out works, 1 means it failed.
 
 param(
-    [string]$ExePath = "crates/onyx-ui-gpui/target/debug/onyx-ui-gpui.exe"
+    [string]$ExePath = "target/debug/onyx.exe"
 )
 
 $ErrorActionPreference = 'Stop'

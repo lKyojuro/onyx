@@ -9,8 +9,7 @@ members = [
     "crates/onyx-operations",
     "crates/onyx-search",
     "crates/onyx-preview",
-    "crates/onyx-ui",
-    "crates/onyx-app",
+    "crates/onyx-ui-gpui",
 ]
 
 [workspace.package]
@@ -32,18 +31,9 @@ onyx-fs = { path = "crates/onyx-fs" }
 onyx-operations = { path = "crates/onyx-operations" }
 onyx-search = { path = "crates/onyx-search" }
 onyx-preview = { path = "crates/onyx-preview" }
-onyx-ui = { path = "crates/onyx-ui" }
 
 # UI
-slint = { version = "1.19", default-features = false, features = [
-    "std",
-    "backend-default",
-    "renderer-femtovg",
-    "accessibility",
-    "compat-1-2",
-    "raw-window-handle-06",
-] }
-slint-build = "1.19"
+gpui-kit = { version = "0.11.0", features = ["gpui-fast"] }
 raw-window-handle = "0.6"
 winresource = "0.1"
 
@@ -111,8 +101,11 @@ all = { level = "warn", priority = -1 }
 unwrap_used = "warn"
 expect_used = "warn"
 
+# Dependencies render the GPUI frame; unoptimized gpui/DirectX code dominates frame
+# time in dev builds, so optimize dependencies while workspace crates stay fast to rebuild.
 [profile.dev.package."*"]
 debug = 0
+opt-level = 2
 
 [profile.release]
 opt-level = "s"
