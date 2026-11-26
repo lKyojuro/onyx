@@ -8,6 +8,10 @@ use crate::components::command_palette::{
 };
 use crate::components::context_menu::{ContextMenuAction, ContextMenuState, ContextMenuTarget};
 use crate::components::drag_drop::{self, DragState, DropTarget, validate_drop};
+use crate::components::overlays::{
+    self, ConflictDialogState, ConflictOutcome, ResolvedTransfer, TransferKind,
+    conflict_resolution_from_policy, detect_conflicts, operation_kind_title,
+};
 use crate::components::preview_pane::{DecodedPreview, PreviewKind, PreviewState};
 use crate::components::settings_overlay;
 use crate::components::smooth_scroll::{
@@ -15,7 +19,7 @@ use crate::components::smooth_scroll::{
 };
 use crate::components::splitter::{self, ActiveSplitterDrag, SplitterKind};
 use crate::components::{
-    context_menu, file_pane, nav_bar, overlays, preview_pane, sidebar, status_bar, tab_bar, toolbar,
+    context_menu, file_pane, nav_bar, preview_pane, sidebar, status_bar, tab_bar, toolbar,
 };
 use crate::icons::{
     RECYCLE_BIN_ICON_PREFIX, ShellIconStore, entry_icon_key, path_icon_key,
@@ -50,9 +54,9 @@ use onyx_fs::{
     FsEngine, WatchEvent, compute_folder_size,
 };
 use onyx_operations::{
-    ConflictPolicy, FileOperationsEngine, OperationProgress, OperationReport,
-    PermanentDeleteRequest, UndoAction, create_archive, extract_archive, is_supported_archive_path,
-    list_archive_entries,
+    ConflictDecision, ConflictInfo, ConflictPolicy, ConflictResolution, FileOperationsEngine,
+    OperationKind, OperationProgress, OperationReport, PermanentDeleteRequest, UndoAction,
+    create_archive, extract_archive, is_supported_archive_path, list_archive_entries,
 };
 use onyx_preview::{PreviewEngine, ThumbnailEngine, is_thumbnail_supported};
 use onyx_search::{SearchIndex, SearchQuery, UnifiedSearchEngine};
@@ -112,13 +116,18 @@ struct ExternalDropIn {
     position: (f32, f32),
 }
 
-/// Live state for the bottom-right floating Operation Progress toast.
+/// Live state for the bottom-right floating Operation Progress card.
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveOperation {
     pub title: &'static str,
+    pub kind: Option<OperationKind>,
     pub current_item: String,
-    pub progress: f32,
-    pub detail: String,
+    pub completed_items: usize,
+    pub total_items: usize,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+    pub error: Option<String>,
+    pub cancelling: bool,
     pub cancel: CancellationToken,
 }
 
@@ -189,16 +198,20 @@ enum FileOperation {
         name: String,
     },
     Duplicate(PathBuf),
-    Paste(PathBuf),
     Recycle(PathBuf),
     PermanentDelete(PermanentDeleteRequest),
     CopyItems {
         sources: Vec<PathBuf>,
         destination: PathBuf,
+        conflict: ConflictPolicy,
+        per_destination: HashMap<PathBuf, ConflictResolution>,
     },
     MoveItems {
         sources: Vec<PathBuf>,
         destination: PathBuf,
+        conflict: ConflictPolicy,
+        per_destination: HashMap<PathBuf, ConflictResolution>,
+        from_cut_clipboard: bool,
     },
     CreateArchive {
         sources: Vec<PathBuf>,
@@ -219,7 +232,6 @@ impl FileOperation {
             Self::Create { .. } => "New folder",
             Self::Rename { .. } => "Rename",
             Self::Duplicate(_) => "Duplicate",
-            Self::Paste(_) => "Paste",
             Self::Recycle(_) => "Move to Recycle Bin",
             Self::PermanentDelete(_) => "Permanent delete",
             Self::CopyItems { .. } => "Copy",
@@ -229,6 +241,38 @@ impl FileOperation {
             Self::RestoreRecycleItems(_) => "Restore",
             Self::EmptyRecycleBin => "Empty Recycle Bin",
             Self::Undo => "Undo",
+        }
+    }
+
+    const fn progress_title(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "Creating folder",
+            Self::Rename { .. } => "Renaming",
+            Self::Duplicate(_) => "Duplicating",
+            Self::Recycle(_) => "Recycling",
+            Self::PermanentDelete(_) => "Deleting",
+            Self::CopyItems { .. } => "Copying",
+            Self::MoveItems { .. } => "Moving",
+            Self::CreateArchive { .. } => "Compressing",
+            Self::ExtractArchive { .. } => "Extracting",
+            Self::RestoreRecycleItems(_) => "Restoring",
+            Self::EmptyRecycleBin => "Emptying Recycle Bin",
+            Self::Undo => "Undoing",
+        }
+    }
+
+    const fn operation_kind(&self) -> Option<OperationKind> {
+        match self {
+            Self::Create { .. } => Some(OperationKind::CreateDir),
+            Self::Rename { .. } => Some(OperationKind::Rename),
+            Self::Duplicate(_) => Some(OperationKind::Duplicate),
+            Self::Recycle(_) => Some(OperationKind::Recycle),
+            Self::PermanentDelete(_) => Some(OperationKind::PermanentDelete),
+            Self::CopyItems { .. } => Some(OperationKind::Copy),
+            Self::MoveItems { .. } => Some(OperationKind::Move),
+            Self::CreateArchive { .. } => Some(OperationKind::CreateArchive),
+            Self::ExtractArchive { .. } => Some(OperationKind::ExtractArchive),
+            Self::RestoreRecycleItems(_) | Self::EmptyRecycleBin | Self::Undo => None,
         }
     }
 
@@ -262,54 +306,6 @@ impl FileOperation {
                 add_parent(affected, &source);
                 engine.duplicate_item(&source, cancel, Some(progress)).await
             }
-            Self::Paste(destination) => {
-                let (reply, answer) = oneshot::channel();
-                let _ = clipboard.send(ClipboardCommand::Read(reply));
-                let files = tokio::select! {
-                    _ = cancel.cancelled() => return Err(OnyxError::Cancelled),
-                    answer = answer => answer.ok().flatten(),
-                };
-                let Some((paths, cut)) = files else {
-                    return Err(OnyxError::OperationFailed {
-                        message: "The clipboard has no files to paste.".into(),
-                    });
-                };
-                affected.push(destination.clone());
-                if cut {
-                    for path in &paths {
-                        add_parent(affected, path);
-                    }
-                    let report = engine
-                        .move_items(
-                            &paths,
-                            &destination,
-                            ConflictPolicy::AutoRename,
-                            cancel,
-                            Some(progress),
-                        )
-                        .await;
-                    if let Ok(report) = &report
-                        && let Some(UndoAction::ReverseMoves(moves)) = &report.undo_action
-                    {
-                        let moved = moves.iter().map(|(_, source)| source.clone()).collect();
-                        let _ = clipboard.send(ClipboardCommand::Moved {
-                            original: paths,
-                            moved,
-                        });
-                    }
-                    report
-                } else {
-                    engine
-                        .copy_items(
-                            &paths,
-                            &destination,
-                            ConflictPolicy::AutoRename,
-                            cancel,
-                            Some(progress),
-                        )
-                        .await
-                }
-            }
             Self::Recycle(path) => {
                 add_parent(affected, &path);
                 engine.recycle_items(&[path], cancel, Some(progress)).await
@@ -325,38 +321,82 @@ impl FileOperation {
             Self::CopyItems {
                 sources,
                 destination,
+                conflict,
+                per_destination,
             } => {
                 affected.push(destination.clone());
                 for path in &sources {
                     add_parent(affected, path);
                 }
-                engine
-                    .copy_items(
-                        &sources,
-                        &destination,
-                        ConflictPolicy::AutoRename,
-                        cancel,
-                        Some(progress),
-                    )
-                    .await
+                if per_destination.is_empty() {
+                    engine
+                        .copy_items(&sources, &destination, conflict, cancel, Some(progress))
+                        .await
+                } else {
+                    let fallback = conflict_resolution_from_policy(conflict);
+                    engine
+                        .copy_items_with_resolver(
+                            &sources,
+                            &destination,
+                            conflict,
+                            move |info: &ConflictInfo| {
+                                let resolution = per_destination
+                                    .iter()
+                                    .find(|(path, _)| same_path(path, &info.destination))
+                                    .map_or(fallback, |(_, &res)| res);
+                                ConflictDecision::once(resolution)
+                            },
+                            cancel,
+                            Some(progress),
+                        )
+                        .await
+                }
             }
             Self::MoveItems {
                 sources,
                 destination,
+                conflict,
+                per_destination,
+                from_cut_clipboard,
             } => {
                 affected.push(destination.clone());
                 for path in &sources {
                     add_parent(affected, path);
                 }
-                engine
-                    .move_items(
-                        &sources,
-                        &destination,
-                        ConflictPolicy::AutoRename,
-                        cancel,
-                        Some(progress),
-                    )
-                    .await
+                let report = if per_destination.is_empty() {
+                    engine
+                        .move_items(&sources, &destination, conflict, cancel, Some(progress))
+                        .await
+                } else {
+                    let fallback = conflict_resolution_from_policy(conflict);
+                    engine
+                        .move_items_with_resolver(
+                            &sources,
+                            &destination,
+                            conflict,
+                            move |info: &ConflictInfo| {
+                                let resolution = per_destination
+                                    .iter()
+                                    .find(|(path, _)| same_path(path, &info.destination))
+                                    .map_or(fallback, |(_, &res)| res);
+                                ConflictDecision::once(resolution)
+                            },
+                            cancel,
+                            Some(progress),
+                        )
+                        .await
+                };
+                if from_cut_clipboard
+                    && let Ok(report) = &report
+                    && let Some(UndoAction::ReverseMoves(moves)) = &report.undo_action
+                {
+                    let moved = moves.iter().map(|(_, source)| source.clone()).collect();
+                    let _ = clipboard.send(ClipboardCommand::Moved {
+                        original: sources,
+                        moved,
+                    });
+                }
+                report
             }
             Self::CreateArchive {
                 sources,
@@ -692,6 +732,8 @@ pub struct OnyxExplorer {
     pub(crate) can_undo: bool,
     pub(crate) status_message: Option<String>,
     pub(crate) prompt_state: Option<PromptState>,
+    pub(crate) conflict_dialog: Option<ConflictDialogState>,
+    pending_conflict_check: bool,
     pub(crate) prompt_input: Entity<InputState>,
     pub(crate) palette_input: Entity<InputState>,
     pub(crate) prompt_focus_handle: FocusHandle,
@@ -940,6 +982,8 @@ impl OnyxExplorer {
             can_undo: false,
             status_message: None,
             prompt_state: None,
+            conflict_dialog: None,
+            pending_conflict_check: false,
             prompt_input,
             palette_input,
             prompt_focus_handle,
@@ -4166,7 +4210,236 @@ impl OnyxExplorer {
 
     pub fn paste(&mut self, cx: &mut Context<Self>) {
         let destination = self.active_directory();
-        self.start_operation(FileOperation::Paste(destination), cx);
+        self.initiate_paste(destination, cx);
+    }
+
+    fn initiate_paste(&mut self, destination: PathBuf, cx: &mut Context<Self>) {
+        if self.refuse_in_recycle_bin("Editing recycled items", cx) {
+            return;
+        }
+        if self.active_operation.is_some()
+            || self.conflict_dialog.is_some()
+            || self.pending_conflict_check
+        {
+            self.status_message = Some("A file operation is already in progress.".to_string());
+            cx.notify();
+            return;
+        }
+        self.pending_conflict_check = true;
+        let clipboard = self.clipboard_tx.clone();
+        let runtime = Arc::clone(&self.runtime);
+        let (tx, rx) = oneshot::channel();
+
+        runtime.spawn(async move {
+            let (reply, answer) = oneshot::channel();
+            let _ = clipboard.send(ClipboardCommand::Read(reply));
+            let files = answer.await.ok().flatten();
+            let result = match files {
+                Some((sources, cut)) => {
+                    let dest_for_scan = destination.clone();
+                    let sources_for_scan = sources.clone();
+                    let conflicts = tokio::task::spawn_blocking(move || {
+                        detect_conflicts(&sources_for_scan, &dest_for_scan)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    Some((sources, cut, destination, conflicts))
+                }
+                None => None,
+            };
+            let _ = tx.send(result);
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = rx.await.ok().flatten();
+            let _ = this.update(cx, |explorer, cx| {
+                explorer.pending_conflict_check = false;
+                let Some((sources, cut, destination, conflicts)) = result else {
+                    explorer.status_message =
+                        Some("The clipboard has no files to paste.".to_string());
+                    cx.notify();
+                    return;
+                };
+                let kind = if cut {
+                    TransferKind::Move
+                } else {
+                    TransferKind::Copy
+                };
+                if conflicts.is_empty() {
+                    explorer.dispatch_resolved_transfer(
+                        ResolvedTransfer {
+                            kind,
+                            sources,
+                            destination,
+                            default_policy: ConflictPolicy::AutoRename,
+                            per_destination: HashMap::new(),
+                            from_cut_clipboard: cut,
+                        },
+                        cx,
+                    );
+                } else {
+                    explorer.conflict_dialog = Some(ConflictDialogState::new(
+                        kind,
+                        sources,
+                        destination,
+                        conflicts,
+                        cut,
+                    ));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn initiate_transfer(
+        &mut self,
+        kind: TransferKind,
+        sources: Vec<PathBuf>,
+        destination: PathBuf,
+        from_cut_clipboard: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.refuse_in_recycle_bin("Editing recycled items", cx) {
+            return;
+        }
+        if self.active_operation.is_some()
+            || self.conflict_dialog.is_some()
+            || self.pending_conflict_check
+        {
+            self.status_message = Some("A file operation is already in progress.".to_string());
+            cx.notify();
+            return;
+        }
+        if sources.is_empty() {
+            return;
+        }
+        self.pending_conflict_check = true;
+        let runtime = Arc::clone(&self.runtime);
+        let sources_for_scan = sources.clone();
+        let dest_for_scan = destination.clone();
+        let (tx, rx) = oneshot::channel();
+
+        runtime.spawn_blocking(move || {
+            let conflicts = detect_conflicts(&sources_for_scan, &dest_for_scan);
+            let _ = tx.send(conflicts);
+        });
+
+        cx.spawn(async move |this, cx| {
+            let conflicts = rx.await.unwrap_or_default();
+            let _ = this.update(cx, |explorer, cx| {
+                explorer.pending_conflict_check = false;
+                if conflicts.is_empty() {
+                    explorer.dispatch_resolved_transfer(
+                        ResolvedTransfer {
+                            kind,
+                            sources,
+                            destination,
+                            default_policy: ConflictPolicy::AutoRename,
+                            per_destination: HashMap::new(),
+                            from_cut_clipboard,
+                        },
+                        cx,
+                    );
+                } else {
+                    explorer.conflict_dialog = Some(ConflictDialogState::new(
+                        kind,
+                        sources,
+                        destination,
+                        conflicts,
+                        from_cut_clipboard,
+                    ));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub fn toggle_conflict_apply_to_all(&mut self, cx: &mut Context<Self>) {
+        if let Some(dialog) = &mut self.conflict_dialog {
+            dialog.toggle_apply_to_all();
+            cx.notify();
+        }
+    }
+
+    pub fn resolve_conflict(
+        &mut self,
+        policy: ConflictPolicy,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut dialog) = self.conflict_dialog.take() else {
+            return;
+        };
+        match dialog.choose(policy) {
+            ConflictOutcome::NextConflict => {
+                self.conflict_dialog = Some(dialog);
+                cx.notify();
+            }
+            ConflictOutcome::Dispatch(resolved) => {
+                a11y::close_modal(self, ModalSurface::Conflict, window, cx);
+                self.dispatch_resolved_transfer(resolved, cx);
+            }
+            ConflictOutcome::Cancelled => {
+                a11y::close_modal(self, ModalSurface::Conflict, window, cx);
+                self.status_message = Some(format!("{} cancelled.", dialog.kind.verb()));
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn cancel_conflict_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.conflict_dialog.take() {
+            a11y::close_modal(self, ModalSurface::Conflict, window, cx);
+            self.status_message = Some(format!("{} cancelled.", dialog.kind.verb()));
+            cx.notify();
+        }
+    }
+
+    fn activate_conflict_focused_slot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = &self.conflict_dialog else {
+            return;
+        };
+        let multi = dialog.has_multiple_conflicts();
+        let Some(slot) = a11y::modal_focused_slot(self, ModalSurface::Conflict, window) else {
+            return;
+        };
+        let action_slot = if multi {
+            if slot == 0 {
+                self.toggle_conflict_apply_to_all(cx);
+                return;
+            }
+            slot - 1
+        } else {
+            slot
+        };
+        match action_slot {
+            0 => self.cancel_conflict_dialog(window, cx),
+            1 => self.resolve_conflict(ConflictPolicy::AutoRename, window, cx),
+            2 => self.resolve_conflict(ConflictPolicy::Skip, window, cx),
+            3 => self.resolve_conflict(ConflictPolicy::Overwrite, window, cx),
+            _ => {}
+        }
+    }
+
+    fn dispatch_resolved_transfer(&mut self, transfer: ResolvedTransfer, cx: &mut Context<Self>) {
+        let operation = match transfer.kind {
+            TransferKind::Copy => FileOperation::CopyItems {
+                sources: transfer.sources,
+                destination: transfer.destination,
+                conflict: transfer.default_policy,
+                per_destination: transfer.per_destination,
+            },
+            TransferKind::Move => FileOperation::MoveItems {
+                sources: transfer.sources,
+                destination: transfer.destination,
+                conflict: transfer.default_policy,
+                per_destination: transfer.per_destination,
+                from_cut_clipboard: transfer.from_cut_clipboard,
+            },
+        };
+        self.start_operation(operation, cx);
     }
 
     pub fn duplicate_selection(&mut self, cx: &mut Context<Self>) {
@@ -4189,7 +4462,8 @@ impl OnyxExplorer {
     }
 
     pub fn cancel_operation(&mut self, cx: &mut Context<Self>) {
-        if let Some(op) = &self.active_operation {
+        if let Some(op) = &mut self.active_operation {
+            op.cancelling = true;
             op.cancel.cancel();
             self.status_message = Some("Cancelling file operation…".to_string());
             cx.notify();
@@ -4207,16 +4481,23 @@ impl OnyxExplorer {
             return;
         }
         let title = operation.title();
+        let progress_title = operation.progress_title();
+        let kind = operation.operation_kind();
         let is_undo = matches!(operation, FileOperation::Undo);
         let is_recycle_delete = matches!(operation, FileOperation::Recycle(_));
         let is_empty_recycle = matches!(operation, FileOperation::EmptyRecycleBin);
         let cancel = CancellationToken::new();
         self.status_message = None;
         self.active_operation = Some(ActiveOperation {
-            title,
+            title: progress_title,
+            kind,
             current_item: String::new(),
-            progress: 0.0,
-            detail: String::new(),
+            completed_items: 0,
+            total_items: 0,
+            bytes_done: 0,
+            bytes_total: 0,
+            error: None,
+            cancelling: false,
             cancel: cancel.clone(),
         });
         self.ensure_led_animation(cx);
@@ -4264,14 +4545,14 @@ impl OnyxExplorer {
                     .update(cx, |explorer, cx| match event {
                         OperationEvent::Progress(progress) => {
                             if let Some(active) = &mut explorer.active_operation {
-                                active.progress = progress_fraction(&progress);
+                                active.title = operation_kind_title(progress.kind);
+                                active.kind = Some(progress.kind);
                                 active.current_item = progress.current_item;
-                                active.detail = progress.error.unwrap_or_else(|| {
-                                    format!(
-                                        "{} of {} items",
-                                        progress.completed_items, progress.total_items
-                                    )
-                                });
+                                active.completed_items = progress.completed_items;
+                                active.total_items = progress.total_items;
+                                active.bytes_done = progress.bytes_copied;
+                                active.bytes_total = progress.total_bytes;
+                                active.error = progress.error;
                             }
                             cx.notify();
                         }
@@ -4542,10 +4823,10 @@ impl OnyxExplorer {
                 } else {
                     self.active_directory()
                 };
-                self.start_operation(FileOperation::Paste(destination), cx);
+                self.initiate_paste(destination, cx);
             }
             (ContextMenuAction::Paste, ContextMenuTarget::Background { dir_path }) => {
-                self.start_operation(FileOperation::Paste(dir_path), cx);
+                self.initiate_paste(dir_path, cx);
             }
             (ContextMenuAction::CopyPath, ContextMenuTarget::Item { path, .. }) => {
                 let display = normalize_display_path(&path);
@@ -4996,18 +5277,12 @@ impl OnyxExplorer {
         };
         match validate_drop(&drag.source, &destination_dir) {
             Ok(destination) => {
-                let operation = if drag.copy {
-                    FileOperation::CopyItems {
-                        sources: vec![drag.source],
-                        destination,
-                    }
+                let kind = if drag.copy {
+                    TransferKind::Copy
                 } else {
-                    FileOperation::MoveItems {
-                        sources: vec![drag.source],
-                        destination,
-                    }
+                    TransferKind::Move
                 };
-                self.start_operation(operation, cx);
+                self.initiate_transfer(kind, vec![drag.source], destination, false, cx);
             }
             Err(reject) => {
                 self.status_message = Some(reject.message().to_string());
@@ -5136,18 +5411,12 @@ impl OnyxExplorer {
         let same_volume = valid_sources
             .iter()
             .all(|path| path.components().next() == destination.components().next());
-        let operation = if same_volume {
-            FileOperation::MoveItems {
-                sources: valid_sources,
-                destination,
-            }
+        let kind = if same_volume {
+            TransferKind::Move
         } else {
-            FileOperation::CopyItems {
-                sources: valid_sources,
-                destination,
-            }
+            TransferKind::Copy
         };
-        self.start_operation(operation, cx);
+        self.initiate_transfer(kind, valid_sources, destination, false, cx);
     }
 
     /// Files another application drags into the window: remember them on
@@ -5195,18 +5464,12 @@ impl OnyxExplorer {
                     .paths
                     .iter()
                     .all(|path| path.components().next() == destination.components().next());
-                let operation = if same_volume {
-                    FileOperation::MoveItems {
-                        sources: drop.paths,
-                        destination,
-                    }
+                let kind = if same_volume {
+                    TransferKind::Move
                 } else {
-                    FileOperation::CopyItems {
-                        sources: drop.paths,
-                        destination,
-                    }
+                    TransferKind::Copy
                 };
-                self.start_operation(operation, cx);
+                self.initiate_transfer(kind, drop.paths, destination, false, cx);
             }
             FileDropEvent::Exited | FileDropEvent::Ended => {
                 if self.external_drop.take().is_some() {
@@ -5301,6 +5564,8 @@ impl OnyxExplorer {
     pub(crate) fn active_modal_surface(&self) -> Option<ModalSurface> {
         if self.context_menu.is_some() {
             Some(ModalSurface::ContextMenu)
+        } else if self.conflict_dialog.is_some() {
+            Some(ModalSurface::Conflict)
         } else if self.prompt_state.is_some() {
             Some(ModalSurface::Prompt)
         } else if self.command_palette.is_some() {
@@ -5317,7 +5582,10 @@ impl OnyxExplorer {
     }
 
     pub fn overlay_open(&self) -> bool {
-        self.command_palette.is_some() || self.settings_open || self.archive_is_open()
+        self.command_palette.is_some()
+            || self.settings_open
+            || self.archive_is_open()
+            || self.conflict_dialog.is_some()
     }
 
     pub fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5803,6 +6071,21 @@ impl OnyxExplorer {
                 }
                 _ => {}
             }
+        }
+
+        if self.conflict_dialog.is_some() {
+            match key {
+                "escape" => {
+                    self.cancel_conflict_dialog(window, cx);
+                    cx.stop_propagation();
+                }
+                "enter" | "space" => {
+                    self.activate_conflict_focused_slot(window, cx);
+                    cx.stop_propagation();
+                }
+                _ => {}
+            }
+            return;
         }
 
         if self.prompt_state.is_some() {
@@ -6307,11 +6590,22 @@ impl Render for OnyxExplorer {
         if let Some(quick_look_overlay) = preview_pane::render_quick_look_modal(self, cx) {
             root = root.child(quick_look_overlay);
         }
+        if let Some(dialog) = self.conflict_dialog.as_mut()
+            && dialog.needs_focus
+        {
+            dialog.needs_focus = false;
+            let initial_slot = usize::from(dialog.has_multiple_conflicts());
+            a11y::open_modal(self, ModalSurface::Conflict, initial_slot, window, cx);
+        }
+
         if let Some(progress_toast) = overlays::render_operation_progress_toast(self, cx) {
             root = root.child(progress_toast);
         }
         if let Some(prompt_dialog) = overlays::render_prompt_dialog(self, cx) {
             root = root.child(prompt_dialog);
+        }
+        if let Some(conflict_dialog) = overlays::render_conflict_dialog(self, cx) {
+            root = root.child(conflict_dialog);
         }
         if let Some(context_overlay) = context_menu::render_context_menu_overlay(self, window, cx) {
             root = root.child(context_overlay);
@@ -6660,17 +6954,6 @@ fn terminal_profile_from_config(value: &str) -> TerminalProfile {
         "cmd" | "command-prompt" => TerminalProfile::Cmd,
         _ => TerminalProfile::WindowsTerminal,
     }
-}
-
-fn progress_fraction(progress: &OperationProgress) -> f32 {
-    let fraction = if progress.total_bytes > 0 {
-        progress.bytes_copied as f32 / progress.total_bytes as f32
-    } else if progress.total_items > 0 {
-        progress.completed_items as f32 / progress.total_items as f32
-    } else {
-        0.0
-    };
-    fraction.clamp(0.0, 1.0)
 }
 
 fn can_restore_recycle_item(item: &RecycleBinItem) -> bool {

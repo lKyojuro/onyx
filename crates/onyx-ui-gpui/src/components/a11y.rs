@@ -12,6 +12,9 @@ use std::cell::Cell;
 
 /// Focus slots reserved for the rename / new-folder / delete prompt.
 const PROMPT_SLOTS: usize = 2;
+/// Focus slots reserved for the copy/move conflict dialog:
+/// optional Apply-to-all checkbox + Cancel, Keep Both, Skip, Replace.
+const CONFLICT_SLOTS: usize = 5;
 /// Focus slots reserved for the command palette (its result list).
 const PALETTE_SLOTS: usize = 1;
 /// Focus slots reserved for the settings overlay: two header controls plus one
@@ -118,6 +121,7 @@ impl FocusRing {
 #[derive(Debug)]
 pub(crate) struct Modals {
     pub(crate) prompt: FocusRing,
+    pub(crate) conflict: FocusRing,
     pub(crate) palette: FocusRing,
     pub(crate) settings: FocusRing,
     pub(crate) menu: FocusRing,
@@ -129,6 +133,7 @@ impl Modals {
     pub(crate) fn new(cx: &mut Context<OnyxExplorer>) -> Self {
         Self {
             prompt: FocusRing::new(PROMPT_SLOTS, cx),
+            conflict: FocusRing::new(CONFLICT_SLOTS, cx),
             palette: FocusRing::new(PALETTE_SLOTS, cx),
             settings: FocusRing::new(SETTINGS_SLOTS, cx),
             menu: FocusRing::new(MENU_SLOTS, cx),
@@ -144,6 +149,7 @@ impl Modals {
         match surface {
             ModalSurface::ContextMenu => &self.menu,
             ModalSurface::Prompt => &self.prompt,
+            ModalSurface::Conflict => &self.conflict,
             ModalSurface::Palette => &self.palette,
             ModalSurface::Archive => &self.archive,
             ModalSurface::Settings => &self.settings,
@@ -155,6 +161,7 @@ impl Modals {
         match surface {
             ModalSurface::ContextMenu => &mut self.menu,
             ModalSurface::Prompt => &mut self.prompt,
+            ModalSurface::Conflict => &mut self.conflict,
             ModalSurface::Palette => &mut self.palette,
             ModalSurface::Archive => &mut self.archive,
             ModalSurface::Settings => &mut self.settings,
@@ -168,6 +175,7 @@ impl Modals {
 pub(crate) enum ModalSurface {
     ContextMenu,
     Prompt,
+    Conflict,
     Palette,
     Archive,
     Settings,
