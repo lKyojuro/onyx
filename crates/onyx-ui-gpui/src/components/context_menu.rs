@@ -17,7 +17,7 @@ const SEPARATOR_HEIGHT: f32 = 9.0;
 const MENU_PADDING: f32 = 10.0;
 const VIEWPORT_MARGIN: f32 = 8.0;
 
-/// Target of an open context menu (file/folder item or empty pane background).
+/// Target of an open context menu (file/folder item, Recycle Bin item, or pane background).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextMenuTarget {
     Item {
@@ -27,6 +27,13 @@ pub enum ContextMenuTarget {
     },
     Background {
         dir_path: PathBuf,
+    },
+    RecycleItem {
+        index: usize,
+        can_restore: bool,
+    },
+    RecycleBackground {
+        has_items: bool,
     },
 }
 
@@ -45,6 +52,8 @@ pub enum ContextMenuAction {
     OpenInTerminal,
     Properties,
     RecycleBin,
+    Restore,
+    EmptyRecycleBin,
     NewFolder,
     Refresh,
     ShowMoreOptions,
@@ -298,6 +307,44 @@ fn build_menu_entries(target: &ContextMenuTarget, can_paste: bool) -> Vec<MenuEn
                 label: "Show more options",
                 glyph: OnyxGlyph::ChevronRight,
                 shortcut: None,
+                enabled: true,
+                danger: false,
+            }),
+        ],
+        ContextMenuTarget::RecycleItem { can_restore, .. } => vec![
+            MenuEntry::Item(MenuItemSpec {
+                action: ContextMenuAction::Restore,
+                label: "Restore",
+                glyph: OnyxGlyph::Undo,
+                shortcut: Some("Enter"),
+                enabled: *can_restore,
+                danger: false,
+            }),
+            MenuEntry::Separator,
+            MenuEntry::Item(MenuItemSpec {
+                action: ContextMenuAction::Refresh,
+                label: "Refresh",
+                glyph: OnyxGlyph::Refresh,
+                shortcut: Some("F5"),
+                enabled: true,
+                danger: false,
+            }),
+        ],
+        ContextMenuTarget::RecycleBackground { has_items } => vec![
+            MenuEntry::Item(MenuItemSpec {
+                action: ContextMenuAction::EmptyRecycleBin,
+                label: "Empty Recycle Bin",
+                glyph: OnyxGlyph::Trash,
+                shortcut: None,
+                enabled: *has_items,
+                danger: true,
+            }),
+            MenuEntry::Separator,
+            MenuEntry::Item(MenuItemSpec {
+                action: ContextMenuAction::Refresh,
+                label: "Refresh",
+                glyph: OnyxGlyph::Refresh,
+                shortcut: Some("F5"),
                 enabled: true,
                 danger: false,
             }),
@@ -650,5 +697,54 @@ mod tests {
             state.focused_action(),
             Some(ContextMenuAction::ShowMoreOptions)
         );
+    }
+
+    #[test]
+    fn recycle_bin_menus_expose_restore_and_empty_actions() {
+        let restorable = ContextMenuState::new(
+            ContextMenuTarget::RecycleItem {
+                index: 0,
+                can_restore: true,
+            },
+            16.0,
+            16.0,
+            false,
+        );
+        let items = restorable.actionable_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].action, ContextMenuAction::Restore);
+        assert!(items[0].enabled);
+        assert_eq!(items[1].action, ContextMenuAction::Refresh);
+
+        let unrestorable = ContextMenuState::new(
+            ContextMenuTarget::RecycleItem {
+                index: 0,
+                can_restore: false,
+            },
+            16.0,
+            16.0,
+            false,
+        );
+        assert!(!unrestorable.actionable_items()[0].enabled);
+
+        let populated_bg = ContextMenuState::new(
+            ContextMenuTarget::RecycleBackground { has_items: true },
+            16.0,
+            16.0,
+            false,
+        );
+        let bg_items = populated_bg.actionable_items();
+        assert_eq!(bg_items.len(), 2);
+        assert_eq!(bg_items[0].action, ContextMenuAction::EmptyRecycleBin);
+        assert!(bg_items[0].enabled);
+        assert!(bg_items[0].danger);
+
+        let empty_bg = ContextMenuState::new(
+            ContextMenuTarget::RecycleBackground { has_items: false },
+            16.0,
+            16.0,
+            false,
+        );
+        assert!(!empty_bg.actionable_items()[0].enabled);
     }
 }

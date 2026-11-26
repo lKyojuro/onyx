@@ -57,11 +57,11 @@ use onyx_operations::{
 use onyx_preview::{PreviewEngine, ThumbnailEngine, is_thumbnail_supported};
 use onyx_search::{SearchIndex, SearchQuery, UnifiedSearchEngine};
 use onyx_windows::{
-    DragImageSource, DragOutcome, RecycleBinItem, RgbaIcon, TerminalProfile, enumerate_drives,
-    enumerate_known_folders, enumerate_recycle_bin, extract_file_icon_rgba, extract_path_icon_rgba,
-    get_clipboard_files, launch_terminal_with_profile, open_file, open_with_dialog,
-    recycle_bin_icon_rgba, set_clipboard_files, show_context_menu, show_properties_dialog,
-    start_external_file_drag,
+    DragImageSource, DragOutcome, RecycleBinItem, RgbaIcon, TerminalProfile, empty_recycle_bin,
+    enumerate_drives, enumerate_known_folders, enumerate_recycle_bin, extract_file_icon_rgba,
+    extract_path_icon_rgba, get_clipboard_files, launch_terminal_with_profile, open_file,
+    open_with_dialog, recycle_bin_icon_rgba, restore_recycle_bin_items, set_clipboard_files,
+    show_context_menu, show_properties_dialog, start_external_file_drag,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -79,11 +79,19 @@ const MAX_THUMBNAIL_WORKERS: usize = 4;
 type FileList = (Vec<PathBuf>, bool);
 
 /// Kind of modal prompt currently open.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PromptKind {
     NewFolder(PathBuf),
     Rename(PathBuf),
     PermanentDelete(PathBuf),
+    EmptyRecycleBin,
+}
+
+impl PromptKind {
+    /// Whether this prompt is a destructive confirmation without a text field.
+    const fn is_danger(&self) -> bool {
+        matches!(self, Self::PermanentDelete(_) | Self::EmptyRecycleBin)
+    }
 }
 
 /// Active state for the reusable Prompt Dialog modal.
@@ -200,6 +208,8 @@ enum FileOperation {
         archive_path: PathBuf,
         dest_dir: PathBuf,
     },
+    RestoreRecycleItems(Vec<RecycleBinItem>),
+    EmptyRecycleBin,
     Undo,
 }
 
@@ -216,8 +226,14 @@ impl FileOperation {
             Self::MoveItems { .. } => "Move",
             Self::CreateArchive { .. } => "Compress to ZIP",
             Self::ExtractArchive { .. } => "Extract ZIP",
+            Self::RestoreRecycleItems(_) => "Restore",
+            Self::EmptyRecycleBin => "Empty Recycle Bin",
             Self::Undo => "Undo",
         }
+    }
+
+    const fn is_recycle_bin_operation(&self) -> bool {
+        matches!(self, Self::RestoreRecycleItems(_) | Self::EmptyRecycleBin)
     }
 
     async fn run(
@@ -381,6 +397,46 @@ impl FileOperation {
                 )
                 .await
             }
+            Self::RestoreRecycleItems(items) => {
+                let mut restored_paths = Vec::with_capacity(items.len());
+                for item in &items {
+                    if let Some(original) = &item.original_path {
+                        add_parent(affected, original);
+                        restored_paths.push(original.clone());
+                    } else {
+                        restored_paths.push(item.shell_path.clone());
+                    }
+                }
+                let cancel_for_restore = cancel.clone();
+                tokio::task::spawn_blocking(move || {
+                    if cancel_for_restore.is_cancelled() {
+                        return Err(OnyxError::Cancelled);
+                    }
+                    restore_recycle_bin_items(&items)
+                })
+                .await
+                .map_err(|err| OnyxError::OperationFailed {
+                    message: format!("Recycle Bin restore task join failed: {err}"),
+                })??;
+                Ok(OperationReport {
+                    succeeded: restored_paths,
+                    ..OperationReport::default()
+                })
+            }
+            Self::EmptyRecycleBin => {
+                let cancel_for_empty = cancel.clone();
+                tokio::task::spawn_blocking(move || {
+                    if cancel_for_empty.is_cancelled() {
+                        return Err(OnyxError::Cancelled);
+                    }
+                    empty_recycle_bin()
+                })
+                .await
+                .map_err(|err| OnyxError::OperationFailed {
+                    message: format!("Empty Recycle Bin task join failed: {err}"),
+                })??;
+                Ok(OperationReport::default())
+            }
             Self::Undo => return engine.undo_last().await,
         };
         report.map(Some)
@@ -394,6 +450,9 @@ enum OperationEvent {
         can_undo: bool,
         affected: Vec<PathBuf>,
         is_undo: bool,
+        is_recycle_delete: bool,
+        is_recycle_bin_op: bool,
+        is_empty_recycle: bool,
     },
 }
 
@@ -516,6 +575,9 @@ pub struct OnyxExplorer {
     /// Items of the Recycle Bin listing, kept beside the rendered rows because a
     /// recycled item has no live path of its own to restore to.
     pub(crate) recycle_items: Vec<RecycleBinItem>,
+    /// Whether the Windows Recycle Bin was last observed to hold at least one item,
+    /// used to select the sidebar's `:empty` vs `:full` stock icon even outside bin view.
+    pub(crate) recycle_bin_has_items: bool,
     /// Preferences for the library search: indexed when an index is open,
     /// otherwise a live walk of the current folder tree.
     pub(crate) search_engine: UnifiedSearchEngine,
@@ -766,6 +828,7 @@ impl OnyxExplorer {
             search_run: SearchRun::default(),
             search_hits: Vec::new(),
             recycle_items: Vec::new(),
+            recycle_bin_has_items: false,
             search_engine: UnifiedSearchEngine::live_only(),
             search_index: None,
             index,
@@ -1418,15 +1481,7 @@ impl OnyxExplorer {
 
                 // Recycle Bin is a Shell namespace folder: its icon comes from the
                 // stock icon set, one key per state (`:empty` / `:full`).
-                let recycle_work: Vec<(String, PathBuf, bool)> = [":empty", ":full"]
-                    .iter()
-                    .map(|state| {
-                        let key = format!("{RECYCLE_BIN_ICON_PREFIX}{state}");
-                        explorer.icons.mark_pending(key.clone());
-                        (key, PathBuf::new(), true)
-                    })
-                    .collect();
-                explorer.spawn_icon_batch(recycle_work, cx);
+                explorer.refresh_recycle_bin_icons(cx);
 
                 // Ensure home path icon is extracted too if not in known_folders
                 let home = explorer.home_path.clone();
@@ -1746,15 +1801,114 @@ impl OnyxExplorer {
         }
     }
 
-    /// Original location of the selected Recycle Bin item, when one is selected.
+    /// Selected Recycle Bin item, when one is selected in Recycle Bin mode.
     #[must_use]
-    pub fn selected_recycle_original(&self) -> Option<&Path> {
+    pub fn selected_recycle_item(&self) -> Option<&RecycleBinItem> {
+        if !self.is_recycle_bin_mode() {
+            return None;
+        }
         let entry = self.selected_entry()?;
         self.recycle_items
             .iter()
-            .find(|item| item.shell_path == entry.path)?
-            .original_path
-            .as_deref()
+            .find(|item| item.shell_path == entry.path)
+    }
+
+    /// Original location of the selected Recycle Bin item, when one is selected.
+    #[must_use]
+    pub fn selected_recycle_original(&self) -> Option<&Path> {
+        self.selected_recycle_item()?.original_path.as_deref()
+    }
+
+    /// Whether the currently selected Recycle Bin item can be restored.
+    #[must_use]
+    pub fn can_restore_selection(&self) -> bool {
+        self.active_operation.is_none()
+            && self
+                .selected_recycle_item()
+                .is_some_and(can_restore_recycle_item)
+    }
+
+    /// Whether the Recycle Bin currently has items that can be emptied.
+    #[must_use]
+    pub fn can_empty_recycle_bin(&self) -> bool {
+        self.is_recycle_bin_mode()
+            && !self.recycle_items.is_empty()
+            && self.active_operation.is_none()
+    }
+
+    /// Re-extracts the empty/full Windows Recycle Bin stock icons on a blocking worker
+    /// so the sidebar reflects the current bin state without blocking the UI thread.
+    fn refresh_recycle_bin_icons(&mut self, cx: &mut Context<Self>) {
+        let recycle_work: Vec<(String, PathBuf, bool)> = [":empty", ":full"]
+            .iter()
+            .map(|state| {
+                let key = format!("{RECYCLE_BIN_ICON_PREFIX}{state}");
+                self.icons.mark_pending(key.clone());
+                (key, PathBuf::new(), true)
+            })
+            .collect();
+        self.spawn_icon_batch(recycle_work, cx);
+    }
+
+    /// Restores the currently selected Recycle Bin item back to its original location.
+    pub fn restore_selected_recycle_item(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = self.selected_recycle_item().cloned() else {
+            return;
+        };
+        self.restore_recycle_item(item, cx);
+    }
+
+    /// Restores the Recycle Bin item at visible row `idx` back to its original location.
+    pub fn restore_recycle_item_at(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if !self.is_recycle_bin_mode() {
+            return;
+        }
+        let Some(entry) = self.entries.get(idx) else {
+            return;
+        };
+        let Some(item) = self
+            .recycle_items
+            .iter()
+            .find(|item| item.shell_path == entry.path)
+            .cloned()
+        else {
+            return;
+        };
+        self.restore_recycle_item(item, cx);
+    }
+
+    fn restore_recycle_item(&mut self, item: RecycleBinItem, cx: &mut Context<Self>) {
+        if !can_restore_recycle_item(&item) {
+            self.status_message = Some(format!(
+                "Cannot restore \"{}\": original location is unknown.",
+                item.name
+            ));
+            cx.notify();
+            return;
+        }
+        self.start_operation(FileOperation::RestoreRecycleItems(vec![item]), cx);
+    }
+
+    /// Opens the explicit danger confirmation modal before emptying the Recycle Bin.
+    pub fn prompt_empty_recycle_bin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.is_recycle_bin_mode() {
+            return;
+        }
+        if self.recycle_items.is_empty() {
+            self.status_message = Some("Recycle Bin is already empty.".to_string());
+            cx.notify();
+            return;
+        }
+        let message = empty_recycle_bin_prompt_message(self.recycle_items.len());
+        self.open_prompt(
+            PromptKind::EmptyRecycleBin,
+            "Empty Recycle Bin?",
+            &message,
+            "",
+            "Empty Recycle Bin",
+            window,
+            cx,
+        );
     }
 
     /// Opens the Windows Recycle Bin in the primary pane.
@@ -1842,6 +1996,7 @@ impl OnyxExplorer {
         match result {
             Ok(items) => {
                 self.recycle_items = items;
+                self.recycle_bin_has_items = !self.recycle_items.is_empty();
                 self.all_entries = self.recycle_items.iter().map(recycle_bin_row).collect();
                 self.error_message = None;
                 self.apply_filter_and_sort();
@@ -1850,6 +2005,7 @@ impl OnyxExplorer {
                 } else {
                     Some(0)
                 };
+                self.refresh_recycle_bin_icons(cx);
                 self.queue_entry_icons(cx);
                 self.update_preview(cx);
             }
@@ -2885,11 +3041,9 @@ impl OnyxExplorer {
         let Some(entry) = self.pane_entries(pane).get(idx).cloned() else {
             return;
         };
-        // A recycled item has no live path: opening it would either fail in the Shell
-        // or launch the leftover inside the bin's `$R` file.
-        if self.pane_shows_recycle_bin(pane)
-            && self.refuse_in_recycle_bin("Restoring recycled items", cx)
-        {
+        // Activating a recycled item (Enter / double-click) restores it to its original location.
+        if self.pane_shows_recycle_bin(pane) {
+            self.restore_recycle_item_at(idx, cx);
             return;
         }
         if entry.is_dir() {
@@ -3561,7 +3715,7 @@ impl OnyxExplorer {
             cx.notify();
             return;
         }
-        let is_danger = matches!(kind, PromptKind::PermanentDelete(_));
+        let is_danger = kind.is_danger();
         let show_input = !is_danger;
         self.prompt_state = Some(PromptState {
             kind,
@@ -3638,6 +3792,7 @@ impl OnyxExplorer {
             PromptKind::PermanentDelete(path) => {
                 FileOperation::PermanentDelete(PermanentDeleteRequest::confirmed(vec![path]))
             }
+            PromptKind::EmptyRecycleBin => FileOperation::EmptyRecycleBin,
         };
         self.start_operation(operation, cx);
     }
@@ -3694,7 +3849,8 @@ impl OnyxExplorer {
     }
 
     fn start_operation(&mut self, operation: FileOperation, cx: &mut Context<Self>) {
-        if self.refuse_in_recycle_bin("Editing recycled items", cx) {
+        let is_recycle_bin_op = operation.is_recycle_bin_operation();
+        if !is_recycle_bin_op && self.refuse_in_recycle_bin("Editing recycled items", cx) {
             return;
         }
         if self.active_operation.is_some() {
@@ -3704,6 +3860,8 @@ impl OnyxExplorer {
         }
         let title = operation.title();
         let is_undo = matches!(operation, FileOperation::Undo);
+        let is_recycle_delete = matches!(operation, FileOperation::Recycle(_));
+        let is_empty_recycle = matches!(operation, FileOperation::EmptyRecycleBin);
         let cancel = CancellationToken::new();
         self.status_message = None;
         self.active_operation = Some(ActiveOperation {
@@ -3746,6 +3904,9 @@ impl OnyxExplorer {
                 can_undo,
                 affected,
                 is_undo,
+                is_recycle_delete,
+                is_recycle_bin_op,
+                is_empty_recycle,
             });
         });
 
@@ -3771,14 +3932,32 @@ impl OnyxExplorer {
                             can_undo,
                             affected,
                             is_undo,
+                            is_recycle_delete,
+                            is_recycle_bin_op,
+                            is_empty_recycle,
                         } => {
+                            let succeeded = result.is_ok();
                             explorer.active_operation = None;
                             explorer.can_undo = can_undo;
                             explorer.status_message = Some(operation_message(title, result));
                             if is_undo {
                                 explorer.directories.clear();
                                 explorer.refresh(cx);
+                            } else if is_recycle_bin_op {
+                                if is_empty_recycle && succeeded {
+                                    explorer.recycle_bin_has_items = false;
+                                }
+                                explorer.refresh_affected_paths(&affected, cx);
+                                if explorer.is_recycle_bin_mode() {
+                                    explorer.load_recycle_bin(false, cx);
+                                } else {
+                                    explorer.refresh_recycle_bin_icons(cx);
+                                }
                             } else {
+                                if is_recycle_delete && succeeded {
+                                    explorer.recycle_bin_has_items = true;
+                                    explorer.refresh_recycle_bin_icons(cx);
+                                }
                                 explorer.refresh_affected_paths(&affected, cx);
                             }
                             cx.notify();
@@ -3888,9 +4067,27 @@ impl OnyxExplorer {
     ) {
         let pane = self.active_pane;
         if self.pane_shows_recycle_bin(pane) {
-            // Recycled items only offer shell actions that need a live path, so the
-            // file context menu stays closed here.
-            self.refuse_in_recycle_bin("The file context menu", cx);
+            let Some(entry) = self.pane_entries(pane).get(idx).cloned() else {
+                return;
+            };
+            self.select_entry_in(pane, idx, cx);
+            let can_restore = self.active_operation.is_none()
+                && self
+                    .recycle_items
+                    .iter()
+                    .find(|item| item.shell_path == entry.path)
+                    .is_some_and(can_restore_recycle_item);
+            self.context_menu = Some(ContextMenuState::new(
+                ContextMenuTarget::RecycleItem {
+                    index: idx,
+                    can_restore,
+                },
+                f32::from(position.x),
+                f32::from(position.y),
+                false,
+            ));
+            a11y::open_modal(self, ModalSurface::ContextMenu, 0, window, cx);
+            cx.notify();
             return;
         }
         let Some(entry) = self.pane_entries(pane).get(idx).cloned() else {
@@ -3918,7 +4115,17 @@ impl OnyxExplorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.refuse_in_recycle_bin("The background context menu", cx) {
+        if self.is_recycle_bin_mode() {
+            self.context_menu = Some(ContextMenuState::new(
+                ContextMenuTarget::RecycleBackground {
+                    has_items: self.can_empty_recycle_bin(),
+                },
+                f32::from(position.x),
+                f32::from(position.y),
+                false,
+            ));
+            a11y::open_modal(self, ModalSurface::ContextMenu, 0, window, cx);
+            cx.notify();
             return;
         }
         self.context_menu = Some(ContextMenuState::new(
@@ -4046,6 +4253,12 @@ impl OnyxExplorer {
             (ContextMenuAction::RecycleBin, ContextMenuTarget::Item { path, .. }) => {
                 self.start_operation(FileOperation::Recycle(path), cx);
             }
+            (ContextMenuAction::Restore, ContextMenuTarget::RecycleItem { index, .. }) => {
+                self.restore_recycle_item_at(index, cx);
+            }
+            (ContextMenuAction::EmptyRecycleBin, ContextMenuTarget::RecycleBackground { .. }) => {
+                self.prompt_empty_recycle_bin(window, cx);
+            }
             (ContextMenuAction::NewFolder, ContextMenuTarget::Background { dir_path }) => {
                 self.open_prompt(
                     PromptKind::NewFolder(dir_path),
@@ -4064,6 +4277,8 @@ impl OnyxExplorer {
                 let paths = match target {
                     ContextMenuTarget::Item { path, .. } => vec![path],
                     ContextMenuTarget::Background { dir_path } => vec![dir_path],
+                    ContextMenuTarget::RecycleItem { .. }
+                    | ContextMenuTarget::RecycleBackground { .. } => return,
                 };
                 self.trigger_native_shell_menu(paths, window, cx);
             }
@@ -5310,8 +5525,8 @@ impl OnyxExplorer {
             return;
         }
 
-        // Recycled items have no live path, so only selection and history keys act on
-        // the Recycle Bin list; every file operation key is inert there.
+        // In Recycle Bin mode, navigation keys move selection, Enter restores the
+        // selected item, and Shift+Delete opens the Empty Recycle Bin confirmation modal.
         if self.is_recycle_bin_mode() {
             match key {
                 "up" | "left" => self.move_selection(-1, cx),
@@ -5321,6 +5536,9 @@ impl OnyxExplorer {
                     if let Some(idx) = self.pane_selected_index(self.active_pane) {
                         self.activate_entry(idx, window, cx);
                     }
+                }
+                "delete" if mods.shift => {
+                    self.prompt_empty_recycle_bin(window, cx);
                 }
                 _ => {}
             }
@@ -5942,11 +6160,32 @@ fn progress_fraction(progress: &OperationProgress) -> f32 {
     fraction.clamp(0.0, 1.0)
 }
 
+fn can_restore_recycle_item(item: &RecycleBinItem) -> bool {
+    !item.shell_path.as_os_str().is_empty()
+        && item
+            .original_path
+            .as_deref()
+            .and_then(Path::parent)
+            .is_some_and(|parent| !parent.as_os_str().is_empty())
+}
+
+fn empty_recycle_bin_prompt_message(item_count: usize) -> String {
+    if item_count == 1 {
+        "Permanently delete 1 item in the Recycle Bin? This cannot be undone.".to_string()
+    } else {
+        format!("Permanently delete {item_count} items in the Recycle Bin? This cannot be undone.")
+    }
+}
+
 fn operation_message(title: &str, result: OnyxResult<Option<OperationReport>>) -> String {
     match result {
         Ok(None) => "Nothing to undo.".into(),
         Ok(Some(report)) if report.failed.is_empty() && report.skipped.is_empty() => {
-            format!("{title} complete · {} items", report.succeeded.len())
+            if report.succeeded.is_empty() {
+                format!("{title} complete.")
+            } else {
+                format!("{title} complete · {} items", report.succeeded.len())
+            }
         }
         Ok(Some(report)) => {
             let summary = format!(
@@ -6181,6 +6420,42 @@ mod tests {
         assert_eq!(
             operation_message("Copy", Ok(Some(report))),
             "Copy complete · 1 items"
+        );
+        assert_eq!(
+            operation_message("Empty Recycle Bin", Ok(Some(OperationReport::default()))),
+            "Empty Recycle Bin complete."
+        );
+    }
+
+    #[test]
+    fn recycle_bin_restore_and_empty_state_helpers() {
+        let valid = test_recycle_item("report.txt", false);
+        assert!(can_restore_recycle_item(&valid));
+
+        let mut missing_origin = valid.clone();
+        missing_origin.original_path = None;
+        assert!(!can_restore_recycle_item(&missing_origin));
+
+        let mut empty_shell = valid;
+        empty_shell.shell_path = PathBuf::new();
+        assert!(!can_restore_recycle_item(&empty_shell));
+
+        assert!(PromptKind::EmptyRecycleBin.is_danger());
+        assert!(PromptKind::PermanentDelete(PathBuf::from("a.txt")).is_danger());
+        assert!(!PromptKind::NewFolder(PathBuf::from("C:\\Temp")).is_danger());
+        assert!(!PromptKind::Rename(PathBuf::from("C:\\Temp\\a.txt")).is_danger());
+
+        assert!(FileOperation::EmptyRecycleBin.is_recycle_bin_operation());
+        assert!(FileOperation::RestoreRecycleItems(Vec::new()).is_recycle_bin_operation());
+        assert!(!FileOperation::Undo.is_recycle_bin_operation());
+
+        assert_eq!(
+            empty_recycle_bin_prompt_message(1),
+            "Permanently delete 1 item in the Recycle Bin? This cannot be undone."
+        );
+        assert_eq!(
+            empty_recycle_bin_prompt_message(4),
+            "Permanently delete 4 items in the Recycle Bin? This cannot be undone."
         );
     }
 }

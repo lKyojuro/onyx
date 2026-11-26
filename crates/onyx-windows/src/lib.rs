@@ -39,7 +39,10 @@ pub use known_folders::enumerate_known_folders;
 pub use mouse_nav::{
     MouseNavDirection, MouseNavHook, install_mouse_nav_hook, uninstall_mouse_nav_hook,
 };
-pub use recycle_bin::{RecycleBinItem, enumerate_recycle_bin};
+pub use recycle_bin::{
+    RecycleBinItem, empty_recycle_bin, enumerate_recycle_bin, restore_recycle_bin_item,
+    restore_recycle_bin_items,
+};
 pub use shell::{
     TerminalProfile, launch_terminal, launch_terminal_with_profile, open_file, open_with_dialog,
     recycle_paths, show_properties_dialog,

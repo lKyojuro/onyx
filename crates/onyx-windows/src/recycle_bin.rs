@@ -6,20 +6,23 @@
 //! Bin column set shows: display name, original location, size and deletion time.
 
 use crate::com::ComGuard;
-use onyx_core::{OnyxError, OnyxResult};
-use std::ffi::c_void;
-use std::path::PathBuf;
-use windows::Win32::Foundation::{FILETIME, HWND, PROPERTYKEY};
-use windows::Win32::System::Com::CoTaskMemFree;
+use crate::to_wide_null;
+use onyx_core::{OnyxError, OnyxResult, normalize_display_path};
+use std::ffi::{OsStr, c_void};
+use std::path::{Path, PathBuf};
+use windows::Win32::Foundation::{E_UNEXPECTED, FILETIME, HWND, PROPERTYKEY};
+use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::System::SystemServices::SFGAO_FOLDER;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    BHID_SFObject, FOLDERID_RecycleBinFolder, IEnumIDList, IShellFolder, IShellItem, IShellItem2,
-    KF_FLAG_DEFAULT, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN, SHCONTF_NONFOLDERS,
-    SHCreateItemWithParent, SHGetKnownFolderItem, SIGDN, SIGDN_DESKTOPABSOLUTEPARSING,
-    SIGDN_NORMALDISPLAY,
+    BHID_SFObject, FOF_NOCONFIRMATION, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_RENAMEONCOLLISION,
+    FOF_SILENT, FOLDERID_RecycleBinFolder, FileOperation, IEnumIDList, IFileOperation,
+    IShellFolder, IShellItem, IShellItem2, KF_FLAG_DEFAULT, SHCONTF_FOLDERS, SHCONTF_INCLUDEHIDDEN,
+    SHCONTF_NONFOLDERS, SHCreateItemFromParsingName, SHCreateItemWithParent, SHERB_NOCONFIRMATION,
+    SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHEmptyRecycleBinW, SHGetKnownFolderItem, SIGDN,
+    SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY,
 };
-use windows::core::{GUID, PWSTR};
+use windows::core::{GUID, PCWSTR, PWSTR};
 
 /// `PKEY_Size` (`System.Size`) from `propkey.h`.
 const PKEY_SIZE: PROPERTYKEY = PROPERTYKEY {
@@ -314,6 +317,231 @@ pub fn enumerate_recycle_bin() -> OnyxResult<Vec<RecycleBinItem>> {
     Ok(items)
 }
 
+/// Validated source and destination metadata for restoring one recycled item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RestoreTarget {
+    shell_path: String,
+    dest_dir: PathBuf,
+    dest_name: String,
+}
+
+/// Extracts and validates the Shell parsing path, destination folder, and file name
+/// needed to restore `item` without overwriting existing files.
+fn resolve_restore_target(item: &RecycleBinItem) -> OnyxResult<RestoreTarget> {
+    let shell_path = item.shell_path.to_string_lossy().trim().to_string();
+    if shell_path.is_empty() {
+        return Err(OnyxError::InvalidPath {
+            message: format!(
+                "Cannot restore '{}': missing Recycle Bin Shell path",
+                item.name
+            ),
+        });
+    }
+
+    let Some(original_path) = item.original_path.as_deref() else {
+        return Err(OnyxError::OperationFailed {
+            message: format!(
+                "Cannot restore '{}': original location is unknown",
+                item.name
+            ),
+        });
+    };
+
+    let Some(dest_dir) = original_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+    else {
+        return Err(OnyxError::OperationFailed {
+            message: format!("Cannot restore '{}': original folder is missing", item.name),
+        });
+    };
+
+    let dest_name = original_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| item.name.clone());
+    let dest_name = dest_name.trim().to_string();
+    if dest_name.is_empty() {
+        return Err(OnyxError::OperationFailed {
+            message: format!(
+                "Cannot restore '{}': destination file name is empty",
+                item.name
+            ),
+        });
+    }
+
+    Ok(RestoreTarget {
+        shell_path,
+        dest_dir,
+        dest_name,
+    })
+}
+
+/// Restores a single item from the Windows Recycle Bin back to its original location.
+///
+/// Uses `IFileOperation::MoveItem` with conflict-safe flags (`FOF_RENAMEONCOLLISION`)
+/// so an existing file at the destination is never silently overwritten.
+pub fn restore_recycle_bin_item(item: &RecycleBinItem) -> OnyxResult<()> {
+    restore_recycle_bin_items(std::slice::from_ref(item))
+}
+
+/// Restores `items` from the Windows Recycle Bin back to their original locations
+/// using COM `IFileOperation::MoveItem` on a dedicated STA thread.
+///
+/// Missing original parent folders are recreated automatically. Conflict-safe flags
+/// (`FOF_RENAMEONCOLLISION`) ensure existing files at the destination are never
+/// silently clobbered.
+pub fn restore_recycle_bin_items(items: &[RecycleBinItem]) -> OnyxResult<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+
+    let targets: Vec<RestoreTarget> = items
+        .iter()
+        .map(resolve_restore_target)
+        .collect::<OnyxResult<Vec<_>>>()?;
+
+    // Run on a dedicated OS thread to guarantee a clean STA apartment (`IFileOperation` requires STA).
+    let handle = std::thread::Builder::new()
+        .name("onyx-recycle-restore-sta".to_string())
+        .spawn(move || restore_recycle_bin_items_sta(&targets))
+        .map_err(|err| OnyxError::Platform {
+            message: format!("Failed to spawn STA thread for Recycle Bin restore: {err}"),
+        })?;
+
+    handle.join().map_err(|_| OnyxError::Platform {
+        message: "Recycle Bin restore STA worker thread panicked".to_string(),
+    })?
+}
+
+fn restore_recycle_bin_items_sta(targets: &[RestoreTarget]) -> OnyxResult<()> {
+    let _com = ComGuard::init_sta()?;
+
+    // SAFETY: COM is initialized in STA mode on this dedicated thread; `FileOperation` is a
+    // standard Windows Shell CLSID implementing `IFileOperation`.
+    let file_op: IFileOperation = unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_ALL) }
+        .map_err(|err| OnyxError::Platform {
+            message: format!("Failed to create IFileOperation instance: {err}"),
+        })?;
+
+    // Conflict-safe flags: rename on collision so existing files are never clobbered,
+    // and suppress native Win32 dialogs since Onyx manages its own UI feedback.
+    let flags = FOF_RENAMEONCOLLISION
+        | FOF_NOCONFIRMATION
+        | FOF_NOCONFIRMMKDIR
+        | FOF_SILENT
+        | FOF_NOERRORUI;
+
+    // SAFETY: `file_op` is a valid COM interface pointer on this STA thread.
+    unsafe { file_op.SetOperationFlags(flags) }.map_err(|err| OnyxError::Platform {
+        message: format!("IFileOperation::SetOperationFlags failed: {err}"),
+    })?;
+
+    for target in targets {
+        if !target.dest_dir.exists() {
+            std::fs::create_dir_all(&target.dest_dir)?;
+        }
+
+        let source_wide = to_wide_null(OsStr::new(&target.shell_path));
+        // SAFETY: `source_wide` is a valid null-terminated UTF-16 Shell parsing path and
+        // `IShellItem` is requested on this STA thread.
+        let source_item: IShellItem =
+            unsafe { SHCreateItemFromParsingName(PCWSTR(source_wide.as_ptr()), None) }.map_err(
+                |err| OnyxError::Platform {
+                    message: format!(
+                        "Could not resolve Recycle Bin item '{}': {err}",
+                        target.dest_name
+                    ),
+                },
+            )?;
+
+        let dest_dir_display = normalize_display_path(&target.dest_dir);
+        let dest_dir_wide = to_wide_null(OsStr::new(&dest_dir_display));
+        // SAFETY: `dest_dir_wide` is a valid null-terminated UTF-16 directory path and
+        // `IShellItem` is requested on this STA thread.
+        let dest_folder: IShellItem =
+            unsafe { SHCreateItemFromParsingName(PCWSTR(dest_dir_wide.as_ptr()), None) }.map_err(
+                |err| OnyxError::Platform {
+                    message: format!(
+                        "Could not resolve destination folder '{}': {err}",
+                        target.dest_dir.display()
+                    ),
+                },
+            )?;
+
+        let new_name_wide = to_wide_null(OsStr::new(&target.dest_name));
+        // SAFETY: `file_op`, `source_item`, and `dest_folder` are valid COM objects on the
+        // same STA thread, and `new_name_wide` is a valid null-terminated UTF-16 string.
+        unsafe {
+            file_op.MoveItem(
+                &source_item,
+                &dest_folder,
+                PCWSTR(new_name_wide.as_ptr()),
+                None,
+            )
+        }
+        .map_err(|err| OnyxError::Platform {
+            message: format!(
+                "IFileOperation::MoveItem failed for '{}': {err}",
+                target.dest_name
+            ),
+        })?;
+    }
+
+    // SAFETY: All queued move items are valid and flags enforce conflict-safe restoration.
+    unsafe { file_op.PerformOperations() }.map_err(|err| OnyxError::Platform {
+        message: format!("IFileOperation::PerformOperations failed during restore: {err}"),
+    })?;
+
+    // SAFETY: Querying abort status after `PerformOperations` is valid on `file_op`.
+    let aborted = unsafe { file_op.GetAnyOperationsAborted() }
+        .map(|b| b.as_bool())
+        .unwrap_or(false);
+
+    if aborted {
+        return Err(OnyxError::OperationFailed {
+            message: "Recycle Bin restore was aborted before completing".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+/// Empties the Windows Recycle Bin across all drives via `SHEmptyRecycleBinW`.
+///
+/// Runs silently (`SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND`) on a
+/// dedicated STA thread; callers MUST show an explicit confirmation modal before
+/// invoking this function.
+pub fn empty_recycle_bin() -> OnyxResult<()> {
+    let handle = std::thread::Builder::new()
+        .name("onyx-recycle-empty-sta".to_string())
+        .spawn(empty_recycle_bin_sta)
+        .map_err(|err| OnyxError::Platform {
+            message: format!("Failed to spawn STA thread to empty Recycle Bin: {err}"),
+        })?;
+
+    handle.join().map_err(|_| OnyxError::Platform {
+        message: "Recycle Bin empty STA worker thread panicked".to_string(),
+    })?
+}
+
+fn empty_recycle_bin_sta() -> OnyxResult<()> {
+    let _com = ComGuard::init_sta()?;
+    let flags = SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND;
+
+    // SAFETY: COM is initialized in STA mode on this dedicated thread; passing a null
+    // owner window and null root path empties the Recycle Bin on all drives silently.
+    match unsafe { SHEmptyRecycleBinW(None, PCWSTR::null(), flags) } {
+        Ok(()) => Ok(()),
+        // Windows returns `E_UNEXPECTED` when the Recycle Bin is already empty.
+        Err(err) if err.code() == E_UNEXPECTED => Ok(()),
+        Err(err) => Err(OnyxError::Platform {
+            message: format!("SHEmptyRecycleBinW failed: {err}"),
+        }),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -427,5 +655,51 @@ mod tests {
             assert!(!item.shell_path.as_os_str().is_empty());
             assert!(seen.insert(item.shell_path.clone()), "duplicate shell path");
         }
+    }
+
+    #[test]
+    fn restore_empty_slice_is_noop() {
+        assert!(restore_recycle_bin_items(&[]).is_ok());
+    }
+
+    #[test]
+    fn resolve_restore_target_extracts_parent_folder_and_name() {
+        let item = facts(Some(r"C:\Users\me\Desktop")).into_item().unwrap();
+        let target = resolve_restore_target(&item).unwrap();
+        assert_eq!(
+            target.shell_path,
+            r"::{645FF040-5081-101B-9F08-00AA002F954E}\$RABCDEF.txt"
+        );
+        assert_eq!(target.dest_dir, PathBuf::from(r"C:\Users\me\Desktop"));
+        assert_eq!(target.dest_name, "report.txt");
+    }
+
+    #[test]
+    fn resolve_restore_target_rejects_missing_original_location() {
+        let item = facts(None).into_item().unwrap();
+        assert!(matches!(
+            resolve_restore_target(&item),
+            Err(OnyxError::OperationFailed { .. })
+        ));
+    }
+
+    #[test]
+    fn resolve_restore_target_rejects_empty_shell_path() {
+        let mut item = facts(Some(r"C:\Users\me\Desktop")).into_item().unwrap();
+        item.shell_path = PathBuf::new();
+        assert!(matches!(
+            resolve_restore_target(&item),
+            Err(OnyxError::InvalidPath { .. })
+        ));
+    }
+
+    #[test]
+    fn resolve_restore_target_rejects_root_without_parent_folder() {
+        let mut item = facts(Some(r"C:\Users\me\Desktop")).into_item().unwrap();
+        item.original_path = Some(PathBuf::from("report.txt"));
+        assert!(matches!(
+            resolve_restore_target(&item),
+            Err(OnyxError::OperationFailed { .. })
+        ));
     }
 }

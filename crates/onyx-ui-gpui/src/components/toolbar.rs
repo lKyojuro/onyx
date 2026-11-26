@@ -29,215 +29,279 @@ pub fn render_toolbar(
     cx: &mut Context<OnyxExplorer>,
 ) -> impl IntoElement {
     let theme = view.theme;
+    let in_recycle_bin = view.is_recycle_bin_mode();
     let has_selection = view.has_selection();
     let selection_is_archive = view.selection_is_archive();
     let can_paste = view.can_paste();
     let can_undo = view.can_undo();
+    let can_restore = view.can_restore_selection();
+    let can_empty_recycle_bin = view.can_empty_recycle_bin();
     let viewport_w: f32 = window.viewport_size().width.into();
     let compact_labels = viewport_w < 1020.0;
 
-    let left_group = div()
+    let mut left_group = div()
         .id("tb-file-actions")
         .role(Role::Toolbar)
-        .aria_label("File actions")
+        .aria_label(if in_recycle_bin {
+            "Recycle Bin actions"
+        } else {
+            "File actions"
+        })
         .aria_orientation(Orientation::Horizontal)
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(3.0))
-        .child(
-            fluent_action_button(
-                ActionButtonProps {
-                    id: "tb-new-folder".into(),
-                    glyph: Some(OnyxGlyph::FolderPlus),
-                    trailing_glyph: None,
-                    label: if compact_labels { None } else { Some("New") },
-                    active: false,
-                    primary: false,
-                    danger: false,
-                    enabled: true,
-                    compact: true,
-                    min_width: px(28.0),
-                },
-                theme,
-                cx.listener(|explorer, _, window, cx| explorer.prompt_new_folder(window, cx)),
+        .gap(px(3.0));
+
+    if in_recycle_bin {
+        left_group = left_group
+            .child(
+                fluent_action_button(
+                    ActionButtonProps {
+                        id: "tb-restore".into(),
+                        glyph: Some(OnyxGlyph::Undo),
+                        trailing_glyph: None,
+                        label: if compact_labels {
+                            None
+                        } else {
+                            Some("Restore")
+                        },
+                        active: false,
+                        primary: true,
+                        danger: false,
+                        enabled: can_restore,
+                        compact: true,
+                        min_width: px(28.0),
+                    },
+                    theme,
+                    cx.listener(|explorer, _, _, cx| explorer.restore_selected_recycle_item(cx)),
+                )
+                .aria_label("Restore selected item"),
             )
-            .aria_label("New folder"),
-        )
-        .child(vertical_divider(theme, px(16.0)))
-        .child(
-            fluent_action_button(
-                ActionButtonProps {
-                    id: "tb-cut".into(),
-                    glyph: Some(OnyxGlyph::Cut),
-                    trailing_glyph: None,
-                    label: None,
-                    active: false,
-                    primary: false,
-                    danger: false,
-                    enabled: has_selection,
-                    compact: true,
-                    min_width: px(28.0),
-                },
-                theme,
-                cx.listener(|explorer, _, _, cx| explorer.cut_selection(cx)),
+            .child(
+                fluent_action_button(
+                    ActionButtonProps {
+                        id: "tb-empty-recycle-bin".into(),
+                        glyph: Some(OnyxGlyph::Trash),
+                        trailing_glyph: None,
+                        label: if compact_labels {
+                            None
+                        } else {
+                            Some("Empty Recycle Bin")
+                        },
+                        active: false,
+                        primary: false,
+                        danger: true,
+                        enabled: can_empty_recycle_bin,
+                        compact: true,
+                        min_width: px(28.0),
+                    },
+                    theme,
+                    cx.listener(|explorer, _, window, cx| {
+                        explorer.prompt_empty_recycle_bin(window, cx);
+                    }),
+                )
+                .aria_label("Empty Recycle Bin"),
             )
-            .aria_label("Cut"),
-        )
-        .child(
-            fluent_action_button(
-                ActionButtonProps {
-                    id: "tb-copy".into(),
-                    glyph: Some(OnyxGlyph::Copy),
-                    trailing_glyph: None,
-                    label: None,
-                    active: false,
-                    primary: false,
-                    danger: false,
-                    enabled: has_selection,
-                    compact: true,
-                    min_width: px(28.0),
-                },
-                theme,
-                cx.listener(|explorer, _, _, cx| explorer.copy_selection(cx)),
+            .child(vertical_divider(theme, px(16.0)));
+    } else {
+        left_group = left_group
+            .child(
+                fluent_action_button(
+                    ActionButtonProps {
+                        id: "tb-new-folder".into(),
+                        glyph: Some(OnyxGlyph::FolderPlus),
+                        trailing_glyph: None,
+                        label: if compact_labels { None } else { Some("New") },
+                        active: false,
+                        primary: false,
+                        danger: false,
+                        enabled: true,
+                        compact: true,
+                        min_width: px(28.0),
+                    },
+                    theme,
+                    cx.listener(|explorer, _, window, cx| explorer.prompt_new_folder(window, cx)),
+                )
+                .aria_label("New folder"),
             )
-            .aria_label("Copy"),
-        )
-        .child(
-            fluent_action_button(
-                ActionButtonProps {
-                    id: "tb-paste".into(),
-                    glyph: Some(OnyxGlyph::Paste),
-                    trailing_glyph: None,
-                    label: None,
-                    active: false,
-                    primary: false,
-                    danger: false,
-                    enabled: can_paste,
-                    compact: true,
-                    min_width: px(28.0),
-                },
-                theme,
-                cx.listener(|explorer, _, _, cx| explorer.paste(cx)),
+            .child(vertical_divider(theme, px(16.0)))
+            .child(
+                fluent_action_button(
+                    ActionButtonProps {
+                        id: "tb-cut".into(),
+                        glyph: Some(OnyxGlyph::Cut),
+                        trailing_glyph: None,
+                        label: None,
+                        active: false,
+                        primary: false,
+                        danger: false,
+                        enabled: has_selection,
+                        compact: true,
+                        min_width: px(28.0),
+                    },
+                    theme,
+                    cx.listener(|explorer, _, _, cx| explorer.cut_selection(cx)),
+                )
+                .aria_label("Cut"),
             )
-            .aria_label("Paste"),
-        )
-        .child(
-            fluent_action_button(
-                ActionButtonProps {
-                    id: "tb-rename".into(),
-                    glyph: Some(OnyxGlyph::Rename),
-                    trailing_glyph: None,
-                    label: None,
-                    active: false,
-                    primary: false,
-                    danger: false,
-                    enabled: has_selection,
-                    compact: true,
-                    min_width: px(28.0),
-                },
-                theme,
-                cx.listener(|explorer, _, window, cx| explorer.prompt_rename(window, cx)),
+            .child(
+                fluent_action_button(
+                    ActionButtonProps {
+                        id: "tb-copy".into(),
+                        glyph: Some(OnyxGlyph::Copy),
+                        trailing_glyph: None,
+                        label: None,
+                        active: false,
+                        primary: false,
+                        danger: false,
+                        enabled: has_selection,
+                        compact: true,
+                        min_width: px(28.0),
+                    },
+                    theme,
+                    cx.listener(|explorer, _, _, cx| explorer.copy_selection(cx)),
+                )
+                .aria_label("Copy"),
             )
-            .aria_label("Rename"),
-        )
-        .child(
-            fluent_action_button(
-                ActionButtonProps {
-                    id: "tb-duplicate".into(),
-                    glyph: Some(OnyxGlyph::Duplicate),
-                    trailing_glyph: None,
-                    label: None,
-                    active: false,
-                    primary: false,
-                    danger: false,
-                    enabled: has_selection,
-                    compact: true,
-                    min_width: px(28.0),
-                },
-                theme,
-                cx.listener(|explorer, _, _, cx| explorer.duplicate_selection(cx)),
+            .child(
+                fluent_action_button(
+                    ActionButtonProps {
+                        id: "tb-paste".into(),
+                        glyph: Some(OnyxGlyph::Paste),
+                        trailing_glyph: None,
+                        label: None,
+                        active: false,
+                        primary: false,
+                        danger: false,
+                        enabled: can_paste,
+                        compact: true,
+                        min_width: px(28.0),
+                    },
+                    theme,
+                    cx.listener(|explorer, _, _, cx| explorer.paste(cx)),
+                )
+                .aria_label("Paste"),
             )
-            .aria_label("Duplicate"),
-        )
-        .child(
-            fluent_action_button(
-                ActionButtonProps {
-                    id: "tb-recycle".into(),
-                    glyph: Some(OnyxGlyph::Trash),
-                    trailing_glyph: None,
-                    label: None,
-                    active: false,
-                    primary: false,
-                    danger: true,
-                    enabled: has_selection,
-                    compact: true,
-                    min_width: px(28.0),
-                },
-                theme,
-                cx.listener(|explorer, _, _, cx| explorer.recycle_selection(cx)),
+            .child(
+                fluent_action_button(
+                    ActionButtonProps {
+                        id: "tb-rename".into(),
+                        glyph: Some(OnyxGlyph::Rename),
+                        trailing_glyph: None,
+                        label: None,
+                        active: false,
+                        primary: false,
+                        danger: false,
+                        enabled: has_selection,
+                        compact: true,
+                        min_width: px(28.0),
+                    },
+                    theme,
+                    cx.listener(|explorer, _, window, cx| explorer.prompt_rename(window, cx)),
+                )
+                .aria_label("Rename"),
             )
-            .aria_label("Move to Recycle Bin"),
-        )
-        .child(
-            fluent_action_button(
-                ActionButtonProps {
-                    id: "tb-undo".into(),
-                    glyph: Some(OnyxGlyph::Undo),
-                    trailing_glyph: None,
-                    label: None,
-                    active: false,
-                    primary: false,
-                    danger: false,
-                    enabled: can_undo,
-                    compact: true,
-                    min_width: px(28.0),
-                },
-                theme,
-                cx.listener(|explorer, _, _, cx| explorer.undo(cx)),
+            .child(
+                fluent_action_button(
+                    ActionButtonProps {
+                        id: "tb-duplicate".into(),
+                        glyph: Some(OnyxGlyph::Duplicate),
+                        trailing_glyph: None,
+                        label: None,
+                        active: false,
+                        primary: false,
+                        danger: false,
+                        enabled: has_selection,
+                        compact: true,
+                        min_width: px(28.0),
+                    },
+                    theme,
+                    cx.listener(|explorer, _, _, cx| explorer.duplicate_selection(cx)),
+                )
+                .aria_label("Duplicate"),
             )
-            .aria_label("Undo"),
-        )
-        .child(vertical_divider(theme, px(16.0)))
-        .child(
-            fluent_action_button(
-                ActionButtonProps {
-                    id: "tb-compress".into(),
-                    glyph: Some(OnyxGlyph::Archive),
-                    trailing_glyph: None,
-                    label: None,
-                    active: false,
-                    primary: false,
-                    danger: false,
-                    enabled: has_selection,
-                    compact: true,
-                    min_width: px(28.0),
-                },
-                theme,
-                cx.listener(|explorer, _, _, cx| explorer.compress_selection_to_zip(cx)),
+            .child(
+                fluent_action_button(
+                    ActionButtonProps {
+                        id: "tb-recycle".into(),
+                        glyph: Some(OnyxGlyph::Trash),
+                        trailing_glyph: None,
+                        label: None,
+                        active: false,
+                        primary: false,
+                        danger: true,
+                        enabled: has_selection,
+                        compact: true,
+                        min_width: px(28.0),
+                    },
+                    theme,
+                    cx.listener(|explorer, _, _, cx| explorer.recycle_selection(cx)),
+                )
+                .aria_label("Move to Recycle Bin"),
             )
-            .aria_label("Compress to ZIP"),
-        )
-        .child(
-            fluent_action_button(
-                ActionButtonProps {
-                    id: "tb-extract".into(),
-                    glyph: Some(OnyxGlyph::Download),
-                    trailing_glyph: None,
-                    label: None,
-                    active: false,
-                    primary: false,
-                    danger: false,
-                    enabled: selection_is_archive,
-                    compact: true,
-                    min_width: px(28.0),
-                },
-                theme,
-                cx.listener(|explorer, _, _, cx| explorer.extract_selected_archive(cx)),
+            .child(
+                fluent_action_button(
+                    ActionButtonProps {
+                        id: "tb-undo".into(),
+                        glyph: Some(OnyxGlyph::Undo),
+                        trailing_glyph: None,
+                        label: None,
+                        active: false,
+                        primary: false,
+                        danger: false,
+                        enabled: can_undo,
+                        compact: true,
+                        min_width: px(28.0),
+                    },
+                    theme,
+                    cx.listener(|explorer, _, _, cx| explorer.undo(cx)),
+                )
+                .aria_label("Undo"),
             )
-            .aria_label("Extract archive here"),
-        )
-        .child(vertical_divider(theme, px(16.0)))
+            .child(vertical_divider(theme, px(16.0)))
+            .child(
+                fluent_action_button(
+                    ActionButtonProps {
+                        id: "tb-compress".into(),
+                        glyph: Some(OnyxGlyph::Archive),
+                        trailing_glyph: None,
+                        label: None,
+                        active: false,
+                        primary: false,
+                        danger: false,
+                        enabled: has_selection,
+                        compact: true,
+                        min_width: px(28.0),
+                    },
+                    theme,
+                    cx.listener(|explorer, _, _, cx| explorer.compress_selection_to_zip(cx)),
+                )
+                .aria_label("Compress to ZIP"),
+            )
+            .child(
+                fluent_action_button(
+                    ActionButtonProps {
+                        id: "tb-extract".into(),
+                        glyph: Some(OnyxGlyph::Download),
+                        trailing_glyph: None,
+                        label: None,
+                        active: false,
+                        primary: false,
+                        danger: false,
+                        enabled: selection_is_archive,
+                        compact: true,
+                        min_width: px(28.0),
+                    },
+                    theme,
+                    cx.listener(|explorer, _, _, cx| explorer.extract_selected_archive(cx)),
+                )
+                .aria_label("Extract archive here"),
+            )
+            .child(vertical_divider(theme, px(16.0)));
+    }
+
+    let left_group = left_group
         .child(
             fluent_action_button(
                 ActionButtonProps {

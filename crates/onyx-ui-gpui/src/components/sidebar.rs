@@ -174,10 +174,10 @@ pub fn render_sidebar(
     // among the known folders that resolve to a filesystem path.
     // The Recycle Bin has no filesystem path, so it uses the Windows stock icon
     // (one per state) instead of a shell-extracted one.
-    let recycle_state = if view.recycle_items.is_empty() {
-        ":empty"
-    } else {
+    let recycle_state = if view.recycle_bin_has_items {
         ":full"
+    } else {
+        ":empty"
     };
     let recycle_icon = view
         .icons
