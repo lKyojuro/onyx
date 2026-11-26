@@ -28,6 +28,9 @@ use tokio_util::sync::CancellationToken;
 /// the pending run, so only the last query in a burst reaches SQLite.
 pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(180);
 
+/// Channel capacity for streaming search events between the Tokio worker and the UI consumer.
+pub const STREAM_EVENT_CHANNEL_CAPACITY: usize = 32;
+
 const CACHE_DIR: &str = "cache";
 const INDEX_FILE_NAME: &str = "search.sqlite";
 const INDEX_WORKER_THREAD: &str = "onyx-gpui-search-index";
@@ -58,8 +61,8 @@ pub enum SearchStatus {
     /// No run in flight and no hits to show.
     #[default]
     Idle,
-    /// A run is queued (debounce) or querying.
-    Running,
+    /// A run is queued (debounce) or actively streaming hits.
+    Running { matches: usize },
     /// The last run finished with `matches` hits.
     Done { matches: usize },
     /// The last run failed; the message is shown in the status bar.
@@ -70,7 +73,7 @@ impl SearchStatus {
     /// Whether a run is still in flight, used for the LED activity pill.
     #[must_use]
     pub fn is_busy(&self) -> bool {
-        matches!(self, Self::Running)
+        matches!(self, Self::Running { .. })
     }
 }
 
@@ -117,8 +120,23 @@ impl IndexStatus {
     }
 }
 
+/// Incremental events emitted by one streaming search run.
+#[derive(Debug)]
+pub enum SearchStreamEvent {
+    /// A batch of newly matched results from `generation`.
+    Batch {
+        generation: GenerationId,
+        results: Vec<SearchResult>,
+    },
+    /// Terminal event for `generation` (completed, cancelled, or errored).
+    Finished {
+        generation: GenerationId,
+        outcome: OnyxResult<usize>,
+    },
+}
+
 /// One indexed search run: every keystroke opens a new generation with its own
-/// token, and a finish is only accepted while that generation is current.
+/// token, and batches/completion are only accepted while that generation is current.
 #[derive(Debug, Default)]
 pub struct SearchRun {
     generation: GenerationId,
@@ -133,7 +151,7 @@ impl SearchRun {
         self.cancel.cancel();
         self.cancel = CancellationToken::new();
         self.generation = self.generation.next();
-        self.status = SearchStatus::Running;
+        self.status = SearchStatus::Running { matches: 0 };
         self.query = query;
         (self.generation, self.cancel.clone())
     }
@@ -156,6 +174,7 @@ impl SearchRun {
     /// index is switched off.
     pub fn fail(&mut self, message: String) {
         self.cancel.cancel();
+        self.cancel = CancellationToken::new();
         self.generation = self.generation.next();
         self.query.clear();
         self.status = SearchStatus::Failed { message };
@@ -166,57 +185,151 @@ impl SearchRun {
         self.status.is_busy()
     }
 
-    /// Applies a finished run and returns its ranked hits. Results of a stale
-    /// generation - a newer keystroke already restarted the run - are dropped
-    /// without touching the current state.
-    pub fn finish(
+    /// Accepts one streamed batch for `generation` and returns its file entries.
+    /// Batches of a stale or cancelled generation are dropped without touching
+    /// the current state.
+    pub fn accept_batch(
         &mut self,
         generation: GenerationId,
-        result: OnyxResult<Vec<SearchResult>>,
+        results: Vec<SearchResult>,
     ) -> Option<Vec<FileEntry>> {
-        if generation != self.generation {
+        if generation != self.generation || self.cancel.is_cancelled() || !self.status.is_busy() {
             return None;
         }
-        match result {
-            Ok(results) => {
-                let hits: Vec<FileEntry> = results.into_iter().map(|result| result.entry).collect();
+        let hits: Vec<FileEntry> = results.into_iter().map(|result| result.entry).collect();
+        if let SearchStatus::Running { matches } = &mut self.status {
+            *matches = matches.saturating_add(hits.len());
+        }
+        Some(hits)
+    }
+
+    /// Applies the terminal outcome of a streaming run. Results of a stale
+    /// generation are dropped without touching the current state. Returns
+    /// `true` if `generation` matched the active run.
+    pub fn finish_stream(&mut self, generation: GenerationId, outcome: OnyxResult<usize>) -> bool {
+        if generation != self.generation {
+            return false;
+        }
+        let received = match self.status {
+            SearchStatus::Running { matches } => matches,
+            _ => 0,
+        };
+        match outcome {
+            Ok(total) => {
                 self.status = SearchStatus::Done {
-                    matches: hits.len(),
+                    matches: received.max(total),
                 };
-                Some(hits)
             }
             Err(OnyxError::Cancelled) => {
                 self.status = SearchStatus::Idle;
-                None
             }
             Err(error) => {
                 self.status = SearchStatus::Failed {
                     message: error.to_string(),
                 };
-                None
             }
         }
+        true
     }
 }
 
-/// Runs one query with the shared debounce/cancel discipline. Cancelling the
-/// token during the debounce returns [`OnyxError::Cancelled`] without touching
-/// the index.
-pub async fn run_query(
+/// Runs one streaming query with the shared debounce/cancel discipline.
+///
+/// Cancelling `cancel` during the debounce emits a single
+/// [`SearchStreamEvent::Finished`] with [`OnyxError::Cancelled`] without
+/// touching the index or filesystem. Otherwise, matched batches are forwarded
+/// incrementally as [`SearchStreamEvent::Batch`] followed by a terminal
+/// [`SearchStreamEvent::Finished`].
+pub async fn run_query_streaming(
     engine: UnifiedSearchEngine,
+    generation: GenerationId,
     root: PathBuf,
     query: SearchQuery,
     cancel: CancellationToken,
     debounce: bool,
-) -> OnyxResult<Vec<SearchResult>> {
+    events: mpsc::Sender<SearchStreamEvent>,
+) {
     if debounce {
         tokio::select! {
             biased;
-            () = cancel.cancelled() => return Err(OnyxError::Cancelled),
+            () = cancel.cancelled() => {
+                let _ = events
+                    .send(SearchStreamEvent::Finished {
+                        generation,
+                        outcome: Err(OnyxError::Cancelled),
+                    })
+                    .await;
+                return;
+            }
             () = tokio::time::sleep(SEARCH_DEBOUNCE) => {}
         }
     }
-    engine.search(root, query, cancel).await
+    if cancel.is_cancelled() {
+        let _ = events
+            .send(SearchStreamEvent::Finished {
+                generation,
+                outcome: Err(OnyxError::Cancelled),
+            })
+            .await;
+        return;
+    }
+
+    let (batch_tx, mut batch_rx) =
+        mpsc::channel::<Vec<SearchResult>>(STREAM_EVENT_CHANNEL_CAPACITY);
+    let worker_cancel = cancel.clone();
+    let worker = tokio::spawn(async move {
+        engine
+            .search_streaming(root, query, worker_cancel, batch_tx)
+            .await
+    });
+
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                break;
+            }
+            maybe_batch = batch_rx.recv() => {
+                let Some(batch) = maybe_batch else {
+                    break;
+                };
+                if batch.is_empty() {
+                    continue;
+                }
+                if events
+                    .send(SearchStreamEvent::Batch {
+                        generation,
+                        results: batch,
+                    })
+                    .await
+                    .is_err()
+                {
+                    cancel.cancel();
+                    return;
+                }
+            }
+        }
+    }
+
+    drop(batch_rx);
+
+    let outcome = if cancel.is_cancelled() {
+        Err(OnyxError::Cancelled)
+    } else {
+        match worker.await {
+            Ok(result) => result,
+            Err(err) => Err(OnyxError::Search {
+                message: format!("streaming search task failed: {err}"),
+            }),
+        }
+    };
+
+    let _ = events
+        .send(SearchStreamEvent::Finished {
+            generation,
+            outcome,
+        })
+        .await;
 }
 
 /// Commands sent from the GPUI thread to the index worker. Sending never blocks.
@@ -507,7 +620,7 @@ mod tests {
         assert!(first_cancel.is_cancelled());
         assert!(!second_cancel.is_cancelled());
         assert!(second_generation.value() > first_generation.value());
-        assert_eq!(run.status(), &SearchStatus::Running);
+        assert_eq!(run.status(), &SearchStatus::Running { matches: 0 });
         assert!(run.is_busy());
     }
 
@@ -517,20 +630,21 @@ mod tests {
         let stale_generation = run.restart("alpha".to_string()).0;
         let current_generation = run.restart("alphabet".to_string()).0;
 
-        let dropped = run.finish(
-            stale_generation,
-            Ok(vec![hit(r"C:\data\alphabet.rs", "alphabet.rs")]),
-        );
-        assert!(dropped.is_none());
-        assert_eq!(run.status(), &SearchStatus::Running);
+        let dropped_batch =
+            run.accept_batch(stale_generation, vec![hit(r"C:\data\stale.rs", "stale.rs")]);
+        assert!(dropped_batch.is_none());
+        assert!(!run.finish_stream(stale_generation, Ok(1)));
+        assert_eq!(run.status(), &SearchStatus::Running { matches: 0 });
 
         let hits = run
-            .finish(
+            .accept_batch(
                 current_generation,
-                Ok(vec![hit(r"C:\data\alphabet.rs", "alphabet.rs")]),
+                vec![hit(r"C:\data\alphabet.rs", "alphabet.rs")],
             )
             .unwrap();
         assert_eq!(hits.len(), 1);
+        assert_eq!(run.status(), &SearchStatus::Running { matches: 1 });
+        assert!(run.finish_stream(current_generation, Ok(1)));
         assert_eq!(run.status(), &SearchStatus::Done { matches: 1 });
     }
 
@@ -538,7 +652,7 @@ mod tests {
     fn cancelled_run_reports_idle_instead_of_an_error() {
         let mut run = SearchRun::default();
         let (generation, _) = run.restart("alpha".to_string());
-        assert!(run.finish(generation, Err(OnyxError::Cancelled)).is_none());
+        assert!(run.finish_stream(generation, Err(OnyxError::Cancelled)));
         assert_eq!(run.status(), &SearchStatus::Idle);
     }
 
@@ -546,13 +660,13 @@ mod tests {
     fn failed_run_keeps_the_message_for_the_status_bar() {
         let mut run = SearchRun::default();
         let (generation, _) = run.restart("alpha".to_string());
-        let result = run.finish(
+        let accepted = run.finish_stream(
             generation,
             Err(OnyxError::Search {
                 message: "index unavailable".to_string(),
             }),
         );
-        assert!(result.is_none());
+        assert!(accepted);
         assert!(matches!(
             run.status(),
             SearchStatus::Failed { message } if message.contains("index unavailable")
@@ -565,16 +679,241 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let generation = GenerationId::new(1);
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let result = runtime.block_on(run_query(
+        let (tx, mut rx) = mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY);
+        runtime.block_on(run_query_streaming(
             UnifiedSearchEngine::live_only(),
+            generation,
             PathBuf::from(r"C:\does\not\matter"),
             query("alpha"),
             cancel,
             true,
+            tx,
         ));
-        assert!(matches!(result, Err(OnyxError::Cancelled)));
+        let event = rx.try_recv().expect("must emit terminal cancelled event");
+        assert!(matches!(
+            event,
+            SearchStreamEvent::Finished {
+                generation: g,
+                outcome: Err(OnyxError::Cancelled),
+            } if g == generation
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_live_search_delivers_multiple_batches_and_tracks_progress() {
+        let dir = TempDir::new().unwrap();
+        for idx in 1..=7 {
+            fs::write(dir.path().join(format!("stream-item-{idx:02}.txt")), "hit").unwrap();
+        }
+        fs::write(dir.path().join("unrelated.md"), "skip").unwrap();
+
+        let engine = UnifiedSearchEngine::live_only()
+            .with_live_engine(onyx_search::LiveSearchEngine::with_batch_size(2));
+        let mut run = SearchRun::default();
+        let (generation, cancel) = run.restart("stream-item".to_string());
+        let (tx, mut rx) = mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY);
+
+        let task = tokio::spawn(run_query_streaming(
+            engine,
+            generation,
+            dir.path().to_path_buf(),
+            query("stream-item"),
+            cancel,
+            false,
+            tx,
+        ));
+
+        let mut batch_count = 0usize;
+        let mut collected = Vec::new();
+        let mut progress_counts = Vec::new();
+
+        while let Some(event) = rx.recv().await {
+            match event {
+                SearchStreamEvent::Batch {
+                    generation: event_gen,
+                    results,
+                } => {
+                    batch_count += 1;
+                    let entries = run.accept_batch(event_gen, results).unwrap();
+                    collected.extend(entries);
+                    if let SearchStatus::Running { matches } = run.status() {
+                        progress_counts.push(*matches);
+                    } else {
+                        panic!("expected Running status during batch delivery");
+                    }
+                }
+                SearchStreamEvent::Finished {
+                    generation: event_gen,
+                    outcome,
+                } => {
+                    assert!(run.finish_stream(event_gen, outcome));
+                }
+            }
+        }
+        task.await.unwrap();
+
+        assert!(
+            batch_count >= 4,
+            "expected at least 4 batches for 7 hits with batch_size=2, got {batch_count}"
+        );
+        assert_eq!(collected.len(), 7);
+        assert!(progress_counts.windows(2).all(|w| w[1] > w[0]));
+        assert_eq!(run.status(), &SearchStatus::Done { matches: 7 });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streaming_indexed_search_delivers_sqlite_hits() {
+        let tree = build_sample_tree();
+        let db_dir = TempDir::new().unwrap();
+        let db_path = index_path(db_dir.path());
+        let index = Arc::new(Mutex::new(SearchIndex::open(&db_path).unwrap()));
+        index
+            .lock()
+            .unwrap()
+            .index_directory(tree.path(), &CancellationToken::new())
+            .unwrap();
+
+        let engine = UnifiedSearchEngine::with_index(index);
+        let mut run = SearchRun::default();
+        let (generation, cancel) = run.restart("report".to_string());
+        let (tx, mut rx) = mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY);
+
+        run_query_streaming(
+            engine,
+            generation,
+            tree.path().to_path_buf(),
+            query("report"),
+            cancel,
+            false,
+            tx,
+        )
+        .await;
+
+        let mut entries = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                SearchStreamEvent::Batch {
+                    generation: event_gen,
+                    results,
+                } => {
+                    assert!(
+                        results
+                            .iter()
+                            .all(|r| r.source == onyx_search::SearchSource::SqliteIndex)
+                    );
+                    entries.extend(run.accept_batch(event_gen, results).unwrap());
+                }
+                SearchStreamEvent::Finished {
+                    generation: event_gen,
+                    outcome,
+                } => {
+                    assert!(run.finish_stream(event_gen, outcome));
+                }
+            }
+        }
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(run.status(), &SearchStatus::Done { matches: 2 });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn superseded_streaming_run_cancels_and_drops_stale_batches() {
+        let dir = TempDir::new().unwrap();
+        for idx in 1..=5 {
+            fs::write(dir.path().join(format!("first-{idx}.txt")), "old").unwrap();
+            fs::write(dir.path().join(format!("second-{idx}.txt")), "new").unwrap();
+        }
+
+        let engine = UnifiedSearchEngine::live_only()
+            .with_live_engine(onyx_search::LiveSearchEngine::with_batch_size(2));
+        let mut run = SearchRun::default();
+
+        // Start a debounced first run, then supersede it immediately with a second keystroke.
+        let (stale_gen, stale_cancel) = run.restart("first".to_string());
+        let (stale_tx, mut stale_rx) = mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY);
+        let stale_task = tokio::spawn(run_query_streaming(
+            engine.clone(),
+            stale_gen,
+            dir.path().to_path_buf(),
+            query("first"),
+            stale_cancel.clone(),
+            true,
+            stale_tx,
+        ));
+
+        let (active_gen, active_cancel) = run.restart("second".to_string());
+        assert!(stale_cancel.is_cancelled());
+        assert!(active_gen.value() > stale_gen.value());
+
+        // Drain the cancelled first run: any event carrying `stale_gen` must be rejected.
+        while let Some(event) = stale_rx.recv().await {
+            match event {
+                SearchStreamEvent::Batch {
+                    generation,
+                    results,
+                } => {
+                    assert!(run.accept_batch(generation, results).is_none());
+                }
+                SearchStreamEvent::Finished {
+                    generation,
+                    outcome,
+                } => {
+                    assert!(matches!(outcome, Err(OnyxError::Cancelled)));
+                    assert!(!run.finish_stream(generation, outcome));
+                }
+            }
+        }
+        stale_task.await.unwrap();
+
+        // Even a late in-flight batch for `stale_gen` cannot pollute the active run.
+        assert!(
+            run.accept_batch(stale_gen, vec![hit(r"C:\data\first-1.txt", "first-1.txt")])
+                .is_none()
+        );
+        assert_eq!(run.status(), &SearchStatus::Running { matches: 0 });
+
+        // Run the active generation to completion and verify only its hits are accepted.
+        let (active_tx, mut active_rx) = mpsc::channel(STREAM_EVENT_CHANNEL_CAPACITY);
+        run_query_streaming(
+            engine,
+            active_gen,
+            dir.path().to_path_buf(),
+            query("second"),
+            active_cancel,
+            false,
+            active_tx,
+        )
+        .await;
+
+        let mut active_hits = Vec::new();
+        while let Some(event) = active_rx.recv().await {
+            match event {
+                SearchStreamEvent::Batch {
+                    generation,
+                    results,
+                } => {
+                    active_hits.extend(run.accept_batch(generation, results).unwrap());
+                }
+                SearchStreamEvent::Finished {
+                    generation,
+                    outcome,
+                } => {
+                    assert!(run.finish_stream(generation, outcome));
+                }
+            }
+        }
+
+        assert_eq!(active_hits.len(), 5);
+        assert!(
+            active_hits
+                .iter()
+                .all(|entry| entry.name.starts_with("second-"))
+        );
+        assert_eq!(run.status(), &SearchStatus::Done { matches: 5 });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -23,6 +23,7 @@ use crate::icons::{
 };
 use crate::search_index::{
     self, IndexController, IndexEvent, IndexStatus, ListMode, SearchRun, SearchStatus,
+    SearchStreamEvent,
 };
 use crate::theme::OnyxTheme;
 use gpui_kit::{
@@ -54,7 +55,7 @@ use onyx_operations::{
     list_archive_entries,
 };
 use onyx_preview::{PreviewEngine, ThumbnailEngine, is_thumbnail_supported};
-use onyx_search::{SearchIndex, SearchQuery, SearchResult, UnifiedSearchEngine};
+use onyx_search::{SearchIndex, SearchQuery, UnifiedSearchEngine};
 use onyx_windows::{
     DragImageSource, DragOutcome, RecycleBinItem, RgbaIcon, TerminalProfile, enumerate_drives,
     enumerate_known_folders, enumerate_recycle_bin, extract_file_icon_rgba, extract_path_icon_rgba,
@@ -895,8 +896,28 @@ impl OnyxExplorer {
     pub fn led_label(&self) -> String {
         if self.active_operation.is_some() {
             "Working".to_string()
-        } else if self.search_run.is_busy() {
-            "Searching".to_string()
+        } else if self.search_run.is_busy()
+            || self
+                .command_palette
+                .as_ref()
+                .is_some_and(|palette| palette.search.run.is_busy())
+        {
+            let matches = match self.search_run.status() {
+                SearchStatus::Running { matches } => *matches,
+                _ => self
+                    .command_palette
+                    .as_ref()
+                    .and_then(|palette| match palette.search.run.status() {
+                        SearchStatus::Running { matches } => Some(*matches),
+                        _ => None,
+                    })
+                    .unwrap_or(0),
+            };
+            if matches > 0 {
+                format!("Searching ({matches})")
+            } else {
+                "Searching".to_string()
+            }
         } else if self.index_status.is_busy() {
             "Indexing".to_string()
         } else if self.is_loading || self.secondary.is_loading {
@@ -2056,9 +2077,10 @@ impl OnyxExplorer {
         }
     }
 
-    /// Starts one search run over the open folder tree and feeds the hits into
-    /// the primary pane. The previous run is cancelled immediately, so a new
-    /// keystroke aborts the old run and only the newest hits ever reach the list.
+    /// Starts one streaming search run over the open folder tree and feeds
+    /// matched batches into the primary pane as they arrive. The previous run
+    /// is cancelled immediately, so a new keystroke or navigation aborts the
+    /// old stream and drops any stale batches.
     fn start_list_search(&mut self, debounce: bool, cx: &mut Context<Self>) {
         let text = self.search_query.trim().to_string();
         if text.is_empty() {
@@ -2079,18 +2101,32 @@ impl OnyxExplorer {
             use_index: self.search_index.is_some(),
             ..SearchQuery::default()
         };
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = mpsc::channel(search_index::STREAM_EVENT_CHANNEL_CAPACITY);
+        let worker_cancel = cancel.clone();
         self.runtime.spawn(async move {
-            let result = search_index::run_query(engine, root, query, cancel, debounce).await;
-            let _ = tx.send(result);
+            search_index::run_query_streaming(
+                engine,
+                generation,
+                root,
+                query,
+                worker_cancel,
+                debounce,
+                tx,
+            )
+            .await;
         });
         cx.spawn(async move |this, cx| {
-            let Ok(result) = rx.await else {
-                return;
-            };
-            let _ = this.update(cx, |explorer, cx| {
-                explorer.finish_list_search(generation, result, cx);
-            });
+            while let Some(event) = rx.recv().await {
+                let keep_going = this
+                    .update(cx, |explorer, cx| {
+                        explorer.handle_list_search_event(event, cx)
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    cancel.cancel();
+                    break;
+                }
+            }
         })
         .detach();
 
@@ -2098,38 +2134,61 @@ impl OnyxExplorer {
         cx.notify();
     }
 
-    /// Applies the hits of `generation`; results of a superseded run are dropped.
-    fn finish_list_search(
+    /// Applies one incremental streaming search event for the primary pane.
+    /// Events of a superseded generation are dropped; returns `true` while the
+    /// stream for this generation remains active.
+    fn handle_list_search_event(
         &mut self,
-        generation: GenerationId,
-        result: OnyxResult<Vec<SearchResult>>,
+        event: SearchStreamEvent,
         cx: &mut Context<Self>,
-    ) {
-        let Some(hits) = self.search_run.finish(generation, result) else {
-            let status = self.search_run.status();
-            if let SearchStatus::Failed { message } = status {
-                self.error_message = Some(message.clone());
+    ) -> bool {
+        match event {
+            SearchStreamEvent::Batch {
+                generation,
+                results,
+            } => {
+                let Some(hits) = self.search_run.accept_batch(generation, results) else {
+                    return false;
+                };
+                // The index ignores the listing options of the browse view, so protect
+                // the protected-system-file preference here, as the Slint app does.
+                let show_system = self.config.show_system;
+                let filtered: Vec<FileEntry> = hits
+                    .into_iter()
+                    .filter(|entry| show_system || !entry.attributes.system)
+                    .collect();
+                if !filtered.is_empty() {
+                    let was_empty = self.entries.is_empty();
+                    self.search_hits.extend(filtered.iter().cloned());
+                    self.entries.extend(filtered);
+                    if was_empty && self.selected_index.is_none() {
+                        self.selected_index = Some(0);
+                        self.update_preview(cx);
+                    }
+                    self.queue_entry_icons(cx);
+                }
+                cx.notify();
+                true
             }
-            cx.notify();
-            return;
-        };
-        // The index ignores the listing options of the browse view, so protect
-        // the protected-system-file preference here, as the Slint app does.
-        let show_system = self.config.show_system;
-        self.search_hits = hits
-            .into_iter()
-            .filter(|entry| show_system || !entry.attributes.system)
-            .collect();
-        self.entries = self.search_hits.clone();
-        self.selected_index = if self.entries.is_empty() {
-            None
-        } else {
-            Some(0)
-        };
-        self.update_preview(cx);
-        self.queue_entry_icons(cx);
-        self.queue_thumbnails(cx);
-        cx.notify();
+            SearchStreamEvent::Finished {
+                generation,
+                outcome,
+            } => {
+                if !self.search_run.finish_stream(generation, outcome) {
+                    return false;
+                }
+                if let SearchStatus::Failed { message } = self.search_run.status() {
+                    self.error_message = Some(message.clone());
+                } else if self.selected_index.is_none() && !self.entries.is_empty() {
+                    self.selected_index = Some(0);
+                }
+                self.update_preview(cx);
+                self.queue_entry_icons(cx);
+                self.queue_thumbnails(cx);
+                cx.notify();
+                false
+            }
+        }
     }
 
     pub fn toggle_indexed_search(&mut self, cx: &mut Context<Self>) {
@@ -2206,7 +2265,8 @@ impl OnyxExplorer {
             return None;
         }
         Some(match self.search_run.status() {
-            SearchStatus::Running => "Searching…".to_string(),
+            SearchStatus::Running { matches: 0 } => "Searching…".to_string(),
+            SearchStatus::Running { matches } => format!("Searching… ({matches})"),
             SearchStatus::Done { matches } => format!("{matches} matches"),
             SearchStatus::Failed { message } => format!("Search failed · {message}"),
             SearchStatus::Idle => format!("{} matches", self.entries.len()),
@@ -4679,6 +4739,8 @@ impl OnyxExplorer {
             return;
         }
         let (generation, cancel) = palette.search.run.restart(text.clone());
+        palette.search.hits.clear();
+        palette.search.selected = 0;
         let root = self.current_path().to_path_buf();
         let engine = self.search_engine.clone();
         let query = SearchQuery {
@@ -4687,42 +4749,76 @@ impl OnyxExplorer {
             use_index: self.search_index.is_some(),
             ..SearchQuery::default()
         };
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = mpsc::channel(search_index::STREAM_EVENT_CHANNEL_CAPACITY);
+        let worker_cancel = cancel.clone();
         self.runtime.spawn(async move {
-            let result = search_index::run_query(engine, root, query, cancel, true).await;
-            let _ = tx.send(result);
+            search_index::run_query_streaming(
+                engine,
+                generation,
+                root,
+                query,
+                worker_cancel,
+                true,
+                tx,
+            )
+            .await;
         });
         cx.spawn(async move |this, cx| {
-            let Ok(result) = rx.await else {
-                return;
-            };
-            let _ = this.update(cx, |explorer, cx| {
-                explorer.finish_palette_search(generation, result, cx);
-            });
+            while let Some(event) = rx.recv().await {
+                let keep_going = this
+                    .update(cx, |explorer, cx| {
+                        explorer.handle_palette_search_event(event, cx)
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    cancel.cancel();
+                    break;
+                }
+            }
         })
         .detach();
         self.ensure_led_animation(cx);
         cx.notify();
     }
 
-    fn finish_palette_search(
+    fn handle_palette_search_event(
         &mut self,
-        generation: GenerationId,
-        result: OnyxResult<Vec<SearchResult>>,
+        event: SearchStreamEvent,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let show_system = self.config.show_system;
         let Some(palette) = self.command_palette.as_mut() else {
-            return;
+            return false;
         };
-        if let Some(hits) = palette.search.run.finish(generation, result) {
-            palette.search.set_hits(
-                hits.into_iter()
+        match event {
+            SearchStreamEvent::Batch {
+                generation,
+                results,
+            } => {
+                let Some(hits) = palette.search.run.accept_batch(generation, results) else {
+                    return false;
+                };
+                let filtered: Vec<FileEntry> = hits
+                    .into_iter()
                     .filter(|entry| show_system || !entry.attributes.system)
-                    .collect(),
-            );
+                    .collect();
+                if !filtered.is_empty() {
+                    palette.search.append_hits(filtered);
+                }
+                cx.notify();
+                true
+            }
+            SearchStreamEvent::Finished {
+                generation,
+                outcome,
+            } => {
+                if !palette.search.run.finish_stream(generation, outcome) {
+                    return false;
+                }
+                cx.notify();
+                false
+            }
         }
-        cx.notify();
     }
 
     fn palette_selected_id(&self) -> Option<&'static str> {

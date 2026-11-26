@@ -361,10 +361,14 @@ pub struct PaletteSearch {
 }
 
 impl PaletteSearch {
-    /// Replaces the hits of the current run and focuses the first one.
-    pub fn set_hits(&mut self, hits: Vec<FileEntry>) {
-        self.hits = hits;
-        self.selected = 0;
+    /// Appends a streamed batch of hits to the current run, focusing the first
+    /// hit when the list was previously empty.
+    pub fn append_hits(&mut self, mut hits: Vec<FileEntry>) {
+        let was_empty = self.hits.is_empty();
+        self.hits.append(&mut hits);
+        if was_empty {
+            self.selected = 0;
+        }
     }
 
     /// Reports why a file search could not run at all.
@@ -401,7 +405,7 @@ impl PaletteSearch {
     #[must_use]
     pub fn empty_note(&self) -> &'static str {
         match self.run.status() {
-            SearchStatus::Running => "Searching files…",
+            SearchStatus::Running { .. } => "Searching files…",
             SearchStatus::Failed { .. } => "File search unavailable",
             SearchStatus::Done { .. } | SearchStatus::Idle => "No matching files",
         }
@@ -736,7 +740,8 @@ pub fn render_command_palette(
                 ));
             }
             let note = match state.search.run.status() {
-                SearchStatus::Running => "searching…".to_string(),
+                SearchStatus::Running { matches: 0 } => "searching…".to_string(),
+                SearchStatus::Running { matches } => format!("searching… ({matches})"),
                 SearchStatus::Failed { message } => message.clone(),
                 SearchStatus::Done { .. } | SearchStatus::Idle if count > 0 => {
                     format!("{count} files")
@@ -1029,7 +1034,7 @@ mod tests {
         assert_eq!(search.selected, 0);
         assert_eq!(search.empty_note(), "No matching files");
 
-        search.set_hits(vec![entry("a"), entry("b")]);
+        search.append_hits(vec![entry("a"), entry("b")]);
         assert_eq!(search.selected, 0);
         assert_eq!(
             search.selected_hit().map(|hit| hit.name.as_str()),
