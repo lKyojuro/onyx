@@ -9,7 +9,7 @@ use gpui_kit::{
     Context, FontWeight, InteractiveElement, IntoElement, ParentElement, Role,
     StatefulInteractiveElement, Styled, div, px,
 };
-use onyx_core::{ViewMode, normalize_display_path};
+use onyx_core::{ViewMode, format_bytes, normalize_display_path};
 
 /// Renders the 30px bottom status bar with counts, selection info, path, mode badges, and LED pill.
 pub fn render_status_bar(view: &OnyxExplorer, cx: &mut Context<OnyxExplorer>) -> impl IntoElement {
@@ -24,17 +24,48 @@ pub fn render_status_bar(view: &OnyxExplorer, cx: &mut Context<OnyxExplorer>) ->
         (count, true) => format!("{count} items in the Recycle Bin"),
     };
 
-    let selection_text = active
-        .selected_index
-        .and_then(|idx| active.entries.get(idx))
-        .map(|entry| {
-            let (size_label, _) = view.entry_size_info_for(view.active_pane, entry);
-            if size_label.is_empty() {
-                "1 selected".to_string()
-            } else {
-                format!("1 selected · {size_label}")
+    let selected_count = active.selected_indices.len();
+    let selection_text = if selected_count == 0 {
+        None
+    } else if selected_count == 1 {
+        active
+            .selected_indices
+            .iter()
+            .next()
+            .and_then(|&idx| active.entries.get(idx))
+            .map(|entry| {
+                let (size_label, _) = view.entry_size_info_for(view.active_pane, entry);
+                if size_label.is_empty() {
+                    "1 selected".to_string()
+                } else {
+                    format!("1 selected · {size_label}")
+                }
+            })
+    } else {
+        let mut total_bytes: u64 = 0;
+        let mut has_size = false;
+        for &idx in active.selected_indices {
+            if let Some(entry) = active.entries.get(idx) {
+                if entry.is_dir() {
+                    if let Some(cached) = view.folder_sizes.get(&entry.path) {
+                        total_bytes = total_bytes.saturating_add(cached.total_bytes);
+                        has_size = true;
+                    }
+                } else {
+                    total_bytes = total_bytes.saturating_add(entry.size);
+                    has_size = true;
+                }
             }
-        });
+        }
+        if has_size {
+            Some(format!(
+                "{selected_count} selected · {}",
+                format_bytes(total_bytes)
+            ))
+        } else {
+            Some(format!("{selected_count} selected"))
+        }
+    };
 
     let display_path = view.pane_location_label(view.active_pane);
     let search_status = view.search_status_label();

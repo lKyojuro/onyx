@@ -28,6 +28,9 @@ pub enum DropTarget {
     Directory(PathBuf),
     /// Empty background of a pane, i.e. that pane's current directory.
     Pane(PaneId),
+    /// A non-folder row in Details view: drops into that pane's current directory
+    /// and displays a 2px accent insertion line along the row edge.
+    PaneRow { pane: PaneId, row_index: usize },
 }
 
 /// Why a drop is refused.
@@ -117,6 +120,7 @@ pub const fn drag_mode_label(copy: bool) -> &'static str {
 #[derive(Debug, Clone)]
 pub struct DragState {
     pub source: PathBuf,
+    pub sources: Vec<PathBuf>,
     pub label: String,
     pub is_dir: bool,
     pub origin: (f32, f32),
@@ -129,8 +133,10 @@ pub struct DragState {
 impl DragState {
     #[must_use]
     pub fn new(source: PathBuf, label: String, is_dir: bool, origin: (f32, f32)) -> Self {
+        let sources = vec![source.clone()];
         Self {
             source,
+            sources,
             label,
             is_dir,
             origin,
@@ -139,6 +145,18 @@ impl DragState {
             copy: false,
             hover: None,
         }
+    }
+
+    /// Attaches multiple dragged paths and updates the ghost label when dragging a multi-selection.
+    #[must_use]
+    pub fn with_sources(mut self, sources: Vec<PathBuf>) -> Self {
+        if sources.len() > 1 {
+            self.label = format!("{} items", sources.len());
+            self.sources = sources;
+        } else if !sources.is_empty() {
+            self.sources = sources;
+        }
+        self
     }
 
     /// Updates the pointer and arms the drag once the threshold is passed.
