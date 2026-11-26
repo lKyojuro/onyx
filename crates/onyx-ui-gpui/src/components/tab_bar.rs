@@ -209,6 +209,35 @@ pub fn render_tab_bar(
             );
         }
 
+        if view.dual_pane {
+            tab_card = tab_card.child(
+                div()
+                    .id(("tab-move-pane", tab_id))
+                    .role(Role::Button)
+                    .aria_label("Move tab to other pane")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(18.0))
+                    .h(px(18.0))
+                    .rounded(RADIUS_SM)
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(theme.bg_pressed()))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_click(cx.listener(move |explorer, _, _, cx| {
+                        cx.stop_propagation();
+                        explorer.move_tab_to_other_pane(Some(tab_id), cx);
+                    }))
+                    .child(render_glyph(
+                        OnyxGlyph::SwapHorizontal,
+                        px(11.0),
+                        theme.text_muted(),
+                    )),
+            );
+        }
+
         // Close tab button
         tab_card = tab_card.child(
             div()

@@ -38,12 +38,12 @@ use gpui_kit::{
 use onyx_cache::{
     CachedFolderSize, DirectoryCache, FolderSizeCache, FolderSizeStore, dir_mtime_secs,
 };
-use onyx_config::{AppConfig, ConfigStore, SessionState};
+use onyx_config::{AppConfig, ConfigStore, PreviewSide, SessionState};
 use onyx_core::{
     DriveInfo, FavoriteItem, FileAttributes, FileEntry, FileKind, GenerationId, KnownFolder,
-    NavHistory, OnyxError, OnyxResult, SortColumn, SortDirection, SortSpec, TabManager, ThemeMode,
-    ViewMode, expand_env_vars, format_bytes, natural_cmp, normalize_display_path, sort_entries,
-    split_autocomplete_prefix,
+    NavHistory, OnyxError, OnyxResult, SortColumn, SortDirection, SortSpec, TabManager, TabState,
+    ThemeMode, ViewMode, expand_env_vars, format_bytes, natural_cmp, normalize_display_path,
+    sort_entries, split_autocomplete_prefix,
 };
 use onyx_fs::{
     DEFAULT_MAX_FOLDER_SIZE_ENTRIES, DirectoryWatcher, EnumerationOptions, FolderSizeResult,
@@ -468,9 +468,11 @@ pub enum PaneId {
 /// [`OnyxExplorer`] so single-pane rendering stays untouched.
 struct SecondaryPane {
     path: PathBuf,
+    history: NavHistory,
     all_entries: Vec<FileEntry>,
     entries: Vec<FileEntry>,
     selected_index: Option<usize>,
+    pending_selection: Option<PathBuf>,
     is_loading: bool,
     error_message: Option<String>,
     sort_spec: SortSpec,
@@ -487,10 +489,12 @@ struct SecondaryPane {
 impl SecondaryPane {
     fn new(path: PathBuf) -> Self {
         Self {
+            history: NavHistory::with_initial(path.clone()),
             path,
             all_entries: Vec::new(),
             entries: Vec::new(),
             selected_index: None,
+            pending_selection: None,
             is_loading: false,
             error_message: None,
             sort_spec: SortSpec::default(),
@@ -618,6 +622,7 @@ pub struct OnyxExplorer {
     secondary: SecondaryPane,
     pub(crate) sidebar_width: f32,
     pub(crate) preview_width: Option<f32>,
+    pub(crate) preview_side: PreviewSide,
     pub(crate) pane_split_ratio: f32,
     pub(crate) splitter_drag: Option<ActiveSplitterDrag>,
     pub(crate) command_palette: Option<CommandPaletteState>,
@@ -859,6 +864,7 @@ impl OnyxExplorer {
             secondary: SecondaryPane::new(initial_path.clone()),
             sidebar_width: onyx_config::DEFAULT_SIDEBAR_WIDTH,
             preview_width: None,
+            preview_side: PreviewSide::Right,
             pane_split_ratio: onyx_config::DEFAULT_PANE_SPLIT_RATIO,
             splitter_drag: None,
             command_palette: None,
@@ -898,7 +904,10 @@ impl OnyxExplorer {
 
     #[must_use]
     pub fn active_history(&self) -> Option<&NavHistory> {
-        self.tabs.active_tab().map(|tab| &tab.history)
+        match self.active_pane {
+            PaneId::Primary => self.tabs.active_tab().map(|tab| &tab.history),
+            PaneId::Secondary => Some(&self.secondary.history),
+        }
     }
 
     #[must_use]
@@ -1301,7 +1310,7 @@ impl OnyxExplorer {
         self.layout_touched = true;
         if self.dual_pane {
             let path = self.secondary.path.clone();
-            self.load_secondary_directory(path, true, cx);
+            self.load_secondary_directory(path, false, true, cx);
         } else {
             self.active_pane = PaneId::Primary;
             self.secondary.cancel_token.cancel();
@@ -1310,6 +1319,13 @@ impl OnyxExplorer {
             self.secondary.active_folder_size_tasks = 0;
             self.update_preview(cx);
         }
+        self.persist_session();
+        cx.notify();
+    }
+
+    pub fn toggle_preview_side(&mut self, cx: &mut Context<Self>) {
+        self.preview_side = self.preview_side.toggled();
+        self.layout_touched = true;
         self.persist_session();
         cx.notify();
     }
@@ -1324,7 +1340,7 @@ impl OnyxExplorer {
             return;
         }
         self.load_directory(secondary, false, true, cx);
-        self.load_secondary_directory(primary, true, cx);
+        self.load_secondary_directory(primary, false, true, cx);
         self.persist_session();
         cx.notify();
     }
@@ -1380,7 +1396,7 @@ impl OnyxExplorer {
                 self.preview_width = Some(splitter::apply_preview_drag(
                     drag.start_preview_w,
                     delta,
-                    false,
+                    self.preview_side == PreviewSide::Left,
                 ));
             }
         }
@@ -1559,6 +1575,83 @@ impl OnyxExplorer {
         }
     }
 
+    /// Moves a tab between Primary and Secondary panes in Dual-Pane mode,
+    /// preserving path, `NavHistory`, `SortSpec`, and selection.
+    ///
+    /// - `tab_id = Some(id)` moves that specific primary tab to the secondary pane.
+    /// - `tab_id = None` moves whichever pane is currently `self.active_pane`.
+    /// - No-ops gracefully when Dual-Pane mode is off.
+    pub fn move_tab_to_other_pane(&mut self, tab_id: Option<u64>, cx: &mut Context<Self>) {
+        if !self.dual_pane {
+            return;
+        }
+        let primary_tab_index = match tab_id {
+            Some(id) => {
+                let Some(idx) = self.tabs.tabs().iter().position(|t| t.id == id) else {
+                    return;
+                };
+                Some(idx)
+            }
+            None => None,
+        };
+
+        let primary_selected = self
+            .selected_index
+            .and_then(|idx| self.entries.get(idx))
+            .map(|entry| entry.path.clone())
+            .or_else(|| self.pending_selection.clone());
+        if let Some(tab) = self.tabs.active_tab_mut() {
+            tab.sort = self.sort_spec;
+            tab.selected_paths = primary_selected.into_iter().collect();
+        }
+
+        let secondary_selected = self
+            .secondary
+            .selected_index
+            .and_then(|idx| self.secondary.entries.get(idx))
+            .map(|entry| entry.path.clone())
+            .or_else(|| self.secondary.pending_selection.clone());
+        let mut secondary_tab = TabState::new(0, self.secondary.path.clone());
+        secondary_tab.history = self.secondary.history.clone();
+        secondary_tab.sort = self.secondary.sort_spec;
+        secondary_tab.selected_paths = secondary_selected.into_iter().collect();
+
+        if !transfer_tab_between_panes(
+            &mut self.tabs,
+            &mut secondary_tab,
+            &mut self.active_pane,
+            primary_tab_index,
+        ) {
+            return;
+        }
+
+        let secondary_path = secondary_tab.path.clone();
+        let secondary_sel = secondary_tab.selected_paths.first().cloned();
+        self.secondary.path = secondary_path.clone();
+        self.secondary.history = secondary_tab.history;
+        self.secondary.sort_spec = secondary_tab.sort;
+        self.secondary.pending_selection = secondary_sel;
+
+        let primary_tab = self.tabs.active_tab().cloned();
+        let (primary_path, primary_sel) = if let Some(tab) = primary_tab {
+            self.sort_spec = tab.sort;
+            (tab.path, tab.selected_paths.first().cloned())
+        } else {
+            (self.home_path.clone(), None)
+        };
+        self.pending_selection = primary_sel.clone();
+        self.address_editing = false;
+        self.load_directory(primary_path, false, true, cx);
+        if let Some(sel) = primary_sel
+            && let Some(tab) = self.tabs.active_tab_mut()
+        {
+            tab.selected_paths = vec![sel];
+        }
+        self.load_secondary_directory(secondary_path, false, true, cx);
+        self.persist_session();
+        cx.notify();
+    }
+
     // ---- Navigation & Directory Loading ----
 
     pub fn navigate_to(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -1571,22 +1664,40 @@ impl OnyxExplorer {
     }
 
     pub fn go_back(&mut self, cx: &mut Context<Self>) {
-        let target = self
-            .tabs
-            .active_tab_mut()
-            .and_then(|tab| tab.history.go_back().cloned());
-        if let Some(target) = target {
-            self.load_directory(target, false, true, cx);
+        match self.active_pane {
+            PaneId::Primary => {
+                let target = self
+                    .tabs
+                    .active_tab_mut()
+                    .and_then(|tab| tab.history.go_back().cloned());
+                if let Some(target) = target {
+                    self.load_directory(target, false, true, cx);
+                }
+            }
+            PaneId::Secondary => {
+                if let Some(target) = self.secondary.history.go_back().cloned() {
+                    self.load_secondary_directory(target, false, true, cx);
+                }
+            }
         }
     }
 
     pub fn go_forward(&mut self, cx: &mut Context<Self>) {
-        let target = self
-            .tabs
-            .active_tab_mut()
-            .and_then(|tab| tab.history.go_forward().cloned());
-        if let Some(target) = target {
-            self.load_directory(target, false, true, cx);
+        match self.active_pane {
+            PaneId::Primary => {
+                let target = self
+                    .tabs
+                    .active_tab_mut()
+                    .and_then(|tab| tab.history.go_forward().cloned());
+                if let Some(target) = target {
+                    self.load_directory(target, false, true, cx);
+                }
+            }
+            PaneId::Secondary => {
+                if let Some(target) = self.secondary.history.go_forward().cloned() {
+                    self.load_secondary_directory(target, false, true, cx);
+                }
+            }
         }
     }
 
@@ -1603,7 +1714,7 @@ impl OnyxExplorer {
         }
         match self.active_pane {
             PaneId::Primary => self.load_directory(parent, true, true, cx),
-            PaneId::Secondary => self.load_secondary_directory(parent, true, cx),
+            PaneId::Secondary => self.load_secondary_directory(parent, true, true, cx),
         }
     }
 
@@ -1617,7 +1728,7 @@ impl OnyxExplorer {
             PaneId::Secondary => {
                 let path = self.secondary.path.clone();
                 self.invalidate_path_caches(&path);
-                self.load_secondary_directory(path, false, cx);
+                self.load_secondary_directory(path, false, false, cx);
             }
         }
     }
@@ -2859,6 +2970,7 @@ impl OnyxExplorer {
             self.sidebar_visible = session.sidebar_visible;
             self.sidebar_width = session.sidebar_width;
             self.preview_width = session.preview_width;
+            self.preview_side = session.preview_side;
             self.pane_split_ratio = session.pane_split_ratio;
             self.collapsed_sidebar_groups =
                 session.collapsed_sidebar_groups.iter().cloned().collect();
@@ -2867,11 +2979,12 @@ impl OnyxExplorer {
             self.dual_pane = session.dual_pane || self.config.dual_pane_default;
         }
         if let Some(path) = session.secondary_path.clone() {
-            self.secondary.path = path;
+            self.secondary.path = path.clone();
+            self.secondary.history = NavHistory::with_initial(path);
         }
         if self.dual_pane {
             let path = self.secondary.path.clone();
-            self.load_secondary_directory(path, true, cx);
+            self.load_secondary_directory(path, false, true, cx);
         }
         cx.notify();
     }
@@ -2888,6 +3001,7 @@ impl OnyxExplorer {
         let sidebar_visible = self.sidebar_visible;
         let sidebar_width = self.sidebar_width;
         let preview_width = self.preview_width;
+        let preview_side = self.preview_side;
         let pane_split_ratio = self.pane_split_ratio;
         let collapsed_groups: Vec<String> = self.collapsed_sidebar_groups.iter().cloned().collect();
         let (viewport_w, viewport_h) = self.viewport_size;
@@ -2902,6 +3016,7 @@ impl OnyxExplorer {
             session.sidebar_visible = sidebar_visible;
             session.sidebar_width = sidebar_width;
             session.preview_width = preview_width;
+            session.preview_side = preview_side;
             session.pane_split_ratio = pane_split_ratio;
             session.collapsed_sidebar_groups = collapsed_groups;
             if viewport_w > 1.0 && viewport_h > 1.0 {
@@ -2915,7 +3030,13 @@ impl OnyxExplorer {
 
     // ---- Secondary pane loading (Stage 2D) ----
 
-    fn load_secondary_directory(&mut self, path: PathBuf, use_cache: bool, cx: &mut Context<Self>) {
+    fn load_secondary_directory(
+        &mut self,
+        path: PathBuf,
+        record_history: bool,
+        use_cache: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.reset_list_scroll(PaneId::Secondary);
         self.secondary.cancel_token.cancel();
         self.secondary.folder_size_cancel.cancel();
@@ -2927,6 +3048,9 @@ impl OnyxExplorer {
         let generation = self.secondary.generation;
 
         self.secondary.path = path.clone();
+        if record_history {
+            self.secondary.history.push(path.clone());
+        }
         self.secondary.selected_index = None;
         self.secondary.error_message = None;
         self.secondary.is_loading = true;
@@ -2937,6 +3061,7 @@ impl OnyxExplorer {
             sort_entries(&mut cached, self.secondary.sort_spec);
             self.secondary.all_entries = cached;
             self.apply_filter_and_sort();
+            self.apply_secondary_pending_selection(cx);
             self.queue_entry_icons(cx);
             self.queue_thumbnails(cx);
         } else if use_cache {
@@ -2979,6 +3104,7 @@ impl OnyxExplorer {
                         explorer.secondary.all_entries = entries;
                         explorer.secondary.error_message = None;
                         explorer.apply_filter_and_sort();
+                        explorer.apply_secondary_pending_selection(cx);
                         explorer.queue_entry_icons(cx);
                         explorer.queue_folder_sizes_for(PaneId::Secondary, cx);
                         explorer.queue_thumbnails(cx);
@@ -3049,7 +3175,7 @@ impl OnyxExplorer {
         if entry.is_dir() {
             match pane {
                 PaneId::Primary => self.load_directory(entry.path, true, true, cx),
-                PaneId::Secondary => self.load_secondary_directory(entry.path, true, cx),
+                PaneId::Secondary => self.load_secondary_directory(entry.path, true, true, cx),
             }
         } else if entry_is_archive(&entry) {
             self.open_archive_browser(entry.path, window, cx);
@@ -3091,8 +3217,32 @@ impl OnyxExplorer {
         };
         self.pending_selection = None;
         self.selected_index = Some(index);
+        if let Some(tab) = self.tabs.active_tab_mut() {
+            tab.selected_paths = vec![path];
+        }
         if self.view_mode != ViewMode::Grid {
             self.reveal_list_row(PaneId::Primary, index, cx);
+        }
+        self.update_preview(cx);
+    }
+
+    /// Selects and reveals the carried-over secondary selection once entries load.
+    fn apply_secondary_pending_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.secondary.pending_selection.clone() else {
+            return;
+        };
+        let Some(index) = self
+            .secondary
+            .entries
+            .iter()
+            .position(|entry| same_path(&entry.path, &path))
+        else {
+            return;
+        };
+        self.secondary.pending_selection = None;
+        self.secondary.selected_index = Some(index);
+        if self.view_mode != ViewMode::Grid {
+            self.reveal_list_row(PaneId::Secondary, index, cx);
         }
         self.update_preview(cx);
     }
@@ -3997,7 +4147,7 @@ impl OnyxExplorer {
         if self.dual_pane {
             let secondary = self.secondary.path.clone();
             if affected.iter().any(|path| same_path(path, &secondary)) {
-                self.load_secondary_directory(secondary, false, cx);
+                self.load_secondary_directory(secondary, false, false, cx);
             }
         }
     }
@@ -4328,7 +4478,7 @@ impl OnyxExplorer {
                         } else if explorer.dual_pane
                             && same_path(&affected_dir, &explorer.secondary.path)
                         {
-                            explorer.load_secondary_directory(affected_dir, false, cx);
+                            explorer.load_secondary_directory(affected_dir, false, false, cx);
                         }
                     }
                     Err(message) => {
@@ -4360,7 +4510,7 @@ impl OnyxExplorer {
                 if (same_path(changed_path, &current) || changed_path.starts_with(&current))
                     && !self.secondary.is_loading
                 {
-                    self.load_secondary_directory(current, false, cx);
+                    self.load_secondary_directory(current, false, false, cx);
                 }
             }
         }
@@ -4532,11 +4682,13 @@ impl OnyxExplorer {
         self.preview_visible = true;
         self.sidebar_width = onyx_config::DEFAULT_SIDEBAR_WIDTH;
         self.preview_width = None;
+        self.preview_side = PreviewSide::Right;
         self.pane_split_ratio = onyx_config::DEFAULT_PANE_SPLIT_RATIO;
         self.collapsed_sidebar_groups.clear();
         // A layout the user picked explicitly wins over a session that is still
         // being restored by the bootstrap task.
         self.layout_touched = true;
+        self.persist_session();
         cx.notify();
     }
 
@@ -5089,6 +5241,7 @@ impl OnyxExplorer {
             "settings" => self.open_settings(window, cx),
             "new-tab" => self.new_tab(cx),
             "close-tab" => self.close_tab(None, cx),
+            "move-tab-pane" => self.move_tab_to_other_pane(None, cx),
             "refresh" => self.refresh(cx),
             "up" => self.go_up(cx),
             "favorite" => self.toggle_favorite(cx),
@@ -5101,6 +5254,7 @@ impl OnyxExplorer {
             "dual" => self.toggle_dual_pane(cx),
             "swap-panes" => self.swap_panes(cx),
             "preview" => self.set_preview_visible(!self.preview_visible, cx),
+            "preview-side" => self.toggle_preview_side(cx),
             "folder-sizes" => self.set_calculate_folder_sizes(!self.calculate_folder_sizes, cx),
             "new-folder" => self.prompt_new_folder(window, cx),
             "rename" => self.prompt_rename(window, cx),
@@ -5300,7 +5454,7 @@ impl OnyxExplorer {
         if self.dual_pane {
             let secondary = self.secondary.path.clone();
             self.directories.invalidate(&secondary);
-            self.load_secondary_directory(secondary, false, cx);
+            self.load_secondary_directory(secondary, false, false, cx);
         }
     }
 
@@ -5615,6 +5769,11 @@ impl OnyxExplorer {
             cx.stop_propagation();
             return;
         }
+        if mods.control && mods.shift && key == "m" {
+            self.move_tab_to_other_pane(None, cx);
+            cx.stop_propagation();
+            return;
+        }
         if mods.control && mods.shift && key == "n" {
             self.prompt_new_folder(window, cx);
             cx.stop_propagation();
@@ -5702,6 +5861,20 @@ impl Render for OnyxExplorer {
                 cx,
             ));
         }
+        if self.preview_side == PreviewSide::Left {
+            if let Some(preview_el) = preview_pane::render_preview_pane(self, layout.preview_w, cx)
+            {
+                workspace = workspace.child(preview_el);
+            }
+            if self.preview_visible {
+                workspace = workspace.child(splitter::render_splitter(
+                    SplitterKind::Preview,
+                    dragging_kind == Some(SplitterKind::Preview),
+                    theme,
+                    cx,
+                ));
+            }
+        }
         workspace = workspace.child(file_pane::render_file_pane(
             self,
             PaneId::Primary,
@@ -5722,16 +5895,19 @@ impl Render for OnyxExplorer {
                 cx,
             ));
         }
-        if self.preview_visible {
-            workspace = workspace.child(splitter::render_splitter(
-                SplitterKind::Preview,
-                dragging_kind == Some(SplitterKind::Preview),
-                theme,
-                cx,
-            ));
-        }
-        if let Some(preview_el) = preview_pane::render_preview_pane(self, layout.preview_w, cx) {
-            workspace = workspace.child(preview_el);
+        if self.preview_side == PreviewSide::Right {
+            if self.preview_visible {
+                workspace = workspace.child(splitter::render_splitter(
+                    SplitterKind::Preview,
+                    dragging_kind == Some(SplitterKind::Preview),
+                    theme,
+                    cx,
+                ));
+            }
+            if let Some(preview_el) = preview_pane::render_preview_pane(self, layout.preview_w, cx)
+            {
+                workspace = workspace.child(preview_el);
+            }
         }
 
         let mut root = div()
@@ -6204,6 +6380,59 @@ fn operation_message(title: &str, result: OnyxResult<Option<OperationReport>>) -
     }
 }
 
+/// Transfers a tab between the primary [`TabManager`] and the secondary [`TabState`]
+/// while preserving `path`, `history`, `sort`, and `selected_paths`.
+///
+/// Mirrors `crates/onyx-app/src/state.rs::AppState::move_tab_to_other_pane`.
+fn transfer_tab_between_panes(
+    tabs: &mut TabManager,
+    secondary_tab: &mut TabState,
+    active_pane: &mut PaneId,
+    primary_tab_index: Option<usize>,
+) -> bool {
+    let source_primary_index = match primary_tab_index {
+        Some(idx) => Some(idx),
+        None if *active_pane == PaneId::Primary => Some(tabs.active_index()),
+        None => None,
+    };
+
+    if let Some(index) = source_primary_index {
+        if index >= tabs.tabs().len() {
+            return false;
+        }
+        if tabs.tabs().len() <= 1 {
+            let Some(primary_tab) = tabs.active_tab_mut() else {
+                return false;
+            };
+            let primary_id = primary_tab.id;
+            std::mem::swap(primary_tab, secondary_tab);
+            primary_tab.id = primary_id;
+            *active_pane = PaneId::Secondary;
+            return true;
+        }
+
+        let Some(moved) = tabs.tabs().get(index).cloned() else {
+            return false;
+        };
+        if !tabs.close_tab(index) {
+            return false;
+        }
+        *secondary_tab = moved;
+        *active_pane = PaneId::Secondary;
+        true
+    } else {
+        let moved = secondary_tab.clone();
+        tabs.new_tab(moved.path.clone());
+        if let Some(dst) = tabs.active_tab_mut() {
+            let new_id = dst.id;
+            *dst = moved;
+            dst.id = new_id;
+        }
+        *active_pane = PaneId::Primary;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6457,5 +6686,152 @@ mod tests {
             empty_recycle_bin_prompt_message(4),
             "Permanently delete 4 items in the Recycle Bin? This cannot be undone."
         );
+    }
+
+    #[test]
+    fn transfer_primary_tab_to_secondary_preserves_state() {
+        let mut tabs = TabManager::new(PathBuf::from(r"C:\Alpha"));
+        tabs.new_tab(PathBuf::from(r"C:\Beta"));
+        if let Some(tab) = tabs.active_tab_mut() {
+            tab.navigate(PathBuf::from(r"C:\Beta\Sub"), true);
+            tab.sort = SortSpec {
+                column: SortColumn::Size,
+                direction: SortDirection::Descending,
+                folders_first: true,
+            };
+            tab.selected_paths = vec![PathBuf::from(r"C:\Beta\Sub\notes.txt")];
+        }
+        let mut secondary = TabState::new(0, PathBuf::from(r"C:\Secondary"));
+        let mut active_pane = PaneId::Primary;
+
+        assert!(transfer_tab_between_panes(
+            &mut tabs,
+            &mut secondary,
+            &mut active_pane,
+            None,
+        ));
+        assert_eq!(active_pane, PaneId::Secondary);
+        assert_eq!(tabs.tabs().len(), 1);
+        assert_eq!(
+            tabs.active_tab().map(|t| t.path.as_path()),
+            Some(Path::new(r"C:\Alpha"))
+        );
+        assert_eq!(secondary.path, PathBuf::from(r"C:\Beta\Sub"));
+        assert!(secondary.history.can_go_back());
+        assert_eq!(
+            secondary.sort,
+            SortSpec {
+                column: SortColumn::Size,
+                direction: SortDirection::Descending,
+                folders_first: true,
+            }
+        );
+        assert_eq!(
+            secondary.selected_paths,
+            vec![PathBuf::from(r"C:\Beta\Sub\notes.txt")]
+        );
+    }
+
+    #[test]
+    fn transfer_sole_primary_tab_swaps_with_secondary_and_preserves_both() {
+        let mut tabs = TabManager::new(PathBuf::from(r"C:\Primary"));
+        let primary_id = tabs.active_tab().map(|t| t.id).unwrap_or(0);
+        if let Some(tab) = tabs.active_tab_mut() {
+            tab.navigate(PathBuf::from(r"C:\Primary\Deep"), true);
+            tab.sort = SortSpec {
+                column: SortColumn::Modified,
+                direction: SortDirection::Descending,
+                folders_first: true,
+            };
+            tab.selected_paths = vec![PathBuf::from(r"C:\Primary\Deep\a.txt")];
+        }
+        let mut secondary = TabState::new(0, PathBuf::from(r"C:\Secondary"));
+        secondary.navigate(PathBuf::from(r"C:\Secondary\Child"), true);
+        secondary.sort = SortSpec {
+            column: SortColumn::Kind,
+            direction: SortDirection::Ascending,
+            folders_first: true,
+        };
+        secondary.selected_paths = vec![PathBuf::from(r"C:\Secondary\Child\b.txt")];
+
+        let mut active_pane = PaneId::Primary;
+        assert!(transfer_tab_between_panes(
+            &mut tabs,
+            &mut secondary,
+            &mut active_pane,
+            None,
+        ));
+
+        assert_eq!(active_pane, PaneId::Secondary);
+        assert_eq!(tabs.tabs().len(), 1);
+        let Some(new_primary) = tabs.active_tab() else {
+            panic!("primary tab remains");
+        };
+        assert_eq!(new_primary.id, primary_id);
+        assert_eq!(new_primary.path, PathBuf::from(r"C:\Secondary\Child"));
+        assert!(new_primary.history.can_go_back());
+        assert_eq!(new_primary.sort.column, SortColumn::Kind);
+        assert_eq!(
+            new_primary.selected_paths,
+            vec![PathBuf::from(r"C:\Secondary\Child\b.txt")]
+        );
+
+        assert_eq!(secondary.path, PathBuf::from(r"C:\Primary\Deep"));
+        assert!(secondary.history.can_go_back());
+        assert_eq!(secondary.sort.column, SortColumn::Modified);
+        assert_eq!(
+            secondary.selected_paths,
+            vec![PathBuf::from(r"C:\Primary\Deep\a.txt")]
+        );
+    }
+
+    #[test]
+    fn transfer_secondary_tab_to_primary_opens_new_active_tab_with_state() {
+        let mut tabs = TabManager::new(PathBuf::from(r"C:\Primary"));
+        let mut secondary = TabState::new(0, PathBuf::from(r"C:\Secondary"));
+        secondary.navigate(PathBuf::from(r"C:\Secondary\Logs"), true);
+        secondary.sort = SortSpec {
+            column: SortColumn::Size,
+            direction: SortDirection::Descending,
+            folders_first: true,
+        };
+        secondary.selected_paths = vec![PathBuf::from(r"C:\Secondary\Logs\app.log")];
+
+        let mut active_pane = PaneId::Secondary;
+        assert!(transfer_tab_between_panes(
+            &mut tabs,
+            &mut secondary,
+            &mut active_pane,
+            None,
+        ));
+
+        assert_eq!(active_pane, PaneId::Primary);
+        assert_eq!(tabs.tabs().len(), 2);
+        let Some(moved) = tabs.active_tab() else {
+            panic!("new active tab exists");
+        };
+        assert_ne!(moved.id, 0);
+        assert_eq!(moved.path, PathBuf::from(r"C:\Secondary\Logs"));
+        assert!(moved.history.can_go_back());
+        assert_eq!(
+            moved.sort,
+            SortSpec {
+                column: SortColumn::Size,
+                direction: SortDirection::Descending,
+                folders_first: true,
+            }
+        );
+        assert_eq!(
+            moved.selected_paths,
+            vec![PathBuf::from(r"C:\Secondary\Logs\app.log")]
+        );
+
+        // Out-of-bounds index is a safe no-op.
+        assert!(!transfer_tab_between_panes(
+            &mut tabs,
+            &mut secondary,
+            &mut active_pane,
+            Some(99),
+        ));
     }
 }

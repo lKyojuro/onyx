@@ -97,6 +97,12 @@ pub const COMMANDS: &[PaletteCommand] = &[
         category: "Navigation",
     },
     PaletteCommand {
+        id: "move-tab-pane",
+        title: "Move Active Tab to Other Pane",
+        shortcut: "Ctrl+Shift+M",
+        category: "Navigation",
+    },
+    PaletteCommand {
         id: "refresh",
         title: "Refresh",
         shortcut: "F5",
@@ -166,6 +172,12 @@ pub const COMMANDS: &[PaletteCommand] = &[
         id: "preview",
         title: "Toggle Preview Pane",
         shortcut: "Alt+P",
+        category: "View",
+    },
+    PaletteCommand {
+        id: "preview-side",
+        title: "Dock Preview Left / Right",
+        shortcut: "",
         category: "View",
     },
     PaletteCommand {
@@ -894,12 +906,28 @@ mod tests {
             "extract-to-folder",
             "browse-archive",
             "reset-layout",
+            "preview-side",
+            "move-tab-pane",
         ] {
             assert!(
                 ids.contains(&required),
                 "expected command '{required}' to be registered"
             );
         }
+
+        let preview_side_hits: Vec<&str> = matching_commands("dock preview")
+            .iter()
+            .filter_map(|index| COMMANDS.get(*index))
+            .map(|command| command.id)
+            .collect();
+        assert_eq!(preview_side_hits, vec!["preview-side"]);
+
+        let move_tab_hits: Vec<&str> = matching_commands("ctrl+shift+m")
+            .iter()
+            .filter_map(|index| COMMANDS.get(*index))
+            .map(|command| command.id)
+            .collect();
+        assert_eq!(move_tab_hits, vec!["move-tab-pane"]);
 
         let archive_hits: Vec<&str> = matching_commands("archive")
             .iter()

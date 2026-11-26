@@ -253,8 +253,53 @@ mod tests {
     use super::*;
     use onyx_config::{
         MAX_PANE_SPLIT_RATIO, MAX_PREVIEW_WIDTH, MAX_SIDEBAR_WIDTH, MIN_PANE_SPLIT_RATIO,
-        MIN_PREVIEW_WIDTH, MIN_SIDEBAR_WIDTH,
+        MIN_PREVIEW_WIDTH, MIN_SIDEBAR_WIDTH, PreviewSide,
     };
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct WorkspaceSlots {
+        after_sidebar_x: f32,
+        files_x: f32,
+        preview_x: f32,
+        preview_splitter_x: f32,
+    }
+
+    fn compute_workspace_slots(
+        layout: WorkspaceLayout,
+        sidebar_visible: bool,
+        dual_pane: bool,
+        preview_visible: bool,
+        preview_side: PreviewSide,
+    ) -> WorkspaceSlots {
+        let after_sidebar_x = if sidebar_visible {
+            layout.sidebar_w + SPLITTER_WIDTH
+        } else {
+            0.0
+        };
+        let files_total_w = layout.files_area_w + if dual_pane { SPLITTER_WIDTH } else { 0.0 };
+        let preview_on_left = preview_side == PreviewSide::Left;
+        let files_x = if preview_visible && preview_on_left {
+            after_sidebar_x + layout.preview_w + SPLITTER_WIDTH
+        } else {
+            after_sidebar_x
+        };
+        let preview_x = if preview_on_left {
+            after_sidebar_x
+        } else {
+            files_x + files_total_w + SPLITTER_WIDTH
+        };
+        let preview_splitter_x = if preview_on_left {
+            after_sidebar_x + layout.preview_w
+        } else {
+            files_x + files_total_w
+        };
+        WorkspaceSlots {
+            after_sidebar_x,
+            files_x,
+            preview_x,
+            preview_splitter_x,
+        }
+    }
 
     #[test]
     fn drag_helpers_clamp_to_onyx_config_bounds() {
@@ -287,5 +332,54 @@ mod tests {
         let layout = compute_workspace_layout(800.0, false, 226.0, true, 0.15, false, None);
         assert!(layout.primary_w >= FILE_PANE_MIN_WIDTH);
         assert!(layout.secondary_w >= FILE_PANE_MIN_WIDTH);
+    }
+
+    #[test]
+    fn preview_drag_direction_and_clamping_for_both_dock_sides() {
+        // Docked Right: dragging left (negative delta) widens preview, dragging right narrows it.
+        assert!((apply_preview_drag(310.0, -50.0, false) - 360.0).abs() < 1e-4);
+        assert!((apply_preview_drag(310.0, 50.0, false) - 260.0).abs() < 1e-4);
+        assert!((apply_preview_drag(310.0, -500.0, false) - MAX_PREVIEW_WIDTH).abs() < 1e-4);
+        assert!((apply_preview_drag(310.0, 500.0, false) - MIN_PREVIEW_WIDTH).abs() < 1e-4);
+
+        // Docked Left: dragging right (positive delta) widens preview, dragging left narrows it.
+        assert!((apply_preview_drag(310.0, 50.0, true) - 360.0).abs() < 1e-4);
+        assert!((apply_preview_drag(310.0, -50.0, true) - 260.0).abs() < 1e-4);
+        assert!((apply_preview_drag(310.0, 500.0, true) - MAX_PREVIEW_WIDTH).abs() < 1e-4);
+        assert!((apply_preview_drag(310.0, -500.0, true) - MIN_PREVIEW_WIDTH).abs() < 1e-4);
+    }
+
+    #[test]
+    fn workspace_slots_place_preview_left_and_right_contiguously() {
+        let workspace_w = 1400.0;
+        let layout =
+            compute_workspace_layout(workspace_w, true, 240.0, true, 0.5, true, Some(300.0));
+        assert!((layout.sidebar_w - 240.0).abs() < 1e-4);
+        assert!((layout.preview_w - 300.0).abs() < 1e-4);
+
+        let files_total_w = layout.files_area_w + SPLITTER_WIDTH;
+        let right = compute_workspace_slots(layout, true, true, true, PreviewSide::Right);
+        assert!((right.after_sidebar_x - (240.0 + SPLITTER_WIDTH)).abs() < 1e-4);
+        assert!((right.files_x - right.after_sidebar_x).abs() < 1e-4);
+        assert!((right.preview_splitter_x - (right.files_x + files_total_w)).abs() < 1e-4);
+        assert!((right.preview_x - (right.preview_splitter_x + SPLITTER_WIDTH)).abs() < 1e-4);
+        assert!((right.preview_x + layout.preview_w - workspace_w).abs() < 1e-4);
+
+        let left = compute_workspace_slots(layout, true, true, true, PreviewSide::Left);
+        assert!((left.after_sidebar_x - (240.0 + SPLITTER_WIDTH)).abs() < 1e-4);
+        assert!((left.preview_x - left.after_sidebar_x).abs() < 1e-4);
+        assert!((left.preview_splitter_x - (left.preview_x + layout.preview_w)).abs() < 1e-4);
+        assert!((left.files_x - (left.preview_splitter_x + SPLITTER_WIDTH)).abs() < 1e-4);
+        assert!((left.files_x + files_total_w - workspace_w).abs() < 1e-4);
+
+        // Without sidebar, left-docked preview starts at x = 0.
+        let no_sidebar_layout =
+            compute_workspace_layout(1000.0, false, 240.0, false, 0.5, true, Some(280.0));
+        let left_no_sidebar =
+            compute_workspace_slots(no_sidebar_layout, false, false, true, PreviewSide::Left);
+        assert!((left_no_sidebar.preview_x - 0.0).abs() < 1e-4);
+        assert!((left_no_sidebar.preview_splitter_x - 280.0).abs() < 1e-4);
+        assert!((left_no_sidebar.files_x - (280.0 + SPLITTER_WIDTH)).abs() < 1e-4);
+        assert!((left_no_sidebar.files_x + no_sidebar_layout.files_area_w - 1000.0).abs() < 1e-4);
     }
 }
