@@ -9,6 +9,10 @@ use crate::components::command_palette::{
 use crate::components::context_menu::{ContextMenuAction, ContextMenuState, ContextMenuTarget};
 use crate::components::drag_drop::{self, DragState, DropTarget, validate_drop};
 use crate::components::preview_pane::{DecodedPreview, PreviewKind, PreviewState};
+use crate::components::selection::{
+    self, InlineRenameState, MarqueeState, PaneSelection, RectF32, filename_stem_range,
+    marquee_hit_test_details, marquee_hit_test_grid,
+};
 use crate::components::settings_overlay;
 use crate::components::smooth_scroll::{
     DETAILS_ROW_HEIGHT, SmoothScroll, content_height, keep_visible, wheel_pixels,
@@ -64,7 +68,7 @@ use onyx_windows::{
     show_context_menu, show_properties_dialog, start_external_file_drag,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -83,7 +87,7 @@ type FileList = (Vec<PathBuf>, bool);
 pub(crate) enum PromptKind {
     NewFolder(PathBuf),
     Rename(PathBuf),
-    PermanentDelete(PathBuf),
+    PermanentDelete(Vec<PathBuf>),
     EmptyRecycleBin,
 }
 
@@ -190,7 +194,7 @@ enum FileOperation {
     },
     Duplicate(PathBuf),
     Paste(PathBuf),
-    Recycle(PathBuf),
+    Recycle(Vec<PathBuf>),
     PermanentDelete(PermanentDeleteRequest),
     CopyItems {
         sources: Vec<PathBuf>,
@@ -310,9 +314,11 @@ impl FileOperation {
                         .await
                 }
             }
-            Self::Recycle(path) => {
-                add_parent(affected, &path);
-                engine.recycle_items(&[path], cancel, Some(progress)).await
+            Self::Recycle(paths) => {
+                for path in &paths {
+                    add_parent(affected, path);
+                }
+                engine.recycle_items(&paths, cancel, Some(progress)).await
             }
             Self::PermanentDelete(request) => {
                 for path in &request.paths {
@@ -472,6 +478,7 @@ struct SecondaryPane {
     all_entries: Vec<FileEntry>,
     entries: Vec<FileEntry>,
     selected_index: Option<usize>,
+    selection: PaneSelection,
     pending_selection: Option<PathBuf>,
     is_loading: bool,
     error_message: Option<String>,
@@ -494,6 +501,7 @@ impl SecondaryPane {
             all_entries: Vec::new(),
             entries: Vec::new(),
             selected_index: None,
+            selection: PaneSelection::default(),
             pending_selection: None,
             is_loading: false,
             error_message: None,
@@ -514,7 +522,7 @@ impl SecondaryPane {
 #[derive(Debug, Clone, Copy)]
 pub struct PaneSnapshot<'a> {
     pub entries: &'a [FileEntry],
-    pub selected_index: Option<usize>,
+    pub selected_indices: &'a BTreeSet<usize>,
 }
 
 /// Timeout after which incremental type-ahead in the file list starts a fresh prefix.
@@ -625,6 +633,11 @@ pub struct OnyxExplorer {
     pub(crate) all_entries: Vec<FileEntry>,
     pub(crate) entries: Vec<FileEntry>,
     pub(crate) selected_index: Option<usize>,
+    pub(crate) selection: PaneSelection,
+    pub(crate) marquee: Option<MarqueeState>,
+    pub(crate) inline_rename: Option<InlineRenameState>,
+    pub(crate) inline_rename_input: Entity<InputState>,
+    pending_collapse_click: Option<(PaneId, usize)>,
     type_ahead: TypeAheadState,
     pub(crate) generation: GenerationId,
     pub(crate) cancel_token: CancellationToken,
@@ -775,6 +788,7 @@ impl OnyxExplorer {
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter path and press Enter..."));
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter folder..."));
         let prompt_input = cx.new(|cx| InputState::new(window, cx));
+        let inline_rename_input = cx.new(|cx| InputState::new(window, cx));
         let palette_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Type a command, or ? to search files…")
         });
@@ -822,6 +836,24 @@ impl OnyxExplorer {
                 if matches!(ev, InputEvent::PressEnter { .. }) && explorer.prompt_state.is_some() {
                     explorer.confirm_prompt(window, cx);
                 }
+            },
+        );
+
+        let inline_rename_sub = cx.subscribe_in(
+            &inline_rename_input,
+            window,
+            |explorer, _state, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } => {
+                    if explorer.inline_rename.is_some() {
+                        explorer.commit_inline_rename(window, cx);
+                    }
+                }
+                InputEvent::Blur => {
+                    if explorer.inline_rename.is_some() {
+                        explorer.cancel_inline_rename(window, cx);
+                    }
+                }
+                InputEvent::Change | InputEvent::Focus => {}
             },
         );
 
@@ -890,6 +922,11 @@ impl OnyxExplorer {
             all_entries: Vec::new(),
             entries: Vec::new(),
             selected_index: None,
+            selection: PaneSelection::default(),
+            marquee: None,
+            inline_rename: None,
+            inline_rename_input,
+            pending_collapse_click: None,
             type_ahead: TypeAheadState::default(),
             generation: GenerationId::new(0),
             cancel_token: CancellationToken::new(),
@@ -969,7 +1006,13 @@ impl OnyxExplorer {
             layout_touched: false,
             config_store,
             config: AppConfig::default(),
-            _subscriptions: vec![addr_sub, search_sub, prompt_sub, palette_sub],
+            _subscriptions: vec![
+                addr_sub,
+                search_sub,
+                prompt_sub,
+                inline_rename_sub,
+                palette_sub,
+            ],
         };
 
         explorer.start_clipboard_monitor(clipboard_rx, cx);
@@ -1017,13 +1060,80 @@ impl OnyxExplorer {
 
     #[must_use]
     pub fn has_selection(&self) -> bool {
-        self.selected_entry().is_some()
+        !self.pane_selection(self.active_pane).is_empty() || self.selected_entry().is_some()
     }
 
     #[must_use]
     pub fn selected_entry(&self) -> Option<&FileEntry> {
         self.pane_selected_index(self.active_pane)
             .and_then(|idx| self.pane_entries(self.active_pane).get(idx))
+    }
+
+    /// Returns all currently selected entries in the active pane, ordered by index.
+    #[must_use]
+    pub fn selected_entries(&self) -> Vec<&FileEntry> {
+        let pane = self.active_pane;
+        let entries = self.pane_entries(pane);
+        let mut out: Vec<&FileEntry> = self
+            .pane_selection(pane)
+            .indices()
+            .iter()
+            .filter_map(|&idx| entries.get(idx))
+            .collect();
+        if out.is_empty()
+            && let Some(entry) = self.selected_entry()
+        {
+            out.push(entry);
+        }
+        out
+    }
+
+    /// Returns the paths of all currently selected entries in the active pane.
+    #[must_use]
+    pub fn selected_paths(&self) -> Vec<PathBuf> {
+        self.selected_entries()
+            .into_iter()
+            .map(|entry| entry.path.clone())
+            .collect()
+    }
+
+    #[must_use]
+    pub fn pane_selection(&self, pane: PaneId) -> &PaneSelection {
+        match pane {
+            PaneId::Primary => &self.selection,
+            PaneId::Secondary => &self.secondary.selection,
+        }
+    }
+
+    fn pane_selection_mut(&mut self, pane: PaneId) -> &mut PaneSelection {
+        match pane {
+            PaneId::Primary => &mut self.selection,
+            PaneId::Secondary => &mut self.secondary.selection,
+        }
+    }
+
+    #[must_use]
+    pub fn pane_is_selected(&self, pane: PaneId, idx: usize) -> bool {
+        self.pane_selection(pane).contains(idx)
+    }
+
+    fn sync_pane_selected_index(&mut self, pane: PaneId) {
+        let lead = self.pane_selection(pane).lead();
+        match pane {
+            PaneId::Primary => self.selected_index = lead,
+            PaneId::Secondary => self.secondary.selected_index = lead,
+        }
+    }
+
+    fn clear_pane_selection(&mut self, pane: PaneId) {
+        self.pane_selection_mut(pane).clear();
+        self.sync_pane_selected_index(pane);
+    }
+
+    fn set_single_selection(&mut self, pane: PaneId, idx: usize) {
+        let len = self.pane_entries(pane).len();
+        self.pane_selection_mut(pane).select_single(idx, len);
+        self.sync_pane_selected_index(pane);
     }
 
     #[must_use]
@@ -1362,7 +1472,7 @@ impl OnyxExplorer {
         let pane = self.active_pane;
         PaneSnapshot {
             entries: self.pane_entries(pane),
-            selected_index: self.pane_selected_index(pane),
+            selected_indices: self.pane_selection(pane).indices(),
         }
     }
 
@@ -1888,7 +1998,8 @@ impl OnyxExplorer {
         if self.indexed_search {
             self.index.watch(self.index_roots());
         }
-        self.selected_index = None;
+        self.clear_pane_selection(PaneId::Primary);
+        self.inline_rename = None;
         self.error_message = None;
         self.is_loading = true;
         self.update_preview(cx);
@@ -2156,7 +2267,8 @@ impl OnyxExplorer {
         self.recycle_items.clear();
         self.all_entries.clear();
         self.entries.clear();
-        self.selected_index = None;
+        self.clear_pane_selection(PaneId::Primary);
+        self.inline_rename = None;
         self.error_message = None;
         self.is_loading = true;
         // Shell namespace items are not watched; the previous folder keeps its watcher
@@ -2198,11 +2310,11 @@ impl OnyxExplorer {
                 self.all_entries = self.recycle_items.iter().map(recycle_bin_row).collect();
                 self.error_message = None;
                 self.apply_filter_and_sort();
-                self.selected_index = if self.entries.is_empty() {
-                    None
+                if self.entries.is_empty() {
+                    self.clear_pane_selection(PaneId::Primary);
                 } else {
-                    Some(0)
-                };
+                    self.set_single_selection(PaneId::Primary, 0);
+                }
                 self.refresh_recycle_bin_icons(cx);
                 self.queue_entry_icons(cx);
                 self.update_preview(cx);
@@ -2211,7 +2323,7 @@ impl OnyxExplorer {
                 self.recycle_items.clear();
                 self.all_entries.clear();
                 self.entries.clear();
-                self.selected_index = None;
+                self.clear_pane_selection(PaneId::Primary);
                 self.error_message = Some(err.to_string());
             }
         }
@@ -2389,8 +2501,8 @@ impl OnyxExplorer {
 
     fn on_search_changed(&mut self, query: String, cx: &mut Context<Self>) {
         self.search_query = query;
-        self.selected_index = None;
-        self.secondary.selected_index = None;
+        self.clear_pane_selection(PaneId::Primary);
+        self.clear_pane_selection(PaneId::Secondary);
         // The Recycle Bin list is filtered in memory: an index run walks filesystem
         // roots and cannot reach Shell namespace items.
         if self.indexed_search
@@ -2444,7 +2556,7 @@ impl OnyxExplorer {
         self.list_mode = ListMode::Search;
         self.search_hits.clear();
         self.entries.clear();
-        self.selected_index = None;
+        self.clear_pane_selection(PaneId::Primary);
         self.error_message = None;
 
         let root = self.current_path().to_path_buf();
@@ -2516,7 +2628,7 @@ impl OnyxExplorer {
                     self.search_hits.extend(filtered.iter().cloned());
                     self.entries.extend(filtered);
                     if was_empty && self.selected_index.is_none() {
-                        self.selected_index = Some(0);
+                        self.set_single_selection(PaneId::Primary, 0);
                         self.update_preview(cx);
                     }
                     self.queue_entry_icons(cx);
@@ -2534,7 +2646,7 @@ impl OnyxExplorer {
                 if let SearchStatus::Failed { message } = self.search_run.status() {
                     self.error_message = Some(message.clone());
                 } else if self.selected_index.is_none() && !self.entries.is_empty() {
-                    self.selected_index = Some(0);
+                    self.set_single_selection(PaneId::Primary, 0);
                 }
                 self.update_preview(cx);
                 self.queue_entry_icons(cx);
@@ -2945,10 +3057,7 @@ impl OnyxExplorer {
         }
         let pane = self.active_pane;
         if self.pane_selected_index(pane).is_none() && !self.pane_entries(pane).is_empty() {
-            match pane {
-                PaneId::Primary => self.selected_index = Some(0),
-                PaneId::Secondary => self.secondary.selected_index = Some(0),
-            }
+            self.set_single_selection(pane, 0);
         }
         if self.pane_selected_index(pane).is_none() {
             return;
@@ -3194,7 +3303,14 @@ impl OnyxExplorer {
         if record_history {
             self.secondary.history.push(path.clone());
         }
-        self.secondary.selected_index = None;
+        self.clear_pane_selection(PaneId::Secondary);
+        if self
+            .inline_rename
+            .as_ref()
+            .is_some_and(|r| r.pane == PaneId::Secondary)
+        {
+            self.inline_rename = None;
+        }
         self.secondary.error_message = None;
         self.secondary.is_loading = true;
         self.sync_secondary_watcher();
@@ -3287,13 +3403,199 @@ impl OnyxExplorer {
         if idx >= self.pane_entries(pane).len() {
             return;
         }
-        match pane {
-            PaneId::Primary => self.selected_index = Some(idx),
-            PaneId::Secondary => self.secondary.selected_index = Some(idx),
-        }
+        self.set_single_selection(pane, idx);
         self.active_pane = pane;
         self.update_preview(cx);
         cx.notify();
+    }
+
+    /// Handles left mouse-down on a file row or grid card, supporting plain click,
+    /// `Ctrl+Click` toggle, `Shift+Click` range selection, double-click activation,
+    /// and internal drag start.
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_entry_mouse_down(
+        &mut self,
+        pane: PaneId,
+        idx: usize,
+        ev: &MouseDownEvent,
+        drag_path: PathBuf,
+        is_dir: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.inline_rename.is_some() {
+            self.cancel_inline_rename(window, cx);
+        }
+        let len = self.pane_entries(pane).len();
+        if idx >= len {
+            return;
+        }
+        self.active_pane = pane;
+        window.focus(self.pane_focus_handle(pane), cx);
+
+        if ev.modifiers.shift {
+            self.pane_selection_mut(pane)
+                .select_range(idx, len, ev.modifiers.control);
+            self.sync_pane_selected_index(pane);
+            self.pending_collapse_click = None;
+        } else if ev.modifiers.control {
+            self.pane_selection_mut(pane).toggle(idx, len);
+            self.sync_pane_selected_index(pane);
+            self.pending_collapse_click = None;
+        } else if self.pane_selection(pane).contains(idx)
+            && self.pane_selection(pane).len() > 1
+            && ev.click_count < 2
+        {
+            // Keep multi-selection intact while the user may be starting a multi-item drag;
+            // if they release without dragging, `finish_drag` collapses to `idx`.
+            self.pending_collapse_click = Some((pane, idx));
+        } else {
+            self.set_single_selection(pane, idx);
+            self.pending_collapse_click = None;
+        }
+
+        self.update_preview(cx);
+
+        if !ev.modifiers.shift && !ev.modifiers.control && ev.click_count < 2 {
+            self.begin_drag(
+                drag_path,
+                is_dir,
+                (f32::from(ev.position.x), f32::from(ev.position.y)),
+                cx,
+            );
+        }
+        if ev.click_count >= 2 {
+            self.pending_collapse_click = None;
+            self.activate_entry_in(pane, idx, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Selects every entry in the active pane (`Ctrl+A`).
+    pub fn select_all_in_active_pane(&mut self, cx: &mut Context<Self>) {
+        let pane = self.active_pane;
+        let len = self.pane_entries(pane).len();
+        self.pane_selection_mut(pane).select_all(len);
+        self.sync_pane_selected_index(pane);
+        self.update_preview(cx);
+        cx.notify();
+    }
+
+    /// Returns the window-space bounding rectangle of `pane`'s scrollable file list area.
+    #[must_use]
+    pub fn pane_content_bounds(&self, pane: PaneId) -> Option<RectF32> {
+        if self.view_mode != ViewMode::Grid {
+            let bounds = self.pane_list_scroll(pane).bounds();
+            let w = f32::from(bounds.size.width);
+            let h = f32::from(bounds.size.height);
+            if w > 0.0 && h > 0.0 {
+                return Some(RectF32::from_origin_size(
+                    f32::from(bounds.origin.x),
+                    f32::from(bounds.origin.y),
+                    w,
+                    h,
+                ));
+            }
+        }
+        let layout = splitter::compute_workspace_layout(
+            self.viewport_size.0,
+            self.sidebar_visible,
+            self.sidebar_width,
+            self.dual_pane,
+            self.pane_split_ratio,
+            self.preview_visible,
+            self.preview_width,
+        );
+        let mut left = 0.0;
+        if self.sidebar_visible {
+            left += layout.sidebar_w + splitter::SPLITTER_WIDTH;
+        }
+        if self.preview_visible && self.preview_side == PreviewSide::Left {
+            left += layout.preview_w + splitter::SPLITTER_WIDTH;
+        }
+        let (pane_left, pane_w) = match pane {
+            PaneId::Primary => (left, layout.primary_w),
+            PaneId::Secondary => (
+                left + layout.primary_w + splitter::SPLITTER_WIDTH,
+                layout.secondary_w,
+            ),
+        };
+        // Top chrome: tab bar + nav bar + toolbar (~112px), bottom: status bar (30px).
+        let top = 112.0 + if self.dual_pane { 30.0 } else { 0.0 };
+        let bottom = (self.viewport_size.1 - 30.0).max(top + 1.0);
+        Some(RectF32 {
+            left: pane_left,
+            top,
+            right: pane_left + pane_w.max(1.0),
+            bottom,
+        })
+    }
+
+    /// Starts a potential marquee (rubber-band) selection drag on the empty pane area.
+    pub fn begin_marquee(
+        &mut self,
+        pane: PaneId,
+        ev: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.inline_rename.is_some() {
+            self.cancel_inline_rename(window, cx);
+        }
+        self.set_active_pane(pane, window, cx);
+        window.focus(self.pane_focus_handle(pane), cx);
+        let additive = ev.modifiers.control;
+        let base = if additive {
+            self.pane_selection(pane).indices().clone()
+        } else {
+            BTreeSet::new()
+        };
+        if !additive {
+            self.clear_pane_selection(pane);
+            self.update_preview(cx);
+        }
+        let origin = (f32::from(ev.position.x), f32::from(ev.position.y));
+        self.marquee = Some(MarqueeState::new(pane, origin, additive, base));
+        cx.notify();
+    }
+
+    /// Updates an active marquee drag and refreshes the pane's selection live.
+    pub fn update_marquee(&mut self, pointer: (f32, f32), cx: &mut Context<Self>) {
+        let Some(marquee) = &mut self.marquee else {
+            return;
+        };
+        if !marquee.update(pointer) {
+            return;
+        }
+        let pane = marquee.pane;
+        let rect = marquee.rect();
+        let additive = marquee.additive;
+        let base = marquee.base_selection.clone();
+
+        let Some(bounds) = self.pane_content_bounds(pane) else {
+            cx.notify();
+            return;
+        };
+        let entry_count = self.pane_entries(pane).len();
+        let hits = if self.view_mode == ViewMode::Grid {
+            let cols = file_pane::compute_grid_columns(bounds.width());
+            marquee_hit_test_grid(rect, bounds, 0.0, cols, 134.0, 10.0, 8.0, entry_count)
+        } else {
+            let scroll_offset = self.pane_list_offset(pane);
+            marquee_hit_test_details(rect, bounds, scroll_offset, DETAILS_ROW_HEIGHT, entry_count)
+        };
+        self.pane_selection_mut(pane)
+            .apply_marquee(hits, &base, additive);
+        self.sync_pane_selected_index(pane);
+        self.update_preview(cx);
+        cx.notify();
+    }
+
+    /// Ends any active marquee drag.
+    pub fn end_marquee(&mut self, cx: &mut Context<Self>) {
+        if self.marquee.take().is_some() {
+            cx.notify();
+        }
     }
 
     pub fn activate_entry(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -3359,7 +3661,7 @@ impl OnyxExplorer {
             return;
         };
         self.pending_selection = None;
-        self.selected_index = Some(index);
+        self.set_single_selection(PaneId::Primary, index);
         if let Some(tab) = self.tabs.active_tab_mut() {
             tab.selected_paths = vec![path];
         }
@@ -3383,7 +3685,7 @@ impl OnyxExplorer {
             return;
         };
         self.secondary.pending_selection = None;
-        self.secondary.selected_index = Some(index);
+        self.set_single_selection(PaneId::Secondary, index);
         if self.view_mode != ViewMode::Grid {
             self.reveal_list_row(PaneId::Secondary, index, cx);
         }
@@ -3406,10 +3708,7 @@ impl OnyxExplorer {
                 }
             }
         };
-        match pane {
-            PaneId::Primary => self.selected_index = Some(next),
-            PaneId::Secondary => self.secondary.selected_index = Some(next),
-        }
+        self.set_single_selection(pane, next);
         if self.view_mode != ViewMode::Grid {
             self.reveal_list_row(pane, next, cx);
         }
@@ -3460,10 +3759,7 @@ impl OnyxExplorer {
         let Some(idx) = matched else {
             return false;
         };
-        match pane {
-            PaneId::Primary => self.selected_index = Some(idx),
-            PaneId::Secondary => self.secondary.selected_index = Some(idx),
-        }
+        self.set_single_selection(pane, idx);
         if self.view_mode != ViewMode::Grid {
             self.reveal_list_row(pane, idx, cx);
         }
@@ -4013,31 +4309,113 @@ impl OnyxExplorer {
         );
     }
 
+    /// Whether the given entry in `pane` is currently being renamed inline.
+    #[must_use]
+    pub fn is_inline_renaming(&self, pane: PaneId, path: &Path) -> bool {
+        self.inline_rename
+            .as_ref()
+            .is_some_and(|r| r.pane == pane && same_path(&r.path, path))
+    }
+
     pub fn prompt_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(entry) = self.selected_entry().cloned() else {
+        if self.refuse_in_recycle_bin("Renaming recycled items", cx) {
+            return;
+        }
+        if self.active_operation.is_some() {
+            self.status_message = Some("A file operation is already in progress.".to_string());
+            cx.notify();
+            return;
+        }
+        let pane = self.active_pane;
+        let Some(idx) = self.pane_selected_index(pane) else {
             return;
         };
-        self.open_prompt(
-            PromptKind::Rename(entry.path),
-            "Rename",
-            "Enter a new name.",
-            &entry.name,
-            "Rename",
-            window,
+        let Some(entry) = self.pane_entries(pane).get(idx).cloned() else {
+            return;
+        };
+        if self.view_mode == ViewMode::Grid {
+            self.open_prompt(
+                PromptKind::Rename(entry.path),
+                "Rename",
+                "Enter a new name.",
+                &entry.name,
+                "Rename",
+                window,
+                cx,
+            );
+            return;
+        }
+
+        let name = entry.name.clone();
+        let stem_range = filename_stem_range(&name, entry.is_dir());
+        self.inline_rename = Some(InlineRenameState {
+            pane,
+            path: entry.path,
+            original_name: name.clone(),
+        });
+        self.reveal_list_row(pane, idx, cx);
+        self.inline_rename_input.update(cx, |input, cx| {
+            input.set_value(name, window, cx);
+            input.focus(window, cx);
+            input.set_selected_range(stem_range, cx);
+        });
+        cx.notify();
+    }
+
+    /// Commits the active inline rename via `onyx-operations::rename_item`.
+    pub fn commit_inline_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rename) = self.inline_rename.take() else {
+            return;
+        };
+        let new_name = self.inline_rename_input.read(cx).value().trim().to_string();
+        self.focus_active_pane(window, cx);
+        if new_name.is_empty() || new_name == rename.original_name {
+            cx.notify();
+            return;
+        }
+        if let Some(parent) = rename.path.parent() {
+            let renamed_path = parent.join(&new_name);
+            match rename.pane {
+                PaneId::Primary => self.pending_selection = Some(renamed_path),
+                PaneId::Secondary => self.secondary.pending_selection = Some(renamed_path),
+            }
+        }
+        self.start_operation(
+            FileOperation::Rename {
+                source: rename.path,
+                name: new_name,
+            },
             cx,
         );
     }
 
+    /// Cancels any active inline rename and returns keyboard focus to the file pane.
+    pub fn cancel_inline_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.inline_rename.take().is_some() {
+            self.focus_active_pane(window, cx);
+            cx.notify();
+        }
+    }
+
     pub fn prompt_permanent_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(entry) = self.selected_entry().cloned() else {
+        let selected: Vec<FileEntry> = self.selected_entries().into_iter().cloned().collect();
+        if selected.is_empty() {
             return;
+        }
+        let message = if selected.len() == 1 {
+            format!(
+                "Permanently delete \"{}\"? This cannot be undone.",
+                selected[0].name
+            )
+        } else {
+            format!(
+                "Permanently delete {} selected items? This cannot be undone.",
+                selected.len()
+            )
         };
-        let message = format!(
-            "Permanently delete \"{}\"? This cannot be undone.",
-            entry.name
-        );
+        let paths: Vec<PathBuf> = selected.into_iter().map(|entry| entry.path).collect();
         self.open_prompt(
-            PromptKind::PermanentDelete(entry.path),
+            PromptKind::PermanentDelete(paths),
             "Permanently delete?",
             &message,
             "",
@@ -4137,8 +4515,8 @@ impl OnyxExplorer {
                 source,
                 name: input_text,
             },
-            PromptKind::PermanentDelete(path) => {
-                FileOperation::PermanentDelete(PermanentDeleteRequest::confirmed(vec![path]))
+            PromptKind::PermanentDelete(paths) => {
+                FileOperation::PermanentDelete(PermanentDeleteRequest::confirmed(paths))
             }
             PromptKind::EmptyRecycleBin => FileOperation::EmptyRecycleBin,
         };
@@ -4154,13 +4532,14 @@ impl OnyxExplorer {
     }
 
     fn write_selection_to_clipboard(&mut self, cut: bool, cx: &mut Context<Self>) {
-        let Some(entry) = self.selected_entry().cloned() else {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
             return;
-        };
+        }
         self.can_paste = true;
         let _ = self
             .clipboard_tx
-            .send(ClipboardCommand::Write((vec![entry.path], cut)));
+            .send(ClipboardCommand::Write((paths, cut)));
         cx.notify();
     }
 
@@ -4176,12 +4555,13 @@ impl OnyxExplorer {
         self.start_operation(FileOperation::Duplicate(entry.path), cx);
     }
 
-    /// Moves the selected item to the Windows Recycle Bin (default safe delete).
+    /// Moves the selected item(s) to the Windows Recycle Bin (default safe delete).
     pub fn recycle_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(entry) = self.selected_entry().cloned() else {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
             return;
-        };
-        self.start_operation(FileOperation::Recycle(entry.path), cx);
+        }
+        self.start_operation(FileOperation::Recycle(paths), cx);
     }
 
     pub fn undo(&mut self, cx: &mut Context<Self>) {
@@ -4442,7 +4822,9 @@ impl OnyxExplorer {
             return;
         };
         let is_dir = entry.is_dir();
-        self.select_entry_in(pane, idx, cx);
+        if !self.pane_is_selected(pane, idx) {
+            self.select_entry_in(pane, idx, cx);
+        }
         self.context_menu = Some(ContextMenuState::new(
             ContextMenuTarget::Item {
                 index: idx,
@@ -4522,19 +4904,11 @@ impl OnyxExplorer {
             (ContextMenuAction::OpenWith, ContextMenuTarget::Item { path, .. }) => {
                 self.spawn_shell_task(path, open_with_dialog, cx);
             }
-            (ContextMenuAction::Cut, ContextMenuTarget::Item { path, .. }) => {
-                self.can_paste = true;
-                let _ = self
-                    .clipboard_tx
-                    .send(ClipboardCommand::Write((vec![path], true)));
-                cx.notify();
+            (ContextMenuAction::Cut, ContextMenuTarget::Item { .. }) => {
+                self.cut_selection(cx);
             }
-            (ContextMenuAction::Copy, ContextMenuTarget::Item { path, .. }) => {
-                self.can_paste = true;
-                let _ = self
-                    .clipboard_tx
-                    .send(ClipboardCommand::Write((vec![path], false)));
-                cx.notify();
+            (ContextMenuAction::Copy, ContextMenuTarget::Item { .. }) => {
+                self.copy_selection(cx);
             }
             (ContextMenuAction::Paste, ContextMenuTarget::Item { path, is_dir, .. }) => {
                 let destination = if is_dir {
@@ -4553,20 +4927,8 @@ impl OnyxExplorer {
                 self.status_message = Some("Copied path to clipboard.".to_string());
                 cx.notify();
             }
-            (ContextMenuAction::Rename, ContextMenuTarget::Item { path, .. }) => {
-                let initial = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                self.open_prompt(
-                    PromptKind::Rename(path),
-                    "Rename",
-                    "Enter a new name.",
-                    &initial,
-                    "Rename",
-                    window,
-                    cx,
-                );
+            (ContextMenuAction::Rename, ContextMenuTarget::Item { .. }) => {
+                self.prompt_rename(window, cx);
             }
             (ContextMenuAction::Duplicate, ContextMenuTarget::Item { path, .. }) => {
                 self.start_operation(FileOperation::Duplicate(path), cx);
@@ -4598,8 +4960,8 @@ impl OnyxExplorer {
             (ContextMenuAction::Properties, ContextMenuTarget::Background { dir_path }) => {
                 self.spawn_shell_task(dir_path, show_properties_dialog, cx);
             }
-            (ContextMenuAction::RecycleBin, ContextMenuTarget::Item { path, .. }) => {
-                self.start_operation(FileOperation::Recycle(path), cx);
+            (ContextMenuAction::RecycleBin, ContextMenuTarget::Item { .. }) => {
+                self.recycle_selection(cx);
             }
             (ContextMenuAction::Restore, ContextMenuTarget::RecycleItem { index, .. }) => {
                 self.restore_recycle_item_at(index, cx);
@@ -4824,19 +5186,23 @@ impl OnyxExplorer {
         );
     }
 
-    /// Compresses the selected item into a ZIP next to it.
+    /// Compresses the selected item(s) into a ZIP next to them.
     pub fn compress_selection_to_zip(&mut self, cx: &mut Context<Self>) {
-        let Some(entry) = self.selected_entry() else {
+        let selected = self.selected_entries();
+        if selected.is_empty() {
             self.status_message = Some("Select a file or folder to compress.".to_string());
             cx.notify();
             return;
-        };
-        if entry_is_archive(entry) {
+        }
+        if selected.len() == 1 && entry_is_archive(selected[0]) {
             self.status_message = Some("Archives cannot be compressed again.".to_string());
             cx.notify();
             return;
         }
-        let sources = vec![entry.path.clone()];
+        let sources: Vec<PathBuf> = selected
+            .into_iter()
+            .map(|entry| entry.path.clone())
+            .collect();
         let current_dir = self.active_directory();
         self.start_operation(
             FileOperation::CreateArchive {
@@ -4942,7 +5308,14 @@ impl OnyxExplorer {
             || source.display().to_string(),
             |name| name.to_string_lossy().into_owned(),
         );
-        self.drag = Some(DragState::new(source, label, is_dir, origin));
+        let selected_paths = self.selected_paths();
+        let sources =
+            if selected_paths.len() > 1 && selected_paths.iter().any(|p| same_path(p, &source)) {
+                selected_paths
+            } else {
+                vec![source.clone()]
+            };
+        self.drag = Some(DragState::new(source, label, is_dir, origin).with_sources(sources));
         cx.notify();
     }
 
@@ -4976,13 +5349,24 @@ impl OnyxExplorer {
         }
     }
 
-    /// Completes the drag: copies or moves the source into the hovered folder.
+    /// Completes the drag: copies or moves the source(s) into the hovered folder.
     pub fn finish_drag(&mut self, cx: &mut Context<Self>) {
+        let pending_collapse = self.pending_collapse_click.take();
         let Some(drag) = self.drag.take() else {
+            if let Some((pane, idx)) = pending_collapse {
+                self.set_single_selection(pane, idx);
+                self.update_preview(cx);
+                cx.notify();
+            }
             return;
         };
         cx.notify();
         if !drag.armed {
+            if let Some((pane, idx)) = pending_collapse {
+                self.set_single_selection(pane, idx);
+                self.update_preview(cx);
+                cx.notify();
+            }
             return;
         }
         let Some(target) = drag.hover else {
@@ -4992,28 +5376,43 @@ impl OnyxExplorer {
         };
         let destination_dir = match &target {
             DropTarget::Directory(path) => path.clone(),
-            DropTarget::Pane(pane) => self.pane_path(*pane).to_path_buf(),
-        };
-        match validate_drop(&drag.source, &destination_dir) {
-            Ok(destination) => {
-                let operation = if drag.copy {
-                    FileOperation::CopyItems {
-                        sources: vec![drag.source],
-                        destination,
-                    }
-                } else {
-                    FileOperation::MoveItems {
-                        sources: vec![drag.source],
-                        destination,
-                    }
-                };
-                self.start_operation(operation, cx);
+            DropTarget::Pane(pane) | DropTarget::PaneRow { pane, .. } => {
+                self.pane_path(*pane).to_path_buf()
             }
-            Err(reject) => {
+        };
+        let mut valid_sources = Vec::with_capacity(drag.sources.len());
+        let mut last_reject = None;
+        for source in drag.sources {
+            match validate_drop(&source, &destination_dir) {
+                Ok(_) => valid_sources.push(source),
+                Err(reject) => last_reject = Some(reject),
+            }
+        }
+        if valid_sources.is_empty() {
+            if let Some(reject) = last_reject {
                 self.status_message = Some(reject.message().to_string());
                 cx.notify();
             }
+            return;
         }
+        let operation = if drag.copy {
+            FileOperation::CopyItems {
+                sources: valid_sources,
+                destination: destination_dir,
+            }
+        } else {
+            FileOperation::MoveItems {
+                sources: valid_sources,
+                destination: destination_dir,
+            }
+        };
+        self.start_operation(operation, cx);
+    }
+
+    /// Whether an internal drag is currently armed (pointer passed drag threshold).
+    #[must_use]
+    pub fn is_drag_armed(&self) -> bool {
+        self.drag.as_ref().is_some_and(|drag| drag.armed)
     }
 
     /// Whether `path` is the folder currently highlighted as a drop target.
@@ -5028,12 +5427,24 @@ impl OnyxExplorer {
         })
     }
 
+    /// Whether a non-folder Details row is currently hovered as an insertion-line drop target.
+    #[must_use]
+    pub fn drag_hover_is_pane_row(&self, pane: PaneId, row_index: usize) -> bool {
+        self.drag.as_ref().is_some_and(|drag| {
+            drag.armed && drag.hover.as_ref() == Some(&DropTarget::PaneRow { pane, row_index })
+        })
+    }
+
     /// Whether the given pane background is the highlighted drop target.
     #[must_use]
     pub fn drag_hover_is_pane(&self, pane: PaneId) -> bool {
-        self.drag
-            .as_ref()
-            .is_some_and(|drag| drag.armed && drag.hover.as_ref() == Some(&DropTarget::Pane(pane)))
+        self.drag.as_ref().is_some_and(|drag| {
+            drag.armed
+                && matches!(
+                    drag.hover.as_ref(),
+                    Some(DropTarget::Pane(p)) | Some(DropTarget::PaneRow { pane: p, .. }) if *p == pane
+                )
+        })
     }
 
     // ---- External drag & drop (OLE `DoDragDrop` out of the window) ----
@@ -5279,7 +5690,7 @@ impl OnyxExplorer {
                 // the target and is removed through the operations engine, which
                 // never deletes permanently.
                 if source.exists() {
-                    self.start_operation(FileOperation::Recycle(source.to_path_buf()), cx);
+                    self.start_operation(FileOperation::Recycle(vec![source.to_path_buf()]), cx);
                 } else {
                     self.refresh_affected_paths(&affected, cx);
                 }
@@ -5866,6 +6277,20 @@ impl OnyxExplorer {
             return;
         }
 
+        if self.marquee.is_some() && key == "escape" {
+            self.end_marquee(cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.inline_rename.is_some() {
+            if key == "escape" {
+                self.cancel_inline_rename(window, cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
+
         if self.settings_open {
             if key == "escape" || (mods.control && key == ",") {
                 self.close_settings(window, cx);
@@ -6041,6 +6466,11 @@ impl OnyxExplorer {
         }
         if !mods.shift && !mods.control && !mods.alt && key == "delete" {
             self.recycle_selection(cx);
+            cx.stop_propagation();
+            return;
+        }
+        if mods.control && !mods.shift && !mods.alt && key == "a" {
+            self.select_all_in_active_pane(cx);
             cx.stop_propagation();
             return;
         }
@@ -6252,6 +6682,12 @@ impl Render for OnyxExplorer {
                     } else {
                         explorer.end_splitter_drag(cx);
                     }
+                } else if explorer.marquee.is_some() {
+                    if ev.pressed_button == Some(MouseButton::Left) {
+                        explorer.update_marquee(pointer, cx);
+                    } else {
+                        explorer.end_marquee(cx);
+                    }
                 } else if explorer.drag.is_some() {
                     if ev.pressed_button == Some(MouseButton::Left) {
                         explorer.update_drag(pointer, ev.modifiers.control, cx);
@@ -6268,6 +6704,7 @@ impl Render for OnyxExplorer {
                 MouseButton::Left,
                 cx.listener(|explorer, _: &MouseUpEvent, _, cx| {
                     explorer.end_splitter_drag(cx);
+                    explorer.end_marquee(cx);
                     explorer.finish_drag(cx);
                 }),
             )
@@ -6275,6 +6712,7 @@ impl Render for OnyxExplorer {
                 MouseButton::Left,
                 cx.listener(|explorer, _: &MouseUpEvent, _, cx| {
                     explorer.end_splitter_drag(cx);
+                    explorer.end_marquee(cx);
                     explorer.finish_drag(cx);
                 }),
             )
@@ -6325,6 +6763,9 @@ impl Render for OnyxExplorer {
         if let Some(settings_element) = settings_overlay::render_settings_overlay(self, window, cx)
         {
             root = root.child(settings_element);
+        }
+        if let Some(marquee_box) = selection::render_marquee_overlay(self) {
+            root = root.child(marquee_box);
         }
         if let Some(ghost) = drag_drop::render_drag_ghost(self) {
             root = root.child(ghost);
@@ -7007,7 +7448,7 @@ mod tests {
         assert!(!can_restore_recycle_item(&empty_shell));
 
         assert!(PromptKind::EmptyRecycleBin.is_danger());
-        assert!(PromptKind::PermanentDelete(PathBuf::from("a.txt")).is_danger());
+        assert!(PromptKind::PermanentDelete(vec![PathBuf::from("a.txt")]).is_danger());
         assert!(!PromptKind::NewFolder(PathBuf::from("C:\\Temp")).is_danger());
         assert!(!PromptKind::Rename(PathBuf::from("C:\\Temp\\a.txt")).is_danger());
 

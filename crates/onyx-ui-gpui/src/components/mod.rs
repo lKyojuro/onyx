@@ -9,6 +9,7 @@ pub mod file_pane;
 pub mod nav_bar;
 pub mod overlays;
 pub mod preview_pane;
+pub mod selection;
 pub mod settings_overlay;
 pub mod sidebar;
 pub mod smooth_scroll;

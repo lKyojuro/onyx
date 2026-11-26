@@ -10,10 +10,13 @@ use crate::explorer::{OnyxExplorer, PaneId};
 use crate::icons::{OnyxGlyph, entry_icon_key, render_glyph};
 use crate::theme::{FONT_MD, FONT_SM, FONT_XS, OnyxTheme, RADIUS_LG, RADIUS_MD, RADIUS_SM};
 use gpui_kit::{
-    Context, ExternalPaths, FontWeight, ImageSource, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ObjectFit, ParentElement, Pixels, RenderImage, Role, ScrollEvent,
-    StatefulInteractiveElement, Styled, StyledImage, div, img, prelude::FluentBuilder, px,
-    relative, uniform_list,
+    Context, Entity, ExternalPaths, FontWeight, ImageSource, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Pixels,
+    RenderImage, Role, ScrollEvent, StatefulInteractiveElement, Styled, StyledImage,
+    component::input::{Input, InputState},
+    div, img,
+    prelude::FluentBuilder,
+    px, relative, uniform_list,
 };
 use onyx_core::{
     FileEntry, GroupByMode, SortColumn, SortDirection, ViewMode, format_bytes, format_timestamp,
@@ -434,8 +437,8 @@ pub fn render_file_pane(
                     for col_idx in 0..grid_cols {
                         let item_idx = row_idx * grid_cols + col_idx;
                         if let Some(entry) = explorer.pane_entries(pane_id).get(item_idx) {
-                            let is_selected =
-                                explorer.pane_selected_index(pane_id) == Some(item_idx);
+                            let is_selected = explorer.pane_is_selected(pane_id, item_idx);
+                            let is_lead = explorer.pane_selected_index(pane_id) == Some(item_idx);
                             let is_drop_hover = explorer.drag_hover_is(&entry.path);
                             let native_icon =
                                 explorer.icons.get(&entry_icon_key(entry)).map(Arc::clone);
@@ -447,6 +450,7 @@ pub fn render_file_pane(
                                 total,
                                 entry,
                                 is_selected,
+                                is_lead,
                                 is_drop_hover,
                                 native_icon,
                                 thumbnail,
@@ -503,8 +507,13 @@ pub fn render_file_pane(
                 let Some(entry) = view.pane_entries(pane_id).get(idx) else {
                     continue;
                 };
-                let is_selected = view.pane_selected_index(pane_id) == Some(idx);
+                let is_selected = view.pane_is_selected(pane_id, idx);
+                let is_lead = view.pane_selected_index(pane_id) == Some(idx);
                 let is_drop_hover = view.drag_hover_is(&entry.path);
+                let is_insert_line = !entry.is_dir() && view.drag_hover_is_pane_row(pane_id, idx);
+                let rename_input = view
+                    .is_inline_renaming(pane_id, &entry.path)
+                    .then(|| view.inline_rename_input.clone());
                 let native_icon = view.icons.get(&entry_icon_key(entry)).map(Arc::clone);
                 let (size_label, size_ratio) = view.entry_size_info_for(pane_id, entry);
                 els.push(
@@ -514,7 +523,10 @@ pub fn render_file_pane(
                         count,
                         entry,
                         is_selected,
+                        is_lead,
                         is_drop_hover,
+                        is_insert_line,
+                        rename_input,
                         native_icon,
                         size_label,
                         size_ratio,
@@ -631,8 +643,14 @@ pub fn render_file_pane(
                         let Some(entry) = view.pane_entries(pane_id).get(*idx) else {
                             continue;
                         };
-                        let is_selected = view.pane_selected_index(pane_id) == Some(*idx);
+                        let is_selected = view.pane_is_selected(pane_id, *idx);
+                        let is_lead = view.pane_selected_index(pane_id) == Some(*idx);
                         let is_drop_hover = view.drag_hover_is(&entry.path);
+                        let is_insert_line =
+                            !entry.is_dir() && view.drag_hover_is_pane_row(pane_id, *idx);
+                        let rename_input = view
+                            .is_inline_renaming(pane_id, &entry.path)
+                            .then(|| view.inline_rename_input.clone());
                         let native_icon = view.icons.get(&entry_icon_key(entry)).map(Arc::clone);
                         let (size_label, size_ratio) = view.entry_size_info_for(pane_id, entry);
                         els.push(
@@ -642,7 +660,10 @@ pub fn render_file_pane(
                                 count,
                                 entry,
                                 is_selected,
+                                is_lead,
                                 is_drop_hover,
+                                is_insert_line,
+                                rename_input,
                                 native_icon,
                                 size_label,
                                 size_ratio,
@@ -701,6 +722,12 @@ pub fn render_file_pane(
             .flex_1()
             .min_h(px(0.0))
             .w_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |explorer, ev: &MouseDownEvent, window, cx| {
+                    explorer.begin_marquee(pane_id, ev, window, cx);
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |explorer, ev: &MouseDownEvent, window, cx| {
@@ -895,7 +922,10 @@ fn render_details_row(
     count: usize,
     entry: &FileEntry,
     is_selected: bool,
+    is_lead: bool,
     is_drop_hover: bool,
+    is_insert_line: bool,
+    rename_input: Option<Entity<InputState>>,
     native_icon: Option<Arc<RenderImage>>,
     size_label: String,
     size_ratio: f32,
@@ -906,6 +936,7 @@ fn render_details_row(
     cx: &mut Context<OnyxExplorer>,
 ) -> impl IntoElement + use<> {
     let is_dir = entry.is_dir();
+    let is_renaming = rename_input.is_some();
     let drag_path = entry.path.clone();
     let hover_path = entry.path.clone();
     let external_drop_path = entry.path.clone();
@@ -961,16 +992,19 @@ fn render_details_row(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |explorer, ev: &MouseDownEvent, window, cx| {
-                explorer.select_entry_in(pane_id, idx, cx);
-                explorer.begin_drag(
+                cx.stop_propagation();
+                if is_renaming {
+                    return;
+                }
+                explorer.handle_entry_mouse_down(
+                    pane_id,
+                    idx,
+                    ev,
                     drag_path.clone(),
                     is_dir,
-                    (f32::from(ev.position.x), f32::from(ev.position.y)),
+                    window,
                     cx,
                 );
-                if ev.click_count >= 2 {
-                    explorer.activate_entry_in(pane_id, idx, window, cx);
-                }
             }),
         )
         .on_mouse_down(
@@ -981,9 +1015,22 @@ fn render_details_row(
                 explorer.open_item_context_menu(idx, ev.position, window, cx);
             }),
         )
-        .on_mouse_move(cx.listener(move |explorer, _, _, cx| {
-            if is_dir {
-                explorer.set_drop_hover(DropTarget::Directory(hover_path.clone()), cx);
+        .on_mouse_move(cx.listener(move |explorer, ev: &MouseMoveEvent, _, cx| {
+            if explorer.is_drag_armed() {
+                let pointer = (f32::from(ev.position.x), f32::from(ev.position.y));
+                explorer.update_drag(pointer, ev.modifiers.control, cx);
+                if is_dir {
+                    explorer.set_drop_hover(DropTarget::Directory(hover_path.clone()), cx);
+                } else {
+                    explorer.set_drop_hover(
+                        DropTarget::PaneRow {
+                            pane: pane_id,
+                            row_index: idx,
+                        },
+                        cx,
+                    );
+                }
+                cx.stop_propagation();
             }
         }));
 
@@ -1015,18 +1062,51 @@ fn render_details_row(
         );
     }
 
-    let mut name_text = div()
-        .flex_1()
-        .min_w(px(0.0))
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .text_size(FONT_SM)
-        .text_color(theme.text_primary());
-    if is_selected {
-        name_text = name_text.font_weight(FontWeight::SEMIBOLD);
-    } else if is_dir {
-        name_text = name_text.font_weight(FontWeight::MEDIUM);
-    }
+    let name_content = if let Some(input_state) = rename_input {
+        div()
+            .flex_1()
+            .min_w(px(0.0))
+            .h(px(24.0))
+            .px(px(6.0))
+            .flex()
+            .items_center()
+            .rounded(RADIUS_SM)
+            .border_1()
+            .border_color(theme.border_focus())
+            .bg(theme.bg_input())
+            .text_size(FONT_SM)
+            .text_color(theme.text_primary())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_key_down(cx.listener(|explorer, ev: &KeyDownEvent, window, cx| {
+                if ev.keystroke.key.as_str() == "escape" {
+                    explorer.cancel_inline_rename(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                Input::new(&input_state)
+                    .appearance(false)
+                    .aria_label("Rename item")
+                    .accessibility_id("inline-rename-input"),
+            )
+            .into_any_element()
+    } else {
+        let mut name_text = div()
+            .flex_1()
+            .min_w(px(0.0))
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_size(FONT_SM)
+            .text_color(theme.text_primary());
+        if is_selected {
+            name_text = name_text.font_weight(FontWeight::SEMIBOLD);
+        } else if is_dir {
+            name_text = name_text.font_weight(FontWeight::MEDIUM);
+        }
+        name_text.child(entry.name.clone()).into_any_element()
+    };
 
     inner = inner.child(
         div()
@@ -1037,7 +1117,7 @@ fn render_details_row(
             .min_w(px(0.0))
             .gap(px(10.0))
             .child(entry_glyph(entry, native_icon, px(22.0), theme))
-            .child(name_text.child(entry.name.clone())),
+            .child(name_content),
     );
 
     if show_date_col {
@@ -1100,17 +1180,48 @@ fn render_details_row(
     );
 
     inner = inner.child(size_cell);
-    if is_selected {
+    if is_lead {
         inner = inner.aria_active_descendant();
     }
 
-    div()
+    let mut row_outer = div()
+        .relative()
         .flex()
         .items_center()
         .w_full()
         .h(px(35.0))
         .px(px(6.0))
-        .child(inner)
+        .child(inner);
+
+    if !is_dir {
+        row_outer = row_outer
+            .border_b_2()
+            .border_color(gpui_kit::transparent_black())
+            .drag_over::<ExternalPaths>(move |style, _, _, _| {
+                style.border_b_2().border_color(theme.accent_bright())
+            })
+            .on_drop(
+                cx.listener(move |explorer, paths: &ExternalPaths, _window, cx| {
+                    cx.stop_propagation();
+                    let dest = explorer.pane_path(pane_id).to_path_buf();
+                    explorer.handle_external_paths_drop_to(paths, dest, cx);
+                }),
+            );
+        if is_insert_line {
+            row_outer = row_outer.child(
+                div()
+                    .absolute()
+                    .left(px(8.0))
+                    .right(px(8.0))
+                    .bottom(px(0.0))
+                    .h(px(2.0))
+                    .rounded_full()
+                    .bg(theme.accent_bright()),
+            );
+        }
+    }
+
+    row_outer
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1120,6 +1231,7 @@ fn render_grid_card(
     count: usize,
     entry: &FileEntry,
     is_selected: bool,
+    is_lead: bool,
     is_drop_hover: bool,
     native_icon: Option<Arc<RenderImage>>,
     thumbnail: Option<Arc<RenderImage>>,
@@ -1163,7 +1275,7 @@ fn render_grid_card(
         .aria_selected(is_selected)
         .aria_position_in_set(idx + 1)
         .aria_size_of_set(count.max(1))
-        .when(is_selected, |card| card.aria_active_descendant())
+        .when(is_lead, |card| card.aria_active_descendant())
         .flex()
         .flex_col()
         .items_center()
@@ -1199,16 +1311,16 @@ fn render_grid_card(
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |explorer, ev: &MouseDownEvent, window, cx| {
-                explorer.select_entry_in(pane_id, idx, cx);
-                explorer.begin_drag(
+                cx.stop_propagation();
+                explorer.handle_entry_mouse_down(
+                    pane_id,
+                    idx,
+                    ev,
                     drag_path.clone(),
                     is_dir,
-                    (f32::from(ev.position.x), f32::from(ev.position.y)),
+                    window,
                     cx,
                 );
-                if ev.click_count >= 2 {
-                    explorer.activate_entry_in(pane_id, idx, window, cx);
-                }
             }),
         )
         .on_mouse_down(
@@ -1219,9 +1331,12 @@ fn render_grid_card(
                 explorer.open_item_context_menu(idx, ev.position, window, cx);
             }),
         )
-        .on_mouse_move(cx.listener(move |explorer, _, _, cx| {
-            if is_dir {
+        .on_mouse_move(cx.listener(move |explorer, ev: &MouseMoveEvent, _, cx| {
+            if is_dir && explorer.is_drag_armed() {
+                let pointer = (f32::from(ev.position.x), f32::from(ev.position.y));
+                explorer.update_drag(pointer, ev.modifiers.control, cx);
                 explorer.set_drop_hover(DropTarget::Directory(hover_path.clone()), cx);
+                cx.stop_propagation();
             }
         }))
         .when(is_dir, |card| {
