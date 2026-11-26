@@ -170,6 +170,24 @@ pub fn render_sidebar(
         }
     }
 
+    // Recycle Bin: a Shell namespace folder, so it sits beside the drives and not
+    // among the known folders that resolve to a filesystem path.
+    let recycle_row = sidebar_nav_row(
+        "sidebar-recycle-bin".into(),
+        "Recycle Bin",
+        OnyxGlyph::Trash,
+        None,
+        view.is_recycle_bin_mode(),
+        false,
+        theme,
+        cx.listener(|explorer, _, _, cx| {
+            explorer.open_recycle_bin(cx);
+        }),
+        None,
+        false,
+        None,
+    );
+
     // Drives section
     let drives_collapsed = view.is_sidebar_group_collapsed(SIDEBAR_GROUP_DRIVES);
     let mut drives_col = div().flex().flex_col().gap(px(6.0)).child(section_header(
@@ -361,6 +379,7 @@ pub fn render_sidebar(
             .child(home_row)
             .child(fav_col)
             .child(qa_col)
+            .child(recycle_row)
             .child(drives_col),
     )
 }

@@ -13,6 +13,7 @@ pub mod dwm;
 pub mod icons;
 pub mod known_folders;
 pub mod mouse_nav;
+pub mod recycle_bin;
 pub mod shell;
 pub mod theme;
 pub mod usn;
@@ -37,6 +38,7 @@ pub use known_folders::enumerate_known_folders;
 pub use mouse_nav::{
     MouseNavDirection, MouseNavHook, install_mouse_nav_hook, uninstall_mouse_nav_hook,
 };
+pub use recycle_bin::{RecycleBinItem, enumerate_recycle_bin};
 pub use shell::{
     TerminalProfile, launch_terminal, launch_terminal_with_profile, open_file, open_with_dialog,
     recycle_paths, show_properties_dialog,
