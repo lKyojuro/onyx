@@ -9,6 +9,7 @@ license.workspace = true
 image.workspace = true
 lru.workspace = true
 onyx-core.workspace = true
+onyx-windows.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

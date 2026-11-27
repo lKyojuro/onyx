@@ -60,18 +60,18 @@ impl Drop for IconGuard {
     }
 }
 
-struct BitmapGuard(HBITMAP);
+pub(crate) struct BitmapGuard(pub(crate) HBITMAP);
 
 impl Drop for BitmapGuard {
     fn drop(&mut self) {
         if !self.0.is_invalid() {
-            // SAFETY: `self.0` is an owned GDI bitmap handle returned by `GetIconInfo`.
+            // SAFETY: `self.0` is an owned GDI bitmap handle returned by `GetIconInfo` or `GetImage`.
             let _ = unsafe { DeleteObject(HGDIOBJ(self.0.0)) };
         }
     }
 }
 
-struct ScreenDcGuard(HDC);
+pub(crate) struct ScreenDcGuard(pub(crate) HDC);
 
 impl Drop for ScreenDcGuard {
     fn drop(&mut self) {
@@ -82,7 +82,7 @@ impl Drop for ScreenDcGuard {
     }
 }
 
-fn read_bitmap_bgra(hdc: HDC, hbm: HBITMAP, width: u32, height: u32) -> Option<Vec<u8>> {
+pub(crate) fn read_bitmap_bgra(hdc: HDC, hbm: HBITMAP, width: u32, height: u32) -> Option<Vec<u8>> {
     let pixel_count = (width as usize).checked_mul(height as usize)?;
     let byte_len = pixel_count.checked_mul(4)?;
     let mut buf = vec![0u8; byte_len];

@@ -405,7 +405,7 @@ pub fn render_prompt_dialog(
         );
     }
 
-    if show_input {
+    if show_input && let Some(prompt_input) = view.prompt_input.as_ref() {
         body = body.child(
             div()
                 .id("prompt-dialog-input-box")
@@ -432,7 +432,7 @@ pub fn render_prompt_dialog(
                         .text_size(FONT_MD)
                         .text_color(theme.text_primary())
                         .child(
-                            Input::new(&view.prompt_input)
+                            Input::new(prompt_input)
                                 .appearance(false)
                                 .aria_label(a11y_title.clone())
                                 .accessibility_id("prompt-name-input"),

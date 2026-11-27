@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 notify.workspace = true
 onyx-core.workspace = true
+onyx-windows.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

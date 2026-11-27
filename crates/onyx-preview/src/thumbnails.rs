@@ -12,7 +12,7 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::UNIX_EPOCH;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 /// Maximum untrusted image dimension accepted before rejecting decompression bombs.
@@ -100,6 +100,8 @@ struct FileSignature {
     modified_secs: i64,
     modified_nanos: u32,
     size: u64,
+    /// `true` when the file is an unhydrated cloud/offline placeholder.
+    is_cloud_placeholder: bool,
 }
 
 /// Decoded RGBA8 thumbnail buffer with pixel dimensions.
@@ -134,9 +136,9 @@ impl Default for ThumbnailConfig {
     }
 }
 
-/// Returns `true` if `path` has a supported raster image extension for thumbnail generation.
+/// Returns `true` if `path` has an extension this crate can decode in-process with the `image` crate.
 #[must_use]
-pub fn is_thumbnail_supported(path: &Path) -> bool {
+pub fn is_raster_thumbnail_supported(path: &Path) -> bool {
     let Some(ext) = path
         .extension()
         .and_then(|e| e.to_str())
@@ -148,6 +150,85 @@ pub fn is_thumbnail_supported(path: &Path) -> bool {
         ext.as_str(),
         "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "ico" | "tif" | "tiff"
     )
+}
+
+/// Returns `true` if `path` has a non-raster extension that Windows Shell thumbnail handlers
+/// (or third-party ones) can serve: videos, documents, vector/RAW images, fonts, and 3D models.
+#[must_use]
+pub fn is_shell_thumbnail_supported(path: &Path) -> bool {
+    let Some(ext) = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return false;
+    };
+    matches!(
+        ext.as_str(),
+        // Videos
+        "mp4"
+            | "mkv"
+            | "avi"
+            | "mov"
+            | "wmv"
+            | "webm"
+            | "m4v"
+            | "mpg"
+            | "mpeg"
+            | "ts"
+            | "mts"
+            | "flv"
+            | "3gp"
+            // Documents
+            | "pdf"
+            | "docx"
+            | "doc"
+            | "xlsx"
+            | "xls"
+            | "pptx"
+            | "ppt"
+            | "odt"
+            | "ods"
+            | "odp"
+            | "rtf"
+            | "epub"
+            | "xps"
+            // Vector / RAW / modern images
+            | "svg"
+            | "heic"
+            | "heif"
+            | "avif"
+            | "jxl"
+            | "psd"
+            | "ai"
+            | "eps"
+            | "raw"
+            | "cr2"
+            | "cr3"
+            | "nef"
+            | "arw"
+            | "dng"
+            | "orf"
+            | "rw2"
+            | "raf"
+            | "pef"
+            | "srw"
+            // Fonts / 3D
+            | "ttf"
+            | "otf"
+            | "glb"
+            | "gltf"
+            | "stl"
+            | "obj"
+            | "3mf"
+    )
+}
+
+/// Returns `true` if `path` is eligible for thumbnail generation, either in-process (raster) or
+/// through the Windows Shell.
+#[must_use]
+pub fn is_thumbnail_supported(path: &Path) -> bool {
+    is_raster_thumbnail_supported(path) || is_shell_thumbnail_supported(path)
 }
 
 #[derive(Debug)]
@@ -368,7 +449,8 @@ impl ThumbnailEngine {
             });
         }
 
-        if !is_thumbnail_supported(&path) {
+        let is_raster = is_raster_thumbnail_supported(&path);
+        if !is_raster && !is_shell_thumbnail_supported(&path) {
             return Err(OnyxError::Preview {
                 message: format!("Unsupported thumbnail extension for '{}'", path.display()),
             });
@@ -377,14 +459,28 @@ impl ThumbnailEngine {
         let ext_path = to_extended_length_path(&path);
         let sig = read_file_signature(&path, &ext_path).await?;
 
-        if sig.size > self.config.max_source_file_bytes {
-            return Err(OnyxError::Preview {
-                message: format!(
-                    "Image size ({}) exceeds thumbnail limit ({})",
-                    format_bytes(sig.size),
-                    format_bytes(self.config.max_source_file_bytes)
-                ),
-            });
+        // The size budget and the placeholder guard protect the in-process `image` decoder only.
+        // Videos and documents routed through the Shell are routinely larger than 25 MiB, and the
+        // Shell path never hydrates placeholders (`SIIGBF_INCACHEONLY`).
+        if is_raster {
+            if sig.is_cloud_placeholder {
+                return Err(OnyxError::Preview {
+                    message: format!(
+                        "Skipping unhydrated cloud placeholder file '{}'",
+                        path.display()
+                    ),
+                });
+            }
+
+            if sig.size > self.config.max_source_file_bytes {
+                return Err(OnyxError::Preview {
+                    message: format!(
+                        "Image size ({}) exceeds thumbnail limit ({})",
+                        format_bytes(sig.size),
+                        format_bytes(self.config.max_source_file_bytes)
+                    ),
+                });
+            }
         }
 
         let key = ThumbnailKey::new(
@@ -403,17 +499,7 @@ impl ThumbnailEngine {
             return Err(OnyxError::Cancelled);
         }
 
-        let permit = tokio::select! {
-            biased;
-            () = cancel.cancelled() => {
-                return Err(OnyxError::Cancelled);
-            }
-            res = Arc::clone(&self.semaphore).acquire_owned() => {
-                res.map_err(|_| OnyxError::Preview {
-                    message: "Thumbnail concurrency semaphore closed".to_string(),
-                })?
-            }
-        };
+        let permit = self.acquire_permit(&cancel).await?;
 
         if cancel.is_cancelled() {
             drop(permit);
@@ -426,29 +512,38 @@ impl ThumbnailEngine {
             return Ok(cached);
         }
 
-        let max_source_bytes = self.config.max_source_file_bytes;
-        let worker_cancel = cancel.clone();
-        let decode_path = ext_path;
-
-        let join_result = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            decode_thumbnail_blocking(
-                &decode_path,
-                sig.size,
-                max_source_bytes,
-                target_px,
-                &worker_cancel,
-            )
-        })
-        .await;
-
-        let thumbnail = match join_result {
-            Ok(Ok(img)) => img,
-            Ok(Err(err)) => return Err(err),
-            Err(join_err) => {
-                return Err(OnyxError::Preview {
-                    message: format!("Thumbnail worker task failed: {join_err}"),
-                });
+        let thumbnail = if is_raster {
+            match self
+                .decode_raster_thumbnail(permit, ext_path, sig.size, target_px, cancel.clone())
+                .await
+            {
+                Ok(image) => image,
+                Err(err) => {
+                    // Formats that the `image` crate cannot decode may still have a Shell handler.
+                    // Placeholders and oversized files were rejected above, so this stays cheap.
+                    let fallback = if matches!(err, OnyxError::Cancelled) {
+                        Ok(None)
+                    } else {
+                        self.shell_thumbnail(&path, target_px, &cancel).await
+                    };
+                    match fallback {
+                        Ok(Some(image)) => image,
+                        Ok(None) | Err(_) => return Err(err),
+                    }
+                }
+            }
+        } else {
+            drop(permit);
+            match self.shell_thumbnail(&path, target_px, &cancel).await? {
+                Some(image) => image,
+                None => {
+                    return Err(OnyxError::Preview {
+                        message: format!(
+                            "Windows Shell produced no thumbnail for '{}'",
+                            path.display()
+                        ),
+                    });
+                }
             }
         };
 
@@ -465,6 +560,82 @@ impl ThumbnailEngine {
         }
 
         Ok(thumbnail)
+    }
+
+    async fn acquire_permit(&self, cancel: &CancellationToken) -> OnyxResult<OwnedSemaphorePermit> {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => Err(OnyxError::Cancelled),
+            res = Arc::clone(&self.semaphore).acquire_owned() => {
+                res.map_err(|_| OnyxError::Preview {
+                    message: "Thumbnail concurrency semaphore closed".to_string(),
+                })
+            }
+        }
+    }
+
+    /// Decodes a raster image on the blocking pool while holding `permit` for the decode's lifetime.
+    async fn decode_raster_thumbnail(
+        &self,
+        permit: OwnedSemaphorePermit,
+        ext_path: PathBuf,
+        file_size: u64,
+        target_px: u32,
+        cancel: CancellationToken,
+    ) -> OnyxResult<ThumbnailImage> {
+        let max_source_bytes = self.config.max_source_file_bytes;
+        let worker_cancel = cancel.clone();
+
+        let join_result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            decode_thumbnail_blocking(
+                &ext_path,
+                file_size,
+                max_source_bytes,
+                target_px,
+                &worker_cancel,
+            )
+        })
+        .await;
+
+        match join_result {
+            Ok(result) => result,
+            Err(join_err) => Err(OnyxError::Preview {
+                message: format!("Thumbnail worker task failed: {join_err}"),
+            }),
+        }
+    }
+
+    /// Extracts a thumbnail through the Windows Shell on the blocking pool, bounded by `permit`.
+    async fn shell_thumbnail(
+        &self,
+        path: &Path,
+        target_px: u32,
+        cancel: &CancellationToken,
+    ) -> OnyxResult<Option<ThumbnailImage>> {
+        if cancel.is_cancelled() {
+            return Err(OnyxError::Cancelled);
+        }
+
+        let permit = self.acquire_permit(cancel).await?;
+        let owned_path = path.to_path_buf();
+
+        let join_result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            extract_shell_thumbnail_image(&owned_path, target_px)
+        })
+        .await;
+
+        if cancel.is_cancelled() {
+            return Err(OnyxError::Cancelled);
+        }
+
+        match join_result {
+            Ok(result) => result,
+            Err(join_err) => Err(OnyxError::Preview {
+                message: format!("Shell thumbnail worker task failed: {join_err}"),
+            }),
+        }
     }
 }
 
@@ -488,18 +659,16 @@ async fn read_file_signature(original_path: &Path, ext_path: &Path) -> OnyxResul
 }
 
 fn parse_file_signature(original_path: &Path, meta: &Metadata) -> OnyxResult<FileSignature> {
+    // Cloud placeholder detection is recorded, not enforced: Shell-routed formats can still be
+    // thumbnailed from the Windows thumbnail cache (`SIIGBF_INCACHEONLY`). Only the in-process
+    // `image` decoder must refuse to hydrate a placeholder.
     #[cfg(windows)]
-    {
+    let is_cloud_placeholder = {
         use std::os::windows::fs::MetadataExt;
-        if is_cloud_placeholder_attributes(meta.file_attributes()) {
-            return Err(OnyxError::Preview {
-                message: format!(
-                    "Skipping unhydrated cloud placeholder file '{}'",
-                    original_path.display()
-                ),
-            });
-        }
-    }
+        is_cloud_placeholder_attributes(meta.file_attributes())
+    };
+    #[cfg(not(windows))]
+    let is_cloud_placeholder = false;
 
     if !meta.is_file() {
         return Err(OnyxError::Preview {
@@ -527,7 +696,34 @@ fn parse_file_signature(original_path: &Path, meta: &Metadata) -> OnyxResult<Fil
         modified_secs,
         modified_nanos,
         size: meta.len(),
+        is_cloud_placeholder,
     })
+}
+
+/// Extracts a thumbnail through the Windows Shell on the calling blocking worker.
+///
+/// Returns `Ok(None)` when the Shell has no thumbnail handler result for `path`.
+#[cfg(windows)]
+fn extract_shell_thumbnail_image(
+    path: &Path,
+    target_px: u32,
+) -> OnyxResult<Option<ThumbnailImage>> {
+    onyx_windows::extract_shell_thumbnail_rgba(path, target_px).map(|decoded| {
+        decoded.map(|thumbnail| ThumbnailImage {
+            width: thumbnail.width,
+            height: thumbnail.height,
+            rgba: thumbnail.rgba,
+        })
+    })
+}
+
+/// Shell thumbnail extraction is Windows-only; other targets have no handler to ask.
+#[cfg(not(windows))]
+fn extract_shell_thumbnail_image(
+    _path: &Path,
+    _target_px: u32,
+) -> OnyxResult<Option<ThumbnailImage>> {
+    Ok(None)
 }
 
 fn decode_thumbnail_blocking(
@@ -637,12 +833,114 @@ mod tests {
                 "expected {ext} to be supported"
             );
         }
-        for unsupported in ["a.txt", "a.rs", "a.pdf", "a.mp4", "no_ext"] {
+        for ext in ["a.pdf", "a.mp4", "a.svg", "a.cr2"] {
+            assert!(
+                is_thumbnail_supported(Path::new(ext)),
+                "expected Shell-thumbnailable {ext} to be supported"
+            );
+        }
+        for unsupported in ["a.txt", "a.rs", "no_ext"] {
             assert!(
                 !is_thumbnail_supported(Path::new(unsupported)),
                 "expected {unsupported} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn raster_and_shell_predicates_are_disjoint() {
+        for ext in [
+            "a.png", "a.jpg", "a.jpeg", "a.webp", "a.gif", "a.bmp", "a.ico", "a.tif", "a.tiff",
+        ] {
+            assert!(
+                is_raster_thumbnail_supported(Path::new(ext)),
+                "expected {ext} to be decoded in-process"
+            );
+            assert!(
+                !is_shell_thumbnail_supported(Path::new(ext)),
+                "expected {ext} not to be routed through the Shell"
+            );
+        }
+
+        for ext in [
+            "a.mp4", "a.mkv", "a.pdf", "a.docx", "a.svg", "a.heic", "a.cr2", "a.ttf", "a.glb",
+            "a.3mf", "a.MP4", "a.PDF",
+        ] {
+            assert!(
+                is_shell_thumbnail_supported(Path::new(ext)),
+                "expected {ext} to be routed through the Shell"
+            );
+            assert!(
+                !is_raster_thumbnail_supported(Path::new(ext)),
+                "expected {ext} not to be decoded in-process"
+            );
+        }
+
+        for rejected in ["a.txt", "a.rs", "a.exe", "no_ext"] {
+            assert!(!is_raster_thumbnail_supported(Path::new(rejected)));
+            assert!(!is_shell_thumbnail_supported(Path::new(rejected)));
+            assert!(!is_thumbnail_supported(Path::new(rejected)));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_routed_formats_fail_gracefully_without_shell_thumbnails() {
+        let dir = TempDir::new().unwrap();
+        let engine = ThumbnailEngine::new();
+
+        // Empty containers cannot be thumbnailed, so the engine must report a preview error
+        // rather than panicking or hanging.
+        for name in ["empty.pdf", "empty.mp4", "empty.docx"] {
+            let path = dir.path().join(name);
+            fs::write(&path, b"").unwrap();
+            match engine
+                .load_thumbnail(path.clone(), 64, CancellationToken::new())
+                .await
+            {
+                Ok(image) => {
+                    // A Shell handler may still return artwork; the buffer must be well formed.
+                    assert_eq!(image.rgba.len(), (image.width * image.height * 4) as usize);
+                }
+                Err(err) => assert!(
+                    matches!(err, OnyxError::Preview { .. }),
+                    "expected OnyxError::Preview for {}, got {err:?}",
+                    path.display()
+                ),
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_route_ignores_the_raster_size_budget() {
+        let dir = TempDir::new().unwrap();
+        let engine = ThumbnailEngine::with_config(ThumbnailConfig {
+            max_source_file_bytes: 4,
+            ..ThumbnailConfig::default()
+        });
+
+        // A Shell-routed format larger than the raster budget is still attempted.
+        let big_pdf = dir.path().join("big.pdf");
+        fs::write(&big_pdf, vec![b'x'; 4096]).unwrap();
+        let result = engine
+            .load_thumbnail(big_pdf.clone(), 32, CancellationToken::new())
+            .await;
+        if let Err(err) = result {
+            assert!(
+                matches!(err, OnyxError::Preview { .. }),
+                "unexpected error kind for oversized Shell-routed file: {err:?}"
+            );
+        }
+
+        // The very same budget still rejects an in-process raster decode.
+        let big_png = dir.path().join("big.png");
+        fs::write(&big_png, vec![b'x'; 4096]).unwrap();
+        let err = engine
+            .load_thumbnail(big_png, 32, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OnyxError::Preview { .. }));
     }
 
     #[tokio::test]

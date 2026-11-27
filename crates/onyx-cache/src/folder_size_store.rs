@@ -173,6 +173,51 @@ impl FolderSizeStore {
         Ok(())
     }
 
+    /// Inserts or updates a batch of cached folder sizes in a single transaction.
+    ///
+    /// Returns the number of entries written. If `entries` is empty, returns `Ok(0)`
+    /// without locking the database.
+    pub fn upsert_batch(&self, entries: &[(PathBuf, CachedFolderSize, i64)]) -> OnyxResult<usize> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let updated_at = unix_now_secs();
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(map_sqlite_err)?;
+        let mut written = 0usize;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO folder_sizes (path, total_bytes, file_count, truncated, mtime_secs, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(path) DO UPDATE SET
+                        total_bytes = excluded.total_bytes,
+                        file_count = excluded.file_count,
+                        truncated = excluded.truncated,
+                        mtime_secs = excluded.mtime_secs,
+                        updated_at = excluded.updated_at",
+                )
+                .map_err(map_sqlite_err)?;
+
+            for (path, size, mtime_secs) in entries {
+                let key = normalize_folder_key(path);
+                stmt.execute(params![
+                    key,
+                    i64::try_from(size.total_bytes).unwrap_or(i64::MAX),
+                    i64::try_from(size.file_count).unwrap_or(i64::MAX),
+                    i64::from(size.truncated),
+                    mtime_secs,
+                    updated_at,
+                ])
+                .map_err(map_sqlite_err)?;
+                written += 1;
+            }
+        }
+        tx.commit().map_err(map_sqlite_err)?;
+        Ok(written)
+    }
+
     /// Deletes cached entries for `path` and all of its ancestor directories.
     /// Returns the total number of rows removed.
     pub fn invalidate_with_ancestors(&self, path: &Path) -> OnyxResult<usize> {
@@ -351,5 +396,46 @@ mod tests {
             store.get_if_fresh(path, 555).unwrap(),
             Some(CachedFolderSize::new(123, 1, false))
         );
+    }
+
+    #[test]
+    fn folder_size_store_upsert_batch_empty_and_multi_entry() {
+        let store = FolderSizeStore::open_in_memory().unwrap();
+
+        // 1. Empty batch returns 0 without error
+        assert_eq!(store.upsert_batch(&[]).unwrap(), 0);
+
+        // 2. Multi-entry batch insert + lookup
+        let p1 = PathBuf::from(r"C:\Users\Test\Dir1");
+        let p2 = PathBuf::from(r"C:\Users\Test\Dir2");
+        let p3 = PathBuf::from(r"C:\Users\Test\Dir3");
+
+        let s1 = CachedFolderSize::new(1024, 2, false);
+        let s2 = CachedFolderSize::new(2048, 5, true);
+        let s3 = CachedFolderSize::new(4096, 10, false);
+
+        let batch = vec![
+            (p1.clone(), s1, 1_000),
+            (p2.clone(), s2, 2_000),
+            (p3.clone(), s3, 3_000),
+        ];
+
+        let written = store.upsert_batch(&batch).unwrap();
+        assert_eq!(written, 3);
+
+        assert_eq!(store.get_if_fresh(&p1, 1_000).unwrap(), Some(s1));
+        assert_eq!(store.get_if_fresh(&p2, 2_000).unwrap(), Some(s2));
+        assert_eq!(store.get_if_fresh(&p3, 3_000).unwrap(), Some(s3));
+
+        // 3. mtime update overwrite
+        let s2_updated = CachedFolderSize::new(9999, 12, false);
+        let update_batch = vec![(p2.clone(), s2_updated, 2_500)];
+        let update_written = store.upsert_batch(&update_batch).unwrap();
+        assert_eq!(update_written, 1);
+
+        // Old mtime is stale
+        assert_eq!(store.get_if_fresh(&p2, 2_000).unwrap(), None);
+        // New mtime is fresh with updated size
+        assert_eq!(store.get_if_fresh(&p2, 2_500).unwrap(), Some(s2_updated));
     }
 }

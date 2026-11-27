@@ -65,12 +65,19 @@
 
 ## Phase 8 — Path to v1.0 (Active)
 - [x] Primary UI cutover to GPUI (`onyx-ui-gpui` with `gpui-kit` + `gpui-fast` on DirectX 11, ADR 0004; idle RAM reduced by ~75% to ~67 MB)
+- [x] Performance & Feature Sprint — Phase A ("Feel Instant"):
+  - [x] Named-pipe single-instance IPC (`onyx-windows/src/single_instance.rs`, `< 40 ms` warm launch, median `14.83 ms`), `--new-window` / `--background` flags, and deferred post-Frame-1 startup (`IndexController`, watchers, clipboard monitor, lazily created hidden `InputState`s, lazy Rayon global pool)
+  - [x] SSD-aware high-speed copy/move engine (`CopyFile2` + `COPY_FILE_NO_BUFFERING`, parallel small-file copy on SSD, ReFS `FSCTL_DUPLICATE_EXTENTS_TO_FILE` block cloning)
+  - [x] Low-priority `FindFirstFileExW` (`THREAD_MODE_BACKGROUND_BEGIN`) folder size scanner with batched SQLite bottom-up subtree caching (`FolderSizeStore::upsert_batch`)
+- [x] Performance & Feature Sprint — Phase B.1:
+  - [x] Native Windows Shell thumbnails via `IShellItemImageFactory::GetImage` (videos, PDFs, Office docs, SVG/RAW) with `SIIGBF_INCACHEONLY` cloud-placeholder protection
+  - [x] Live USB/removable drive hotplug via `WM_DEVICECHANGE` (`onyx-windows/src/hotplug.rs` + `onyx-ui-gpui`) — volume arrival/removal, including network volumes (`DBTF_NET`); browsing/connecting shares is still manual
 - [x] Recycle Bin shell namespace view with stock icons and native app icon (`onyx-windows` + `onyx-ui-gpui`)
 - [ ] Inline filter & "Group By" view mode (core engine implemented in `onyx-core`; UI wiring & flattened subtree view pending)
 - [ ] Inline collapsible Tree View in the file list (nested folder expansion with chevrons)
 - [ ] Multi-selection polish (marquee/rubber-band selection, `Ctrl+Click` & `Shift+Click` range selection, inline rename)
 - [ ] Resizable & reorderable metadata columns with per-folder view inheritance
-- [ ] Live USB/removable drive hotplug & network share detection
+- [ ] Network share discovery & connection UI (hotplug detection is done; enumerating and mounting shares is pending)
 - [ ] Extended archive formats (`.tar.gz`/`.tgz` implemented in `onyx-operations`; `.7z` pending)
 - [ ] Idle memory footprint optimization (stretch target `< 50 MB` working set)
 - [ ] Full NTFS USN Journal real-time indexing integration

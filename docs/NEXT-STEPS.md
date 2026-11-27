@@ -6,9 +6,22 @@ Die Umsetzung pausiert. Beim Wiederaufnehmen zuerst den aktuellen Windows-Build 
 
 - [x] Release-EXE gebaut und Windows-GUI-Subsystem geprüft.
 - [x] Formatierung, Workspace-Check, Clippy und alle 79 Tests bestanden. `--version` und `--smoke-test` lieferten in PowerShell die erwartete Ausgabe.
+- [x] Performance-Sprint abgeschlossen: `314` Workspace-Tests bestanden, `cargo clippy --workspace --all-targets -- -D warnings` ohne Befund, Release-Build `22.93 MB`. Die Messwerte stehen in [PERFORMANCE.md](PERFORMANCE.md).
 - [x] Aurora im dunklen Fensterinhalt sichtbar gemacht, doppelten ONYX-Schriftzug entfernt und die Speicheranzeige überarbeitet.
 - [ ] EXE per Doppelklick starten und prüfen, dass nur das Onyx-Fenster erscheint. App-Name und Icon in der Titelleiste kontrollieren.
 - [ ] Dunkles und helles Theme im laufenden Fenster prüfen. Auf den Aurora-Übergang, lesbare Speicherzahlen und die Laufwerksfarben achten. Ein schmales Fenster sowie die Ansichten mit Vorschau und zwei Dateibereichen testen.
+
+## Performance-Sprint: Phase A „Feel Instant“ & Phase B.1 (abgeschlossen)
+
+Stand 2026-11-26, Branch `zeron/onyx-performance-feature-sprint-a94df3`. Abnahme: `314` Workspace-Tests bestanden, `cargo clippy --workspace --all-targets -- -D warnings` ohne Befund, Release-Build `22.93 MB`. Alle Zahlen samt Vorher-Nachher-Vergleich stehen in [PERFORMANCE.md](PERFORMANCE.md).
+
+- [x] **Single-Instance-IPC über Named Pipe:** Ein zweiter Start öffnet kein zweites Fenster mehr, sondern übergibt Pfad oder `SHOW` an die laufende Instanz (`onyx-windows/src/single_instance.rs`, `\\.\pipe\onyx-explorer-ipc-v1-<user>`). Warmer Start im Median `14.83 ms`, das Ziel `< 40 ms` ist erreicht.
+- [x] **Startflags `--new-window` und `--background`:** `--new-window` erzwingt eine eigene Instanz, `--background` startet warm, ohne den Fokus zu nehmen.
+- [x] **Zurückgestellter Start nach Frame 1:** `IndexController`, `notify`-Watcher, Clipboard-Monitor, die versteckten `InputState`s und der globale Rayon-Pool starten erst nach dem ersten Frame (`schedule_deferred_startup`, gegen Doppelaufrufe über `deferred_started` abgesichert). Dadurch sinkt der GUI-Start von `194.94 ms` auf `181.07 ms` (`-7,1 %`).
+- [x] **SSD-bewusste Kopier- und Verschiebe-Engine:** `StorageDeviceSeekPenaltyProperty` unterscheidet SSD und HDD, kleine Dateien laufen parallel, große über `CopyFile2` mit `COPY_FILE_NO_BUFFERING`; auf ReFS wird zuerst `FSCTL_DUPLICATE_EXTENTS_TO_FILE` (Block-Cloning) versucht.
+- [x] **Niedrig priorisierter Ordnergrößen-Scanner:** `FindFirstFileExW` unter `THREAD_MODE_BACKGROUND_BEGIN`, Rückgabe als Bottom-up-Teilbaum-Rollup, Cache-Schreibung gesammelt über `FolderSizeStore::upsert_batch`.
+- [x] **Native Shell-Thumbnails:** `IShellItemImageFactory::GetImage` für Videos, PDFs, Office-Dokumente, SVG und RAW, mit `SIIGBF_INCACHEONLY` gegen das ungefragte Nachladen von Cloud-Platzhaltern.
+- [x] **Live-Hotplug für USB- und Netzlaufwerke:** `WM_DEVICECHANGE` in [hotplug.rs](../crates/onyx-windows/src/hotplug.rs), Ein- und Ausstecken inklusive `DBTF_NET`-Volumes; das Verbinden einzelner Freigaben bleibt manuell.
 
 ## Flexibles Fensterlayout
 
@@ -65,10 +78,11 @@ Nach jedem Meilenstein die Qualitätschecks aus [AGENTS.md](../AGENTS.md) ausfü
 
 ## Nächste Prioritäten (v0.2-Abschluss & Phase 8)
 
-- [ ] **Ordnergrößen-Cache & CPU-Optimierung (hohe Priorität):**
-  - Berechnete Ordnergrößen dauerhaft in SQLite speichern (`path`, `total_bytes`, `file_count`, `mtime`, `updated_at`), sodass nach Neustarts sofort `< 1 ms` ohne Neu-Scan geladen wird.
-  - Gezielte Invalidierung: Änderungen über den `notify`-Watcher markieren nur den betroffenen Ordner + Elternpfade als „dirty“ und berechnen nur diese neu (nach Neustart Abgleich via `mtime` und perspektivisch NTFS USN Journal).
-  - Scan-CPU-Last drastisch senken: in [folder_size.rs](../crates/onyx-fs/src/folder_size.rs) direkt `dir_entry.metadata()` statt extra `symlink_metadata()`-Syscall nutzen, Parallelität auf 1–2 Hintergrund-Worker mit niedriger Priorität begrenzen und in den Einstellungen (`Ctrl+,`) den Modus (*Automatisch / Nur auf Abruf / Aus*) wählbar machen.
+- [x] **Ordnergrößen-Cache & CPU-Optimierung (hohe Priorität):** Kern-Engine umgesetzt und gemessen.
+  - [x] Berechnete Ordnergrößen dauerhaft in SQLite speichern (`path`, `total_bytes`, `file_count`, `mtime`, `updated_at`), sodass nach Neustarts ohne Neu-Scan geladen wird. Der Scan liefert dafür ein Bottom-up-Rollup aller Teilbäume, das [folder_size_store.rs](../crates/onyx-cache/src/folder_size_store.rs) gesammelt über `upsert_batch` in einer Transaktion schreibt.
+  - [x] Gezielte Invalidierung: Änderungen über den `notify`-Watcher markieren nur den betroffenen Ordner und seine Elternpfade als „dirty“ und berechnen nur diese neu; nach einem Neustart erfolgt der Abgleich über `mtime`. Ein NTFS-USN-Journal-Abgleich bleibt offen.
+  - [x] Scan-CPU-Last gesenkt: in [folder_size.rs](../crates/onyx-fs/src/folder_size.rs) wird `dir_entry.metadata()` ohne zusätzlichen `symlink_metadata()`-Syscall genutzt, die Aufzählung läuft über `FindFirstFileExW` unter `THREAD_MODE_BACKGROUND_BEGIN` ([fast_scan.rs](../crates/onyx-windows/src/fast_scan.rs)), und die Parallelität orientiert sich an `recommend_scan_workers`.
+  - [ ] Optional offen: der Modusschalter (*Automatisch / Nur auf Abruf / Aus*) in `Ctrl+,`. Die Einstellungen kennen bisher nur den Schalter `calculate_folder_sizes`; ein dreistufiger Modus ist nicht implementiert.
 - [ ] **Zieh-Auswahl (Marquee / Gummiband-Auswahl) & Mehrfachauswahl-Komfort:**
   - Auf freier Fläche in der Dateiliste (Details- und Grid-Ansicht) klicken und ein Auswahlrechteck aufziehen, um mehrere Dateien/Ordner gleichzeitig zu markieren (inkl. Live-Highlight während des Ziehens und sauberem Scroll-Verhalten).
   - Ergänzend dazu `Ctrl+Klick` (einzelne Einträge hinzufügen/entfernen), `Shift+Klick` (Bereichsauswahl), `Ctrl+A` (Alles auswählen) und direktes Inline-Umbenennen in der Zeile.
