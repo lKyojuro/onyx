@@ -4971,6 +4971,7 @@ version = "0.1.0"
 dependencies = [
  "notify 9.0.0",
  "onyx-core",
+ "onyx-windows",
  "rayon",
  "tempfile",
  "thiserror 2.0.21",
@@ -4984,6 +4985,7 @@ name = "onyx-operations"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "criterion",
  "flate2",
  "onyx-core",
  "onyx-windows",
@@ -5003,6 +5005,7 @@ dependencies = [
  "image",
  "lru",
  "onyx-core",
+ "onyx-windows",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

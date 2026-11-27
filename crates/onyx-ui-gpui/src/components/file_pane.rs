@@ -513,7 +513,8 @@ pub fn render_file_pane(
                 let is_insert_line = !entry.is_dir() && view.drag_hover_is_pane_row(pane_id, idx);
                 let rename_input = view
                     .is_inline_renaming(pane_id, &entry.path)
-                    .then(|| view.inline_rename_input.clone());
+                    .then(|| view.inline_rename_input.clone())
+                    .flatten();
                 let native_icon = view.icons.get(&entry_icon_key(entry)).map(Arc::clone);
                 let (size_label, size_ratio) = view.entry_size_info_for(pane_id, entry);
                 els.push(
@@ -650,7 +651,8 @@ pub fn render_file_pane(
                             !entry.is_dir() && view.drag_hover_is_pane_row(pane_id, *idx);
                         let rename_input = view
                             .is_inline_renaming(pane_id, &entry.path)
-                            .then(|| view.inline_rename_input.clone());
+                            .then(|| view.inline_rename_input.clone())
+                            .flatten();
                         let native_icon = view.icons.get(&entry_icon_key(entry)).map(Arc::clone);
                         let (size_label, size_ratio) = view.entry_size_info_for(pane_id, entry);
                         els.push(

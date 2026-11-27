@@ -15,14 +15,14 @@ use crate::undo::{UndoAction, UndoJournal};
 use onyx_core::{OnyxError, OnyxResult};
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-const COPY_CHUNK_BYTES: usize = 256 * 1024;
+const SMALL_FILE_LIMIT: u64 = 4 * 1024 * 1024;
 
 /// Centralized async file operations engine for Onyx.
 ///
@@ -90,7 +90,7 @@ impl FileOperationsEngine {
     }
 
     /// Copies `sources` into `destination_dir` with recursion protection, disk-space preflight,
-    /// symlink safety, chunked cancellable copy, progress streaming, and conflict handling.
+    /// symlink safety, cancellable transfers, progress streaming, and conflict handling.
     pub async fn copy_items(
         &self,
         sources: &[PathBuf],
@@ -518,188 +518,127 @@ fn copy_items_blocking(
     }
 
     ensure_not_recursive(sources, destination_dir)?;
-
     let total_bytes = measure_total_bytes(sources);
     check_disk_space(space_checker, destination_dir, total_bytes)?;
 
-    let total_items = sources.len();
+    let mut transfer = TransferProgress::new(op_id, kind, sources.len(), total_bytes, progress);
+    let workers = onyx_windows::recommended_transfer_workers(
+        sources.first().map_or(destination_dir, PathBuf::as_path),
+        destination_dir,
+    );
     let mut report = OperationReport::default();
-    let mut bytes_copied = 0u64;
-    let mut completed_items = 0usize;
-    let mut sticky_resolution: Option<ConflictResolution> = None;
+    let mut sticky_resolution = None;
+    let mut batch = CopyBatch::default();
 
-    for src in sources {
-        if cancel.is_cancelled() {
-            send_progress(
-                progress,
-                OperationProgress {
-                    op_id,
-                    kind,
-                    current_item: src.display().to_string(),
-                    completed_items,
-                    total_items,
-                    bytes_copied,
-                    total_bytes,
-                    finished: true,
-                    cancelled: true,
-                    error: None,
-                },
-            );
-            return Err(OnyxError::Cancelled);
-        }
+    let result = (|| {
+        for src in sources {
+            check_cancelled(cancel)?;
 
-        let item_name = match src.file_name() {
-            Some(name) => name.to_os_string(),
-            None => {
-                report
-                    .failed
-                    .push((src.clone(), "Source path has no file name".to_string()));
-                completed_items += 1;
-                continue;
-            }
-        };
-
-        let meta = match fs::symlink_metadata(src) {
-            Ok(m) => m,
-            Err(err) => {
-                report.failed.push((src.clone(), err.to_string()));
-                completed_items += 1;
-                continue;
-            }
-        };
-
-        let desired_target = destination_dir.join(&item_name);
-        let target = match resolve_item_conflict(
-            src,
-            &desired_target,
-            conflict,
-            &mut resolver,
-            &mut sticky_resolution,
-        ) {
-            Ok(PathConflictOutcome::Skip) => {
-                report.skipped.push(src.clone());
-                completed_items += 1;
-                continue;
-            }
-            Ok(PathConflictOutcome::Proceed(path)) => path,
-            Ok(PathConflictOutcome::Overwrite(path)) => {
-                if let Err(err) = remove_existing_for_overwrite(&path) {
-                    report.failed.push((src.clone(), err.to_string()));
-                    completed_items += 1;
-                    continue;
+            let planned = (|| {
+                let item_name = src.file_name().ok_or_else(|| OnyxError::InvalidPath {
+                    message: "Source path has no file name".into(),
+                })?;
+                let desired = destination_dir.join(item_name);
+                let name_key = item_name
+                    .to_string_lossy()
+                    .trim_end_matches(['.', ' '])
+                    .to_uppercase();
+                // Conflicts must see the effects of preceding entries, including auto-renames.
+                if batch.names.contains(&name_key)
+                    || path_exists_any(&desired)
+                    || src.starts_with(destination_dir)
+                {
+                    batch.execute(workers, cancel, &mut transfer, &mut report)?;
                 }
-                path
-            }
-            Err(OnyxError::Cancelled) => {
-                send_progress(
-                    progress,
-                    OperationProgress {
-                        op_id,
-                        kind,
-                        current_item: src.display().to_string(),
-                        completed_items,
-                        total_items,
-                        bytes_copied,
-                        total_bytes,
-                        finished: true,
-                        cancelled: true,
-                        error: None,
-                    },
-                );
+                let meta = fs::symlink_metadata(src)?;
+                let target = match resolve_item_conflict(
+                    src,
+                    &desired,
+                    conflict,
+                    &mut resolver,
+                    &mut sticky_resolution,
+                )? {
+                    PathConflictOutcome::Skip => return Ok(None),
+                    PathConflictOutcome::Proceed(path) => path,
+                    PathConflictOutcome::Overwrite(path) => {
+                        remove_existing_for_overwrite(&path)?;
+                        path
+                    }
+                };
+
+                let mut plan = CopyPlan {
+                    files: &mut batch.files,
+                    top_idx: batch.items.len(),
+                    cancel,
+                    require_complete: false,
+                    visited: HashSet::new(),
+                };
+                let outcome = plan.entry(src, &target, &meta);
+                if let Some(name) = target.file_name() {
+                    batch.names.insert(
+                        name.to_string_lossy()
+                            .trim_end_matches(['.', ' '])
+                            .to_uppercase(),
+                    );
+                }
+                outcome.map(|outcome| (outcome == CopyOutcome::Copied).then_some(target))
+            })();
+            if matches!(planned, Err(OnyxError::Cancelled)) {
                 return Err(OnyxError::Cancelled);
             }
-            Err(err) => {
-                report.failed.push((src.clone(), err.to_string()));
-                completed_items += 1;
-                continue;
-            }
-        };
-
-        let mut visited = HashSet::new();
-        let copy_res = copy_entry_recursive(
-            src,
-            &target,
-            &meta,
-            &mut visited,
-            cancel,
-            op_id,
-            kind,
-            completed_items,
-            total_items,
-            &mut bytes_copied,
-            total_bytes,
-            progress,
-        );
-
-        match copy_res {
-            Ok(CopyOutcome::Copied) => {
-                report.succeeded.push(target);
-            }
-            Ok(CopyOutcome::Skipped) => {
-                report.skipped.push(src.clone());
-            }
-            Err(OnyxError::Cancelled) => {
-                send_progress(
-                    progress,
-                    OperationProgress {
-                        op_id,
-                        kind,
-                        current_item: src.display().to_string(),
-                        completed_items,
-                        total_items,
-                        bytes_copied,
-                        total_bytes,
-                        finished: true,
-                        cancelled: true,
-                        error: None,
-                    },
-                );
-                return Err(OnyxError::Cancelled);
-            }
-            Err(err) => {
-                report.failed.push((src.clone(), err.to_string()));
-            }
+            batch.items.push((src, planned));
         }
 
-        completed_items += 1;
-        send_progress(
-            progress,
-            OperationProgress {
-                op_id,
-                kind,
-                current_item: item_name.to_string_lossy().into_owned(),
-                completed_items,
-                total_items,
-                bytes_copied,
-                total_bytes,
-                finished: false,
-                cancelled: false,
-                error: None,
-            },
-        );
-    }
+        batch.execute(workers, cancel, &mut transfer, &mut report)
+    })();
 
+    transfer.emit("", true, result.is_err());
+    result?;
     if !report.succeeded.is_empty() {
         report.undo_action = Some(UndoAction::RecycleCreatedCopies(report.succeeded.clone()));
     }
-
-    send_progress(
-        progress,
-        OperationProgress {
-            op_id,
-            kind,
-            current_item: String::new(),
-            completed_items,
-            total_items,
-            bytes_copied,
-            total_bytes,
-            finished: true,
-            cancelled: false,
-            error: None,
-        },
-    );
-
     Ok(report)
+}
+
+fn check_cancelled(cancel: &CancellationToken) -> OnyxResult<()> {
+    if cancel.is_cancelled() {
+        Err(OnyxError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct CopyBatch<'a> {
+    names: HashSet<String>,
+    files: Vec<PlannedFile>,
+    items: Vec<(&'a Path, OnyxResult<Option<PathBuf>>)>,
+}
+
+impl CopyBatch<'_> {
+    fn execute(
+        &mut self,
+        workers: usize,
+        cancel: &CancellationToken,
+        progress: &mut TransferProgress<'_>,
+        report: &mut OperationReport,
+    ) -> OnyxResult<()> {
+        if self.items.is_empty() {
+            return Ok(());
+        }
+        let failures = execute_copy_plan(&self.files, self.items.len(), workers, cancel, progress)?;
+        for ((source, planned), failure) in self.items.drain(..).zip(failures) {
+            match planned.and_then(|target| failure.map_or(Ok(target), Err)) {
+                Ok(Some(target)) => report.succeeded.push(target),
+                Ok(None) => report.skipped.push(source.to_path_buf()),
+                Err(err) => report.failed.push((source.to_path_buf(), err.to_string())),
+            }
+            progress.complete(source);
+        }
+        self.files.clear();
+        self.names.clear();
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -708,81 +647,278 @@ enum CopyOutcome {
     Skipped,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn copy_entry_recursive(
-    src: &Path,
-    dst: &Path,
-    meta: &fs::Metadata,
-    visited: &mut HashSet<PathBuf>,
-    cancel: &CancellationToken,
-    op_id: u64,
-    kind: OperationKind,
-    completed_items: usize,
-    total_items: usize,
-    bytes_copied: &mut u64,
-    total_bytes: u64,
-    progress: Option<&mpsc::Sender<OperationProgress>>,
-) -> OnyxResult<CopyOutcome> {
-    if cancel.is_cancelled() {
-        return Err(OnyxError::Cancelled);
-    }
+struct PlannedFile {
+    src: PathBuf,
+    dst: PathBuf,
+    size: u64,
+    top_idx: usize,
+}
 
-    if is_reparse_or_symlink(meta) {
-        return copy_symlink_safe(src, dst, meta);
-    }
+struct CopyPlan<'a> {
+    files: &'a mut Vec<PlannedFile>,
+    top_idx: usize,
+    cancel: &'a CancellationToken,
+    require_complete: bool,
+    visited: HashSet<PathBuf>,
+}
 
-    if meta.is_file() {
-        copy_file_chunked(
-            src,
-            dst,
-            cancel,
-            op_id,
-            kind,
-            completed_items,
-            total_items,
-            bytes_copied,
-            total_bytes,
-            progress,
-        )?;
-        return Ok(CopyOutcome::Copied);
-    }
+impl CopyPlan<'_> {
+    fn entry(&mut self, src: &Path, dst: &Path, meta: &fs::Metadata) -> OnyxResult<CopyOutcome> {
+        check_cancelled(self.cancel)?;
+        if is_reparse_or_symlink(meta) {
+            return copy_symlink_safe(src, dst, meta);
+        }
 
-    if meta.is_dir() {
+        if meta.is_file() {
+            self.files.push(PlannedFile {
+                src: src.to_path_buf(),
+                dst: dst.to_path_buf(),
+                size: meta.len(),
+                top_idx: self.top_idx,
+            });
+            return Ok(CopyOutcome::Copied);
+        }
+
+        if !meta.is_dir() {
+            return Ok(CopyOutcome::Skipped);
+        }
         if let Ok(canon) = fs::canonicalize(src)
-            && !visited.insert(canon)
+            && !self.visited.insert(canon)
         {
-            // Cycle detected; skip safely without infinite recursion.
             return Ok(CopyOutcome::Skipped);
         }
 
         fs::create_dir_all(dst)?;
-        for entry_res in fs::read_dir(src)? {
-            if cancel.is_cancelled() {
-                return Err(OnyxError::Cancelled);
+        for entry in fs::read_dir(src)? {
+            check_cancelled(self.cancel)?;
+            let entry = entry?;
+            let child = entry.path();
+            let child_meta = fs::symlink_metadata(&child)?;
+            let outcome = self.entry(&child, &dst.join(entry.file_name()), &child_meta)?;
+            if self.require_complete && outcome == CopyOutcome::Skipped {
+                return Err(OnyxError::OperationFailed {
+                    message: format!(
+                        "Could not copy '{}' before removing its source",
+                        child.display()
+                    ),
+                });
             }
-            let entry = entry_res?;
-            let child_src = entry.path();
-            let child_dst = dst.join(entry.file_name());
-            let child_meta = fs::symlink_metadata(&child_src)?;
-            let _ = copy_entry_recursive(
-                &child_src,
-                &child_dst,
-                &child_meta,
-                visited,
-                cancel,
-                op_id,
-                kind,
-                completed_items,
-                total_items,
-                bytes_copied,
-                total_bytes,
-                progress,
-            )?;
         }
-        return Ok(CopyOutcome::Copied);
+        Ok(CopyOutcome::Copied)
+    }
+}
+
+struct TransferProgress<'a> {
+    op_id: u64,
+    kind: OperationKind,
+    total_items: usize,
+    total_bytes: u64,
+    bytes: AtomicU64,
+    completed: usize,
+    last_update: StdMutex<Option<Instant>>,
+    sender: Option<&'a mpsc::Sender<OperationProgress>>,
+}
+
+impl<'a> TransferProgress<'a> {
+    fn new(
+        op_id: u64,
+        kind: OperationKind,
+        total_items: usize,
+        total_bytes: u64,
+        sender: Option<&'a mpsc::Sender<OperationProgress>>,
+    ) -> Self {
+        Self {
+            op_id,
+            kind,
+            total_items,
+            total_bytes,
+            bytes: AtomicU64::new(0),
+            completed: 0,
+            last_update: StdMutex::new(None),
+            sender,
+        }
     }
 
-    Ok(CopyOutcome::Skipped)
+    fn complete(&mut self, source: &Path) {
+        self.completed += 1;
+        let label = source.file_name().unwrap_or(source.as_os_str());
+        self.emit(&label.to_string_lossy(), false, false);
+    }
+
+    fn add_bytes(&self, source: &Path, bytes: u64) {
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        if self.sender.is_none() {
+            return;
+        }
+        let mut last = self
+            .last_update
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if last.is_none_or(|time| time.elapsed() >= Duration::from_millis(40)) {
+            *last = Some(Instant::now());
+            let label = source.file_name().unwrap_or(source.as_os_str());
+            self.emit(&label.to_string_lossy(), false, false);
+        }
+    }
+
+    fn emit(&self, current_item: &str, finished: bool, cancelled: bool) {
+        send_progress(
+            self.sender,
+            OperationProgress {
+                op_id: self.op_id,
+                kind: self.kind,
+                current_item: current_item.to_owned(),
+                completed_items: self.completed,
+                total_items: self.total_items,
+                bytes_copied: self.bytes.load(Ordering::Relaxed),
+                total_bytes: self.total_bytes,
+                finished,
+                cancelled,
+                error: None,
+            },
+        );
+    }
+}
+
+fn execute_copy_plan(
+    files: &[PlannedFile],
+    top_count: usize,
+    workers: usize,
+    cancel: &CancellationToken,
+    progress: &TransferProgress<'_>,
+) -> OnyxResult<Vec<Option<OnyxError>>> {
+    let cancel = cancel.child_token();
+    let failures: Vec<_> = (0..top_count).map(|_| StdMutex::new(None)).collect();
+    let small: Vec<_> = files
+        .iter()
+        .filter(|file| file.size < SMALL_FILE_LIMIT)
+        .collect();
+    let parallel = workers > 1 && small.len() >= 4;
+
+    let copy = |file: &PlannedFile, tiny_fast_path| {
+        let failure = &failures[file.top_idx];
+        if failure
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .is_some()
+        {
+            return;
+        }
+        let result = transfer_file(file, tiny_fast_path, &cancel, progress);
+        match result {
+            Ok(()) => {}
+            Err(OnyxError::Cancelled) => cancel.cancel(),
+            Err(err) => {
+                failure
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .get_or_insert(err);
+            }
+        }
+    };
+
+    if parallel {
+        let next = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..workers.min(small.len()) {
+                scope.spawn(|| {
+                    while !cancel.is_cancelled() {
+                        let Some(file) = small.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                            break;
+                        };
+                        copy(file, true);
+                    }
+                });
+            }
+        });
+    }
+    for file in files {
+        check_cancelled(&cancel)?;
+        if !parallel || file.size >= SMALL_FILE_LIMIT {
+            copy(file, false);
+        }
+    }
+    check_cancelled(&cancel)?;
+    Ok(failures
+        .into_iter()
+        .map(|failure| failure.into_inner().unwrap_or_else(|err| err.into_inner()))
+        .collect())
+}
+
+fn transfer_file(
+    file: &PlannedFile,
+    tiny_fast_path: bool,
+    cancel: &CancellationToken,
+    progress: &TransferProgress<'_>,
+) -> OnyxResult<()> {
+    check_cancelled(cancel)?;
+    let meta = fs::symlink_metadata(&file.src)?;
+    if !meta.is_file() || is_reparse_or_symlink(&meta) {
+        return Err(OnyxError::InvalidPath {
+            message: format!("Copy source changed type: '{}'", file.src.display()),
+        });
+    }
+    let size = meta.len();
+    if onyx_windows::try_clone_file_refs(&file.src, &file.dst)? {
+        progress.add_bytes(&file.src, size);
+        return Ok(());
+    }
+
+    if tiny_fast_path && size < 128 * 1024 {
+        let done = copy_tiny_file(&file.src, &file.dst, &meta, cancel)?;
+        progress.add_bytes(&file.src, done);
+        return Ok(());
+    }
+
+    let mut reported = 0;
+    onyx_windows::copy_file_fast(
+        &file.src,
+        &file.dst,
+        onyx_windows::CopyFileOptions {
+            no_buffering: size >= 8 * 1024 * 1024,
+            // The planner already resolved overwrite. Protect files created after planning.
+            overwrite: false,
+        },
+        || cancel.is_cancelled(),
+        |done, _| {
+            if done > reported {
+                progress.add_bytes(&file.src, done - reported);
+                reported = done;
+            }
+        },
+    )?;
+    if size > reported {
+        progress.add_bytes(&file.src, size - reported);
+    }
+    Ok(())
+}
+
+fn copy_tiny_file(
+    src: &Path,
+    dst: &Path,
+    meta: &fs::Metadata,
+    cancel: &CancellationToken,
+) -> OnyxResult<u64> {
+    let mut reader = File::open(src)?;
+    let mut writer = File::create_new(dst)?;
+    let result = (|| {
+        let preallocated =
+            meta.len() >= 64 * 1024 && onyx_windows::preallocate_file(&writer, meta.len()).is_ok();
+        let done = std::io::copy(&mut reader, &mut writer)?;
+        if preallocated && done < meta.len() {
+            writer.set_len(done)?;
+        }
+        if let Ok(modified) = meta.modified() {
+            let _ = writer.set_modified(modified);
+        }
+        check_cancelled(cancel)?;
+        Ok(done)
+    })();
+    drop(writer);
+    if result.is_err() {
+        let _ = fs::remove_file(dst);
+    }
+    result
 }
 
 fn copy_symlink_safe(src: &Path, dst: &Path, meta: &fs::Metadata) -> OnyxResult<CopyOutcome> {
@@ -825,70 +961,6 @@ fn copy_symlink_safe(src: &Path, dst: &Path, meta: &fs::Metadata) -> OnyxResult<
         }
         Err(err) => Err(OnyxError::Io(err)),
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn copy_file_chunked(
-    src: &Path,
-    dst: &Path,
-    cancel: &CancellationToken,
-    op_id: u64,
-    kind: OperationKind,
-    completed_items: usize,
-    total_items: usize,
-    bytes_copied: &mut u64,
-    total_bytes: u64,
-    progress: Option<&mpsc::Sender<OperationProgress>>,
-) -> OnyxResult<()> {
-    let mut reader = File::open(src)?;
-    let mut writer = File::create(dst)?;
-    let mut buf = vec![0u8; COPY_CHUNK_BYTES];
-    let item_label = src
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| src.display().to_string());
-
-    loop {
-        if cancel.is_cancelled() {
-            drop(writer);
-            let _ = fs::remove_file(dst);
-            return Err(OnyxError::Cancelled);
-        }
-
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        writer.write_all(&buf[..n])?;
-        *bytes_copied = bytes_copied.saturating_add(n as u64);
-
-        send_progress(
-            progress,
-            OperationProgress {
-                op_id,
-                kind,
-                current_item: item_label.clone(),
-                completed_items,
-                total_items,
-                bytes_copied: *bytes_copied,
-                total_bytes,
-                finished: false,
-                cancelled: false,
-                error: None,
-            },
-        );
-    }
-
-    writer.flush()?;
-
-    // Best-effort preserve modified timestamp.
-    if let Ok(meta) = fs::metadata(src)
-        && let Ok(modified) = meta.modified()
-    {
-        let _ = writer.set_modified(modified);
-    }
-
-    Ok(())
 }
 
 fn remove_existing_for_overwrite(path: &Path) -> OnyxResult<()> {
@@ -965,27 +1037,18 @@ fn move_items_blocking(
     let total_items = sources.len();
     let mut report = OperationReport::default();
     let mut reverse_moves: Vec<(PathBuf, PathBuf)> = Vec::new();
-    let mut bytes_copied = 0u64;
-    let mut completed_items = 0usize;
+    let mut transfer = TransferProgress::new(
+        op_id,
+        OperationKind::Move,
+        total_items,
+        total_bytes,
+        progress,
+    );
     let mut sticky_resolution: Option<ConflictResolution> = None;
 
     for src in sources {
         if cancel.is_cancelled() {
-            send_progress(
-                progress,
-                OperationProgress {
-                    op_id,
-                    kind: OperationKind::Move,
-                    current_item: src.display().to_string(),
-                    completed_items,
-                    total_items,
-                    bytes_copied,
-                    total_bytes,
-                    finished: true,
-                    cancelled: true,
-                    error: None,
-                },
-            );
+            transfer.emit(&src.to_string_lossy(), true, true);
             return Err(OnyxError::Cancelled);
         }
 
@@ -995,7 +1058,7 @@ fn move_items_blocking(
                 report
                     .failed
                     .push((src.clone(), "Source path has no file name".to_string()));
-                completed_items += 1;
+                transfer.complete(src);
                 continue;
             }
         };
@@ -1004,7 +1067,7 @@ fn move_items_blocking(
             Ok(m) => m,
             Err(err) => {
                 report.failed.push((src.clone(), err.to_string()));
-                completed_items += 1;
+                transfer.complete(src);
                 continue;
             }
         };
@@ -1012,7 +1075,7 @@ fn move_items_blocking(
         let desired_target = destination_dir.join(&item_name);
         if is_same_normalized_path(src, &desired_target) {
             report.skipped.push(src.clone());
-            completed_items += 1;
+            transfer.complete(src);
             continue;
         }
 
@@ -1025,39 +1088,25 @@ fn move_items_blocking(
         ) {
             Ok(PathConflictOutcome::Skip) => {
                 report.skipped.push(src.clone());
-                completed_items += 1;
+                transfer.complete(src);
                 continue;
             }
             Ok(PathConflictOutcome::Proceed(path)) => path,
             Ok(PathConflictOutcome::Overwrite(path)) => {
                 if let Err(err) = remove_existing_for_overwrite(&path) {
                     report.failed.push((src.clone(), err.to_string()));
-                    completed_items += 1;
+                    transfer.complete(src);
                     continue;
                 }
                 path
             }
             Err(OnyxError::Cancelled) => {
-                send_progress(
-                    progress,
-                    OperationProgress {
-                        op_id,
-                        kind: OperationKind::Move,
-                        current_item: src.display().to_string(),
-                        completed_items,
-                        total_items,
-                        bytes_copied,
-                        total_bytes,
-                        finished: true,
-                        cancelled: true,
-                        error: None,
-                    },
-                );
+                transfer.emit(&src.to_string_lossy(), true, true);
                 return Err(OnyxError::Cancelled);
             }
             Err(err) => {
                 report.failed.push((src.clone(), err.to_string()));
-                completed_items += 1;
+                transfer.complete(src);
                 continue;
             }
         };
@@ -1066,22 +1115,18 @@ fn move_items_blocking(
             Ok(()) => Ok(()),
             Err(err) if is_cross_device_error(&err) => {
                 // Cross-volume move: copy completely, then delete source.
-                let mut visited = HashSet::new();
-                copy_entry_recursive(
-                    src,
-                    &target,
-                    &meta,
-                    &mut visited,
-                    cancel,
-                    op_id,
-                    OperationKind::Move,
-                    completed_items,
-                    total_items,
-                    &mut bytes_copied,
-                    total_bytes,
-                    progress,
-                )?;
-                remove_existing_for_overwrite(src)
+                let result = copy_for_cross_volume_move(src, &target, &meta, cancel, &transfer);
+                match result {
+                    Ok(CopyOutcome::Copied) => {
+                        check_cancelled(cancel).and_then(|()| remove_existing_for_overwrite(src))
+                    }
+                    Ok(CopyOutcome::Skipped) => {
+                        report.skipped.push(src.clone());
+                        transfer.complete(src);
+                        continue;
+                    }
+                    Err(err) => Err(err),
+                }
             }
             Err(err) => Err(OnyxError::Io(err)),
         };
@@ -1092,21 +1137,7 @@ fn move_items_blocking(
                 report.succeeded.push(target);
             }
             Err(OnyxError::Cancelled) => {
-                send_progress(
-                    progress,
-                    OperationProgress {
-                        op_id,
-                        kind: OperationKind::Move,
-                        current_item: src.display().to_string(),
-                        completed_items,
-                        total_items,
-                        bytes_copied,
-                        total_bytes,
-                        finished: true,
-                        cancelled: true,
-                        error: None,
-                    },
-                );
+                transfer.emit(&src.to_string_lossy(), true, true);
                 return Err(OnyxError::Cancelled);
             }
             Err(err) => {
@@ -1114,45 +1145,40 @@ fn move_items_blocking(
             }
         }
 
-        completed_items += 1;
-        send_progress(
-            progress,
-            OperationProgress {
-                op_id,
-                kind: OperationKind::Move,
-                current_item: item_name.to_string_lossy().into_owned(),
-                completed_items,
-                total_items,
-                bytes_copied,
-                total_bytes,
-                finished: false,
-                cancelled: false,
-                error: None,
-            },
-        );
+        transfer.complete(src);
     }
 
     if !reverse_moves.is_empty() {
         report.undo_action = Some(UndoAction::ReverseMoves(reverse_moves));
     }
 
-    send_progress(
-        progress,
-        OperationProgress {
-            op_id,
-            kind: OperationKind::Move,
-            current_item: String::new(),
-            completed_items,
-            total_items,
-            bytes_copied,
-            total_bytes,
-            finished: true,
-            cancelled: false,
-            error: None,
-        },
-    );
+    transfer.emit("", true, false);
 
     Ok(report)
+}
+
+fn copy_for_cross_volume_move(
+    src: &Path,
+    dst: &Path,
+    meta: &fs::Metadata,
+    cancel: &CancellationToken,
+    progress: &TransferProgress<'_>,
+) -> OnyxResult<CopyOutcome> {
+    let mut files = Vec::new();
+    let mut plan = CopyPlan {
+        files: &mut files,
+        top_idx: 0,
+        cancel,
+        require_complete: true,
+        visited: HashSet::new(),
+    };
+    let outcome = plan.entry(src, dst, meta)?;
+    let workers = onyx_windows::recommended_transfer_workers(src, dst);
+    let mut failures = execute_copy_plan(&files, 1, workers, cancel, progress)?;
+    match failures.pop().flatten() {
+        Some(err) => Err(err),
+        None => Ok(outcome),
+    }
 }
 
 fn is_cross_device_error(err: &std::io::Error) -> bool {
@@ -1474,6 +1500,235 @@ mod tests {
     use super::*;
     use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn copies_64_small_files_and_preserves_modified_time() {
+        let work = TempDir::new().unwrap();
+        let (engine, _) = test_engine(&work);
+        let source = work.path().join("collection");
+        let destination = work.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let modified = std::time::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+        for index in 0..64u8 {
+            let path = source.join(format!("file-{index}.bin"));
+            let size = if index % 2 == 0 { 8 * 1024 } else { 96 * 1024 };
+            fs::write(&path, vec![index; size]).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+
+        let report = engine
+            .copy_items(
+                std::slice::from_ref(&source),
+                &destination,
+                ConflictPolicy::Skip,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let copied = destination.join("collection");
+        assert_eq!(report.succeeded, std::slice::from_ref(&copied));
+        assert!(report.failed.is_empty());
+        assert!(engine.can_undo().await);
+
+        // Force the parallel executor as well so that this test covers it on an HDD.
+        let forced = work.path().join("forced-parallel");
+        let mut files = Vec::new();
+        let cancel = CancellationToken::new();
+        let mut plan = CopyPlan {
+            files: &mut files,
+            top_idx: 0,
+            cancel: &cancel,
+            require_complete: false,
+            visited: HashSet::new(),
+        };
+        plan.entry(&source, &forced, &fs::metadata(&source).unwrap())
+            .unwrap();
+        let progress = TransferProgress::new(1, OperationKind::Copy, 1, 0, None);
+        let failures = execute_copy_plan(&files, 1, 4, &cancel, &progress).unwrap();
+        assert!(failures[0].is_none());
+
+        for index in 0..64u8 {
+            let name = format!("file-{index}.bin");
+            for path in [copied.join(&name), forced.join(name)] {
+                let size = if index % 2 == 0 { 8 * 1024 } else { 96 * 1024 };
+                assert_eq!(fs::read(&path).unwrap(), vec![index; size]);
+                assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn large_copy_reports_bytes_and_honors_cancellation() {
+        let work = TempDir::new().unwrap();
+        let (engine, _) = test_engine(&work);
+        let source = work.path().join("large.bin");
+        let destination = work.path().join("destination");
+        fs::create_dir(&destination).unwrap();
+        let contents = vec![0xba; 16 * 1024 * 1024 + 7];
+        fs::write(&source, &contents).unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+        let report = engine
+            .copy_items(
+                std::slice::from_ref(&source),
+                &destination,
+                ConflictPolicy::Skip,
+                CancellationToken::new(),
+                Some(tx),
+            )
+            .await
+            .unwrap();
+
+        let copied = destination.join("large.bin");
+        assert_eq!(fs::read(&copied).unwrap(), contents);
+        assert_eq!(report.succeeded, [copied]);
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+        assert!(
+            events
+                .iter()
+                .any(|event| !event.finished && event.bytes_copied > 0)
+        );
+        assert!(
+            events
+                .windows(2)
+                .all(|events| events[0].bytes_copied <= events[1].bytes_copied)
+        );
+        let finished = events.last().unwrap();
+        assert!(finished.finished);
+        assert_eq!(finished.bytes_copied, contents.len() as u64);
+        assert_eq!(finished.completed_items, 1);
+
+        let cancelled_destination = work.path().join("cancelled");
+        fs::create_dir(&cancelled_destination).unwrap();
+        let (tx, mut rx) = mpsc::channel(32);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = engine
+            .copy_items(
+                &[source],
+                &cancelled_destination,
+                ConflictPolicy::Skip,
+                cancel,
+                Some(tx),
+            )
+            .await;
+        assert!(matches!(result, Err(OnyxError::Cancelled)));
+        assert!(rx.recv().await.unwrap().cancelled);
+        assert_eq!(fs::read_dir(cancelled_destination).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn cancels_a_large_transfer_after_progress_and_removes_the_partial_file() {
+        let root = std::env::current_dir().unwrap();
+        let work = tempfile::tempdir_in(&root).unwrap();
+        // A relative source forces the native copy path even on a ReFS test volume.
+        let source = work.path().strip_prefix(&root).unwrap().join("source.bin");
+        let destination = work.path().join("destination.bin");
+        let size = 16 * 1024 * 1024 + 7;
+        File::create(&source).unwrap().set_len(size).unwrap();
+        let file = PlannedFile {
+            src: source,
+            dst: destination.clone(),
+            size,
+            top_idx: 0,
+        };
+        let (tx, _rx) = mpsc::channel(32);
+        let progress = TransferProgress::new(1, OperationKind::Copy, 1, size, Some(&tx));
+        let cancel = CancellationToken::new();
+
+        std::thread::scope(|scope| {
+            // Hold the progress lock until the callback accounts for its first bytes.
+            let update = progress.last_update.lock().unwrap();
+            let worker = scope.spawn(|| execute_copy_plan(&[file], 1, 1, &cancel, &progress));
+            let start = Instant::now();
+            while progress.bytes.load(Ordering::Relaxed) == 0
+                && !worker.is_finished()
+                && start.elapsed() < Duration::from_secs(5)
+            {
+                std::thread::yield_now();
+            }
+            cancel.cancel();
+            drop(update);
+            assert!(matches!(worker.join().unwrap(), Err(OnyxError::Cancelled)));
+        });
+
+        assert!(progress.bytes.load(Ordering::Relaxed) > 0);
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn pending_top_level_file_participates_in_conflict_resolution() {
+        let work = TempDir::new().unwrap();
+        let (engine, _) = test_engine(&work);
+        let first_dir = work.path().join("first");
+        let second_dir = work.path().join("second");
+        let destination = work.path().join("destination");
+        for path in [&first_dir, &second_dir, &destination] {
+            fs::create_dir(path).unwrap();
+        }
+        let first = first_dir.join("file.txt");
+        let second = second_dir.join("file.txt");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+
+        let report = engine
+            .copy_items(
+                &[first, second.clone()],
+                &destination,
+                ConflictPolicy::Skip,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let copied = destination.join("file.txt");
+        assert_eq!(fs::read(&copied).unwrap(), b"first");
+        assert_eq!(report.succeeded, [copied]);
+        assert_eq!(report.skipped, [second]);
+    }
+
+    #[test]
+    fn failed_parallel_member_marks_its_top_level_item_failed() {
+        let work = TempDir::new().unwrap();
+        let source = work.path().join("source");
+        let destination = work.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        for index in 0..4 {
+            fs::write(source.join(format!("file-{index}.bin")), b"some data").unwrap();
+        }
+
+        let mut batch = CopyBatch::default();
+        let cancel = CancellationToken::new();
+        let mut plan = CopyPlan {
+            files: &mut batch.files,
+            top_idx: 0,
+            cancel: &cancel,
+            require_complete: false,
+            visited: HashSet::new(),
+        };
+        plan.entry(&source, &destination, &fs::metadata(&source).unwrap())
+            .unwrap();
+        batch.items.push((&source, Ok(Some(destination.clone()))));
+        fs::remove_file(source.join("file-0.bin")).unwrap();
+
+        let mut report = OperationReport::default();
+        let mut progress = TransferProgress::new(1, OperationKind::Copy, 1, 0, None);
+        batch
+            .execute(4, &cancel, &mut progress, &mut report)
+            .unwrap();
+        assert!(report.succeeded.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].0, source);
+    }
 
     /// Mock recycler that moves files into an isolated temporary trash folder instead of
     /// touching the real Windows Recycle Bin.

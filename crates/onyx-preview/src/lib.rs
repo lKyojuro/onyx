@@ -11,7 +11,8 @@ pub mod text;
 pub mod thumbnails;
 
 pub use thumbnails::{
-    ThumbnailConfig, ThumbnailEngine, ThumbnailImage, ThumbnailKey, is_thumbnail_supported,
+    ThumbnailConfig, ThumbnailEngine, ThumbnailImage, ThumbnailKey, is_raster_thumbnail_supported,
+    is_shell_thumbnail_supported, is_thumbnail_supported,
 };
 
 use onyx_core::{OnyxError, OnyxResult, to_extended_length_path};

@@ -18,7 +18,12 @@ tracing.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "transfer_benchmarks"
+harness = false
 
 [lints]
 workspace = true

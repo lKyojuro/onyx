@@ -10,12 +10,17 @@ pub mod context_menu;
 pub mod dnd;
 pub mod drives;
 pub mod dwm;
+pub mod fast_scan;
+pub mod hotplug;
 pub mod icons;
 pub mod known_folders;
 pub mod mouse_nav;
 pub mod recycle_bin;
 pub mod shell;
+pub mod single_instance;
 pub mod theme;
+pub mod thumbnails;
+pub mod transfer;
 pub mod usn;
 
 pub use clipboard::{get_clipboard_files, set_clipboard_files};
@@ -29,6 +34,13 @@ pub use dnd::{
 pub use drives::{enumerate_drives, free_disk_space};
 pub use dwm::{
     apply_titlebar_colors, apply_window_backdrop, has_system_font_family, set_window_icon_from_exe,
+};
+pub use fast_scan::{
+    BackgroundPriorityGuard, FastDirEntry, recommend_scan_workers, scan_dir_entries,
+};
+pub use hotplug::{
+    DriveChangeEvent, DriveChangeKind, VolumeHotplugWatcher, decode_unit_mask,
+    start_volume_hotplug_watcher,
 };
 pub use icons::{
     IconSize, RgbaIcon, extract_existing_icon_rgba, extract_file_icon_rgba,
@@ -47,7 +59,17 @@ pub use shell::{
     TerminalProfile, launch_terminal, launch_terminal_with_profile, open_file, open_with_dialog,
     recycle_paths, show_properties_dialog,
 };
+pub use single_instance::{
+    IpcCommand, SingleInstanceServer, default_ipc_pipe_name, focus_window,
+    start_single_instance_server, start_single_instance_server_at, try_send_to_existing_instance,
+    try_send_to_pipe,
+};
 pub use theme::{detect_system_accent_hex, detect_system_theme};
+pub use thumbnails::{ShellThumbnail, extract_shell_thumbnail_rgba};
+pub use transfer::{
+    CopyFileOptions, StorageMediaKind, copy_file_fast, detect_storage_media, is_path_on_ssd,
+    preallocate_file, recommended_transfer_workers, try_clone_file_refs,
+};
 pub use usn::{UsnCapability, probe_ntfs_usn_capability};
 
 use onyx_core::{OnyxError, OnyxResult};

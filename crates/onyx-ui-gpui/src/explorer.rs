@@ -55,7 +55,7 @@ use onyx_core::{
 };
 use onyx_fs::{
     DEFAULT_MAX_FOLDER_SIZE_ENTRIES, DirectoryWatcher, EnumerationOptions, FolderSizeResult,
-    FsEngine, WatchEvent, compute_folder_size,
+    FolderSizeScanOutput, FsEngine, WatchEvent, compute_folder_size_with_subtrees,
 };
 use onyx_operations::{
     ConflictDecision, ConflictInfo, ConflictPolicy, ConflictResolution, FileOperationsEngine,
@@ -65,11 +65,13 @@ use onyx_operations::{
 use onyx_preview::{PreviewEngine, ThumbnailEngine, is_thumbnail_supported};
 use onyx_search::{SearchIndex, SearchQuery, UnifiedSearchEngine};
 use onyx_windows::{
-    DragImageSource, DragOutcome, RecycleBinItem, RgbaIcon, TerminalProfile, empty_recycle_bin,
+    DragImageSource, DragOutcome, DriveChangeEvent, DriveChangeKind, IpcCommand, RecycleBinItem,
+    RgbaIcon, SingleInstanceServer, TerminalProfile, VolumeHotplugWatcher, empty_recycle_bin,
     enumerate_drives, enumerate_known_folders, enumerate_recycle_bin, extract_file_icon_rgba,
-    extract_path_icon_rgba, get_clipboard_files, launch_terminal_with_profile, open_file,
-    open_with_dialog, recycle_bin_icon_rgba, restore_recycle_bin_items, set_clipboard_files,
-    show_context_menu, show_properties_dialog, start_external_file_drag,
+    extract_path_icon_rgba, focus_window, get_clipboard_files, launch_terminal_with_profile,
+    open_file, open_with_dialog, recycle_bin_icon_rgba, restore_recycle_bin_items,
+    set_clipboard_files, show_context_menu, show_properties_dialog, start_external_file_drag,
+    start_single_instance_server, start_volume_hotplug_watcher,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -83,6 +85,22 @@ use tokio_util::sync::CancellationToken;
 const MAX_FOLDER_SIZE_CONCURRENCY: usize = 2;
 const THUMBNAIL_TARGET_PX: u32 = 128;
 const MAX_THUMBNAIL_WORKERS: usize = 4;
+const MAX_RAYON_THREADS: usize = 4;
+
+/// Builds the global rayon pool once, off the UI thread.
+///
+/// `onyx-fs` sorts directory listings on rayon, so the pool only has to exist
+/// before the first heavy sort, not before Frame 1; building it inside the
+/// deferred startup keeps its worker threads off the window's critical path.
+fn init_rayon_pool() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // A pool initialized elsewhere in the process makes this a no-op.
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(MAX_RAYON_THREADS)
+            .build_global();
+    });
+}
 
 type FileList = (Vec<PathBuf>, bool);
 
@@ -676,7 +694,8 @@ pub struct OnyxExplorer {
     pub(crate) selection: PaneSelection,
     pub(crate) marquee: Option<MarqueeState>,
     pub(crate) inline_rename: Option<InlineRenameState>,
-    pub(crate) inline_rename_input: Entity<InputState>,
+    /// Created on the first inline rename; absent means no rename started yet.
+    pub(crate) inline_rename_input: Option<Entity<InputState>>,
     pending_collapse_click: Option<(PaneId, usize)>,
     type_ahead: TypeAheadState,
     pub(crate) generation: GenerationId,
@@ -720,7 +739,8 @@ pub struct OnyxExplorer {
     pub(crate) search_engine: UnifiedSearchEngine,
     /// Shared handle of the open on-disk index, handed over by the worker.
     pub(crate) search_index: Option<Arc<Mutex<SearchIndex>>>,
-    pub(crate) index: IndexController,
+    /// Index worker, started by the deferred post-Frame-1 startup or on demand.
+    pub(crate) index: Option<IndexController>,
     pub(crate) index_status: IndexStatus,
     /// Generation and cancellation of the running `index_directory` build.
     pub(crate) build_generation: GenerationId,
@@ -747,8 +767,10 @@ pub struct OnyxExplorer {
     pub(crate) prompt_state: Option<PromptState>,
     pub(crate) conflict_dialog: Option<ConflictDialogState>,
     pending_conflict_check: bool,
-    pub(crate) prompt_input: Entity<InputState>,
-    pub(crate) palette_input: Entity<InputState>,
+    /// Created on the first prompt that needs a text field.
+    pub(crate) prompt_input: Option<Entity<InputState>>,
+    /// Created on the first command palette open.
+    pub(crate) palette_input: Option<Entity<InputState>>,
     pub(crate) prompt_focus_handle: FocusHandle,
     pub(crate) active_operation: Option<ActiveOperation>,
     pub(crate) context_menu: Option<ContextMenuState>,
@@ -775,8 +797,22 @@ pub struct OnyxExplorer {
     /// Last painted viewport size, used for layout clamping and session persistence.
     pub(crate) viewport_size: (f32, f32),
     watch_cmd_tx: mpsc::UnboundedSender<PathBuf>,
+    /// Primary watcher commands; consumed once the watcher worker starts.
+    watch_cmd_rx: Option<mpsc::UnboundedReceiver<PathBuf>>,
     watched_path: Option<PathBuf>,
     watch_cmd_tx_secondary: mpsc::UnboundedSender<PathBuf>,
+    /// Secondary watcher commands; consumed once its worker starts.
+    watch_cmd_rx_secondary: Option<mpsc::UnboundedReceiver<PathBuf>>,
+    /// Clipboard commands; consumed once the monitor thread starts.
+    clipboard_rx: Option<mpsc::UnboundedReceiver<ClipboardCommand>>,
+    /// Handle of this window, used by the IPC listener to raise it.
+    window_hwnd: Option<isize>,
+    /// Set once the deferred post-Frame-1 subsystems have been started.
+    deferred_started: bool,
+    /// Listener of the single-instance pipe; stops with the explorer.
+    _single_instance: Option<SingleInstanceServer>,
+    /// Listener of `WM_DEVICECHANGE` volume hotplug broadcasts; stops with the explorer.
+    _hotplug_watcher: Option<VolumeHotplugWatcher>,
     session_write_gate: Arc<Mutex<()>>,
     layout_touched: bool,
     config_store: ConfigStore,
@@ -814,7 +850,8 @@ impl OnyxExplorer {
         // The executable carries the Onyx icon as resource 1 (see `build.rs`); pushing it
         // onto the window gives the taskbar and Alt-Tab the same mark. Off the UI thread
         // because loading the icon hits the image loader.
-        if let Some(hwnd) = extract_window_hwnd(window) {
+        let window_hwnd = extract_window_hwnd(window);
+        if let Some(hwnd) = window_hwnd {
             let runtime = Arc::clone(&runtime);
             runtime.spawn_blocking(move || {
                 let _ = onyx_windows::set_window_icon_from_exe(hwnd);
@@ -829,11 +866,6 @@ impl OnyxExplorer {
         let address_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Enter path and press Enter..."));
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter folder..."));
-        let prompt_input = cx.new(|cx| InputState::new(window, cx));
-        let inline_rename_input = cx.new(|cx| InputState::new(window, cx));
-        let palette_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Type a command, or ? to search files…")
-        });
 
         let addr_sub = cx.subscribe_in(
             &address_input,
@@ -871,72 +903,15 @@ impl OnyxExplorer {
             },
         );
 
-        let prompt_sub = cx.subscribe_in(
-            &prompt_input,
-            window,
-            |explorer, _state, ev: &InputEvent, window, cx| {
-                if matches!(ev, InputEvent::PressEnter { .. }) && explorer.prompt_state.is_some() {
-                    explorer.confirm_prompt(window, cx);
-                }
-            },
-        );
-
-        let inline_rename_sub = cx.subscribe_in(
-            &inline_rename_input,
-            window,
-            |explorer, _state, ev: &InputEvent, window, cx| match ev {
-                InputEvent::PressEnter { .. } => {
-                    if explorer.inline_rename.is_some() {
-                        explorer.commit_inline_rename(window, cx);
-                    }
-                }
-                InputEvent::Blur => {
-                    if explorer.inline_rename.is_some() {
-                        explorer.cancel_inline_rename(window, cx);
-                    }
-                }
-                InputEvent::Change | InputEvent::Focus => {}
-            },
-        );
-
-        let palette_sub = cx.subscribe_in(
-            &palette_input,
-            window,
-            |explorer, state, ev: &InputEvent, window, cx| match ev {
-                InputEvent::Change => {
-                    let query = state.read(cx).value().to_string();
-                    explorer.on_palette_query_changed(query, cx);
-                }
-                InputEvent::PressEnter { .. } => {
-                    explorer.activate_palette_selection(window, cx);
-                }
-                InputEvent::Focus | InputEvent::Blur => {}
-            },
-        );
-
+        // The hidden inputs (`prompt_input`, `inline_rename_input`,
+        // `palette_input`) and the heavy background subsystems are created on
+        // demand: Frame 1 only needs the address bar, the filter box, and the
+        // initial listing.
         let (clipboard_tx, clipboard_rx) = mpsc::unbounded_channel();
         let shutdown_token = CancellationToken::new();
-        let watch_cmd_tx = spawn_directory_watcher(
-            Arc::clone(&runtime),
-            shutdown_token.clone(),
-            PaneId::Primary,
-            cx,
-        );
-        let watch_cmd_tx_secondary = spawn_directory_watcher(
-            Arc::clone(&runtime),
-            shutdown_token.clone(),
-            PaneId::Secondary,
-            cx,
-        );
+        let (watch_cmd_tx, watch_cmd_rx) = directory_watcher_channel();
+        let (watch_cmd_tx_secondary, watch_cmd_rx_secondary) = directory_watcher_channel();
         let config_store = ConfigStore::default_location();
-        // The index worker owns the database and the watcher; the explorer only
-        // sends commands and receives `IndexEvent`s on the GPUI thread.
-        let (index_events_tx, index_events_rx) = mpsc::unbounded_channel();
-        let index = IndexController::start(
-            crate::search_index::index_path(config_store.dir()),
-            &shutdown_token,
-            index_events_tx,
-        );
         let mut explorer = Self {
             runtime,
             theme,
@@ -967,7 +942,7 @@ impl OnyxExplorer {
             selection: PaneSelection::default(),
             marquee: None,
             inline_rename: None,
-            inline_rename_input,
+            inline_rename_input: None,
             pending_collapse_click: None,
             type_ahead: TypeAheadState::default(),
             generation: GenerationId::new(0),
@@ -1001,7 +976,7 @@ impl OnyxExplorer {
             recycle_bin_has_items: false,
             search_engine: UnifiedSearchEngine::live_only(),
             search_index: None,
-            index,
+            index: None,
             index_status: IndexStatus::Disabled,
             build_generation: GenerationId::new(0),
             build_cancel: CancellationToken::new(),
@@ -1021,8 +996,8 @@ impl OnyxExplorer {
             prompt_state: None,
             conflict_dialog: None,
             pending_conflict_check: false,
-            prompt_input,
-            palette_input,
+            prompt_input: None,
+            palette_input: None,
             prompt_focus_handle,
             active_operation: None,
             context_menu: None,
@@ -1044,27 +1019,361 @@ impl OnyxExplorer {
             external_drag_returned_inside: false,
             viewport_size: (1320.0, 820.0),
             watch_cmd_tx,
+            watch_cmd_rx: Some(watch_cmd_rx),
             watched_path: None,
             watch_cmd_tx_secondary,
+            watch_cmd_rx_secondary: Some(watch_cmd_rx_secondary),
+            clipboard_rx: Some(clipboard_rx),
+            window_hwnd,
+            deferred_started: false,
+            _single_instance: None,
+            _hotplug_watcher: None,
             session_write_gate: Arc::new(Mutex::new(())),
             layout_touched: false,
             config_store,
             config: AppConfig::default(),
-            _subscriptions: vec![
-                addr_sub,
-                search_sub,
-                prompt_sub,
-                inline_rename_sub,
-                palette_sub,
-            ],
+            _subscriptions: vec![addr_sub, search_sub],
         };
 
-        explorer.start_clipboard_monitor(clipboard_rx, cx);
-        explorer.start_index_event_loop(index_events_rx, cx);
         explorer.spawn_bootstrap_sidebar_and_config(cx);
         explorer.load_directory(initial_path, false, true, cx);
         window.focus(&explorer.pane_focus[0], cx);
+        explorer.schedule_deferred_startup(window, cx);
         explorer
+    }
+
+    /// Arms the one-shot startup of the background subsystems.
+    ///
+    /// A callback registered here runs at the start of the next frame pass,
+    /// before Frame 1 is drawn, so it only arms a second one. That second
+    /// callback runs right after Frame 1 reaches the screen, which is where the
+    /// index worker, the watchers, the clipboard monitor, the rayon pool, and the
+    /// IPC listener may start without delaying the first paint.
+    fn schedule_deferred_startup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.entity();
+        window.on_next_frame(move |window, _cx| {
+            let this = this.clone();
+            window.on_next_frame(move |_window, cx| {
+                this.update(cx, |explorer, cx| {
+                    explorer.start_deferred_subsystems(cx);
+                });
+            });
+        });
+    }
+
+    /// Starts everything Frame 1 did not need.
+    ///
+    /// Idempotent: the deferred callback and any on-demand caller can race, and
+    /// the first one wins.
+    fn start_deferred_subsystems(&mut self, cx: &mut Context<Self>) {
+        if self.deferred_started {
+            return;
+        }
+        self.deferred_started = true;
+
+        let runtime = Arc::clone(&self.runtime);
+        runtime.spawn_blocking(init_rayon_pool);
+
+        self.ensure_index_started(cx);
+        self.start_directory_watchers(cx);
+        if let Some(clipboard_rx) = self.clipboard_rx.take() {
+            self.start_clipboard_monitor(clipboard_rx, cx);
+        }
+        self.start_single_instance_listener(cx);
+        self.start_volume_hotplug_listener(cx);
+        cx.notify();
+    }
+
+    /// Starts the primary and secondary directory watcher workers, consuming the
+    /// command channels created in `new` so paths queued for Frame 1 are watched
+    /// as soon as the workers exist.
+    fn start_directory_watchers(&mut self, cx: &mut Context<Self>) {
+        if let Some(watch_cmd_rx) = self.watch_cmd_rx.take() {
+            start_directory_watcher_worker(
+                Arc::clone(&self.runtime),
+                self.shutdown_token.clone(),
+                PaneId::Primary,
+                watch_cmd_rx,
+                cx,
+            );
+        }
+        if let Some(watch_cmd_rx_secondary) = self.watch_cmd_rx_secondary.take() {
+            start_directory_watcher_worker(
+                Arc::clone(&self.runtime),
+                self.shutdown_token.clone(),
+                PaneId::Secondary,
+                watch_cmd_rx_secondary,
+                cx,
+            );
+        }
+    }
+
+    /// Starts the index worker and its event loop the first time it is needed.
+    ///
+    /// The deferred startup calls this right after Frame 1; an earlier search or
+    /// `set_indexed_search` call starts it on demand instead.
+    fn ensure_index_started(&mut self, cx: &mut Context<Self>) {
+        if self.index.is_some() {
+            return;
+        }
+        let (index_events_tx, index_events_rx) = mpsc::unbounded_channel();
+        self.index = Some(IndexController::start(
+            crate::search_index::index_path(self.config_store.dir()),
+            &self.shutdown_token,
+            index_events_tx,
+        ));
+        self.start_index_event_loop(index_events_rx, cx);
+    }
+
+    /// Starts the single-instance pipe listener and forwards its commands to the
+    /// UI thread, so a warm re-launch raises this window and opens its path.
+    fn start_single_instance_listener(&mut self, cx: &mut Context<Self>) {
+        if self._single_instance.is_some() {
+            return;
+        }
+        // The listener thread owns the pipe; this side only receives commands.
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel::<IpcCommand>();
+        let Ok(server) = start_single_instance_server(move |command| {
+            let _ = command_tx.send(command);
+        }) else {
+            return;
+        };
+        self._single_instance = Some(server);
+
+        cx.spawn(async move |this, cx| {
+            while let Some(command) = command_rx.recv().await {
+                let alive = this
+                    .update(cx, |explorer, cx| {
+                        explorer.handle_ipc_command(command, cx);
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Raises this window and opens the path a warm re-launch forwarded.
+    fn handle_ipc_command(&mut self, command: IpcCommand, cx: &mut Context<Self>) {
+        if let Some(hwnd) = self.window_hwnd {
+            let _ = focus_window(hwnd);
+        }
+        let forwarded = match command {
+            IpcCommand::OpenPath(path) => path,
+            IpcCommand::ShowWindow => None,
+        };
+        let Some(path) = forwarded else {
+            cx.notify();
+            return;
+        };
+
+        // A forwarded file opens its folder with that file revealed.
+        let (directory, selection) = if path.is_dir() {
+            (path.clone(), None)
+        } else if let Some(parent) = path.parent() {
+            (parent.to_path_buf(), Some(path.clone()))
+        } else {
+            return;
+        };
+
+        // Reuse the tab already showing the folder instead of stacking duplicates.
+        if let Some(index) = self
+            .tabs
+            .tabs()
+            .iter()
+            .position(|tab| same_path(&tab.path, &directory))
+        {
+            if self.tabs.switch_tab(index) {
+                self.address_editing = false;
+                if let Some(tab) = self.tabs.active_tab() {
+                    self.sort_spec = tab.sort;
+                }
+            }
+        } else {
+            self.tabs.new_tab(directory.clone());
+            self.sort_spec = self
+                .tabs
+                .active_tab()
+                .map_or_else(SortSpec::default, |tab| tab.sort);
+        }
+        self.pending_selection = selection;
+        self.load_directory(directory, true, true, cx);
+        cx.notify();
+    }
+
+    /// Starts the `WM_DEVICECHANGE` volume hotplug watcher and forwards drive
+    /// arrival and removal events to the UI thread.
+    fn start_volume_hotplug_listener(&mut self, cx: &mut Context<Self>) {
+        if self._hotplug_watcher.is_some() {
+            return;
+        }
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<DriveChangeEvent>();
+        let Ok(watcher) = start_volume_hotplug_watcher(move |event| {
+            let _ = event_tx.send(event);
+        }) else {
+            return;
+        };
+        self._hotplug_watcher = Some(watcher);
+
+        let runtime = Arc::clone(&self.runtime);
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = event_rx.recv().await {
+                let (drives_tx, drives_rx) = oneshot::channel();
+                runtime.spawn_blocking(move || {
+                    let drives = enumerate_drives();
+                    let mut icons = Vec::with_capacity(drives.len());
+                    for drive in &drives {
+                        let key = path_icon_key(&drive.root);
+                        let icon = extract_path_icon_rgba(&drive.root, true);
+                        icons.push((key, icon));
+                    }
+                    let _ = drives_tx.send((drives, icons));
+                });
+                let Ok((drives, drive_icons)) = drives_rx.await else {
+                    continue;
+                };
+                let alive = this
+                    .update(cx, |explorer, cx| {
+                        explorer.handle_drive_change_event(event, drives, drive_icons, cx);
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Applies a volume arrival or removal notification: refreshes sidebar drives
+    /// and icons, updates the status bar, and navigates away from removed volumes.
+    fn handle_drive_change_event(
+        &mut self,
+        event: DriveChangeEvent,
+        drives: Vec<DriveInfo>,
+        drive_icons: Vec<(String, Option<RgbaIcon>)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.drives = drives;
+        self.icons.insert_batch(drive_icons);
+        self.status_message = Some(drive_change_status_message(&event));
+
+        if event.kind == DriveChangeKind::Removed && !event.drive_letters.is_empty() {
+            for &letter in &event.drive_letters {
+                let root = PathBuf::from(format!("{letter}:\\"));
+                self.invalidate_path_caches(&root);
+            }
+            let home = self.home_path.clone();
+            if !self.is_recycle_bin_mode()
+                && path_is_on_drive_letters(self.current_path(), &event.drive_letters)
+            {
+                self.load_directory(home.clone(), true, true, cx);
+            }
+            if path_is_on_drive_letters(&self.secondary.path, &event.drive_letters) {
+                if self.dual_pane {
+                    self.load_secondary_directory(home, true, true, cx);
+                } else {
+                    self.secondary.path = home.clone();
+                    self.secondary.history = NavHistory::with_initial(home);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    // ---- Lazy hidden inputs ----
+
+    /// Creates the prompt dialog's name field and its key handling on first use.
+    ///
+    /// The three hidden inputs are not part of Frame 1, so building them with the
+    /// rest of the explorer only adds entity registration and layout time to the
+    /// first paint.
+    fn ensure_prompt_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        if let Some(input) = &self.prompt_input {
+            return input.clone();
+        }
+        let input = cx.new(|cx| InputState::new(window, cx));
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |explorer, _state, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) && explorer.prompt_state.is_some() {
+                    explorer.confirm_prompt(window, cx);
+                }
+            },
+        );
+        self._subscriptions.push(subscription);
+        self.prompt_input = Some(input.clone());
+        input
+    }
+
+    /// Creates the inline rename field and its key handling on first use.
+    fn ensure_inline_rename_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        if let Some(input) = &self.inline_rename_input {
+            return input.clone();
+        }
+        let input = cx.new(|cx| InputState::new(window, cx));
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |explorer, _state, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } => {
+                    if explorer.inline_rename.is_some() {
+                        explorer.commit_inline_rename(window, cx);
+                    }
+                }
+                InputEvent::Blur => {
+                    if explorer.inline_rename.is_some() {
+                        explorer.cancel_inline_rename(window, cx);
+                    }
+                }
+                InputEvent::Change | InputEvent::Focus => {}
+            },
+        );
+        self._subscriptions.push(subscription);
+        self.inline_rename_input = Some(input.clone());
+        input
+    }
+
+    /// Creates the command palette field and its key handling on first use.
+    fn ensure_palette_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        if let Some(input) = &self.palette_input {
+            return input.clone();
+        }
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Type a command, or ? to search files…")
+        });
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            |explorer, state, ev: &InputEvent, window, cx| match ev {
+                InputEvent::Change => {
+                    let query = state.read(cx).value().to_string();
+                    explorer.on_palette_query_changed(query, cx);
+                }
+                InputEvent::PressEnter { .. } => {
+                    explorer.activate_palette_selection(window, cx);
+                }
+                InputEvent::Focus | InputEvent::Blur => {}
+            },
+        );
+        self._subscriptions.push(subscription);
+        self.palette_input = Some(input.clone());
+        input
     }
 
     // ---- Queries for modular components ----
@@ -2039,7 +2348,10 @@ impl OnyxExplorer {
             self.recycle_items.clear();
         }
         if self.indexed_search {
-            self.index.watch(self.index_roots());
+            self.ensure_index_started(cx);
+            if let Some(index) = &self.index {
+                index.watch(self.index_roots());
+            }
         }
         self.clear_pane_selection(PaneId::Primary);
         self.inline_rename = None;
@@ -2715,15 +3027,19 @@ impl OnyxExplorer {
         self.config.indexed_search = value;
         self.persist_config();
         if value {
+            self.ensure_index_started(cx);
             self.index_status = IndexStatus::Opening;
-            self.index
-                .enable(self.index_roots(), self.config.excluded_index_dirs.clone());
+            if let Some(index) = &self.index {
+                index.enable(self.index_roots(), self.config.excluded_index_dirs.clone());
+            }
             // Index the configured roots, not just the folder that happens to
             // be open: a search from elsewhere has to find these files too.
             self.request_index_build(self.index_roots(), cx);
             self.status_message = Some("Indexed search on.".to_string());
         } else {
-            self.index.disable();
+            if let Some(index) = &self.index {
+                index.disable();
+            }
             self.build_cancel.cancel();
             self.search_index = None;
             self.search_engine = UnifiedSearchEngine::live_only();
@@ -4101,7 +4417,8 @@ impl OnyxExplorer {
             let sem = Arc::clone(&semaphore);
             let cancel_tok = cancel.clone();
             let store_opt = store.clone();
-            let (tx, rx) = tokio::sync::oneshot::channel::<Option<(PathBuf, FolderSizeResult)>>();
+            let (tx, rx) =
+                tokio::sync::oneshot::channel::<Option<(PathBuf, FolderSizeScanOutput)>>();
 
             runtime.spawn(async move {
                 if cancel_tok.is_cancelled() {
@@ -4122,12 +4439,15 @@ impl OnyxExplorer {
 
                     match lookup {
                         Ok((_, Some(cached))) => {
-                            let res = FolderSizeResult {
-                                total_bytes: cached.total_bytes,
-                                file_count: cached.file_count,
-                                truncated: cached.truncated,
+                            let output = FolderSizeScanOutput {
+                                root: FolderSizeResult {
+                                    total_bytes: cached.total_bytes,
+                                    file_count: cached.file_count,
+                                    truncated: cached.truncated,
+                                },
+                                subtrees: Vec::new(),
                             };
-                            let _ = tx.send(Some((dir_path, res)));
+                            let _ = tx.send(Some((dir_path, output)));
                             return;
                         }
                         Ok((mtime, None)) => mtime,
@@ -4147,7 +4467,7 @@ impl OnyxExplorer {
                     return;
                 }
 
-                let result = compute_folder_size(
+                let result = compute_folder_size_with_subtrees(
                     dir_path.clone(),
                     DEFAULT_MAX_FOLDER_SIZE_ENTRIES,
                     cancel_tok.clone(),
@@ -4156,22 +4476,36 @@ impl OnyxExplorer {
                 drop(permit);
 
                 match result {
-                    Ok(size) => {
-                        if let Some(store_ref) = store_opt
-                            && let Some(mtime) = mtime_secs
-                        {
-                            let path_db = dir_path.clone();
-                            let cached = CachedFolderSize::new(
-                                size.total_bytes,
-                                size.file_count,
-                                size.truncated,
-                            );
-                            let _ = tokio::task::spawn_blocking(move || {
-                                let _ = store_ref.upsert(&path_db, cached, mtime);
-                            })
-                            .await;
+                    Ok(output) => {
+                        if let Some(store_ref) = store_opt {
+                            let batch: Vec<(PathBuf, CachedFolderSize, i64)> = output
+                                .subtrees
+                                .iter()
+                                .filter_map(|subtree| {
+                                    let mtime = subtree.mtime_secs.or_else(|| {
+                                        same_path(&subtree.path, &dir_path)
+                                            .then_some(mtime_secs)
+                                            .flatten()
+                                    })?;
+                                    Some((
+                                        subtree.path.clone(),
+                                        CachedFolderSize::new(
+                                            subtree.total_bytes,
+                                            subtree.file_count,
+                                            subtree.truncated,
+                                        ),
+                                        mtime,
+                                    ))
+                                })
+                                .collect();
+                            if !batch.is_empty() {
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    let _ = store_ref.upsert_batch(&batch);
+                                })
+                                .await;
+                            }
                         }
-                        let _ = tx.send(Some((dir_path, size)));
+                        let _ = tx.send(Some((dir_path, output)));
                     }
                     Err(_) => {
                         let _ = tx.send(None);
@@ -4203,11 +4537,21 @@ impl OnyxExplorer {
                                 .saturating_sub(1);
                         }
                     }
-                    if let Some((path, size)) = outcome {
+                    if let Some((path, output)) = outcome {
+                        for subtree in &output.subtrees {
+                            explorer.folder_sizes.put(
+                                &subtree.path,
+                                CachedFolderSize::new(
+                                    subtree.total_bytes,
+                                    subtree.file_count,
+                                    subtree.truncated,
+                                ),
+                            );
+                        }
                         let cached = CachedFolderSize::new(
-                            size.total_bytes,
-                            size.file_count,
-                            size.truncated,
+                            output.root.total_bytes,
+                            output.root.file_count,
+                            output.root.truncated,
                         );
                         explorer.folder_sizes.put(&path, cached);
                         let all_entries = match pane {
@@ -4216,7 +4560,7 @@ impl OnyxExplorer {
                         };
                         for entry in all_entries {
                             if same_path(&entry.path, &path) {
-                                entry.size = size.total_bytes;
+                                entry.size = output.root.total_bytes;
                             }
                         }
                         explorer.apply_filter_and_sort();
@@ -4402,7 +4746,8 @@ impl OnyxExplorer {
             original_name: name.clone(),
         });
         self.reveal_list_row(pane, idx, cx);
-        self.inline_rename_input.update(cx, |input, cx| {
+        let rename_input = self.ensure_inline_rename_input(window, cx);
+        rename_input.update(cx, |input, cx| {
             input.set_value(name, window, cx);
             input.focus(window, cx);
             input.set_selected_range(stem_range, cx);
@@ -4415,7 +4760,11 @@ impl OnyxExplorer {
         let Some(rename) = self.inline_rename.take() else {
             return;
         };
-        let new_name = self.inline_rename_input.read(cx).value().trim().to_string();
+        let new_name = self
+            .inline_rename_input
+            .as_ref()
+            .map(|input| input.read(cx).value().trim().to_string())
+            .unwrap_or_default();
         self.focus_active_pane(window, cx);
         if new_name.is_empty() || new_name == rename.original_name {
             cx.notify();
@@ -4502,7 +4851,8 @@ impl OnyxExplorer {
         a11y::open_modal(self, ModalSurface::Prompt, 0, window, cx);
         if show_input {
             let value = initial_input.to_string();
-            self.prompt_input.update(cx, |input, cx| {
+            let prompt_input = self.ensure_prompt_input(window, cx);
+            prompt_input.update(cx, |input, cx| {
                 input.set_value(value, window, cx);
                 input.focus(window, cx);
             });
@@ -4521,9 +4871,8 @@ impl OnyxExplorer {
         let input_focused = show_input
             && self
                 .prompt_input
-                .read(cx)
-                .focus_handle(cx)
-                .is_focused(window);
+                .as_ref()
+                .is_some_and(|input| input.read(cx).focus_handle(cx).is_focused(window));
         let focused_slot = a11y::modal_focused_slot(self, ModalSurface::Prompt, window);
         let current = if input_focused {
             Some(0)
@@ -4533,8 +4882,8 @@ impl OnyxExplorer {
         let count = if show_input { 3 } else { 2 };
         let next = a11y::next_stop(current, forward, count);
         if show_input && next == 0 {
-            self.prompt_input
-                .update(cx, |input, cx| input.focus(window, cx));
+            let prompt_input = self.ensure_prompt_input(window, cx);
+            prompt_input.update(cx, |input, cx| input.focus(window, cx));
         } else {
             let slot = if show_input { next - 1 } else { next };
             a11y::focus_modal_slot(self, ModalSurface::Prompt, slot, window, cx);
@@ -4551,7 +4900,11 @@ impl OnyxExplorer {
         let Some(prompt) = self.prompt_state.take() else {
             return;
         };
-        let input_text = self.prompt_input.read(cx).value().to_string();
+        let input_text = self
+            .prompt_input
+            .as_ref()
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
         a11y::close_modal(self, ModalSurface::Prompt, window, cx);
 
         let operation = match prompt.kind {
@@ -6009,11 +6362,12 @@ impl OnyxExplorer {
         self.settings_open = false;
         self.quick_look_open = false;
         a11y::remember_modal_focus(self, ModalSurface::Palette, window, cx);
-        self.palette_input.update(cx, |input, cx| {
+        let palette_input = self.ensure_palette_input(window, cx);
+        palette_input.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.focus(window, cx);
         });
-        self.command_palette = Some(CommandPaletteState::new(self.palette_input.clone()));
+        self.command_palette = Some(CommandPaletteState::new(palette_input));
         cx.notify();
     }
 
@@ -6415,12 +6769,16 @@ impl OnyxExplorer {
         if !self.indexed_search {
             return;
         }
-        self.index.disable();
+        self.ensure_index_started(cx);
+        if let Some(index) = &self.index {
+            index.disable();
+        }
         self.search_index = None;
         self.search_engine = UnifiedSearchEngine::live_only();
         self.index_status = IndexStatus::Opening;
-        self.index
-            .enable(self.index_roots(), self.config.excluded_index_dirs.clone());
+        if let Some(index) = &self.index {
+            index.enable(self.index_roots(), self.config.excluded_index_dirs.clone());
+        }
         self.request_index_build(self.index_roots(), cx);
         cx.notify();
     }
@@ -6449,8 +6807,9 @@ impl OnyxExplorer {
         {
             match surface {
                 ModalSurface::Palette if a11y::modal_slot_is_focused(self, surface, 0, window) => {
-                    self.palette_input
-                        .update(cx, |input, cx| input.focus(window, cx));
+                    if let Some(palette_input) = self.palette_input.clone() {
+                        palette_input.update(cx, |input, cx| input.focus(window, cx));
+                    }
                 }
                 ModalSurface::Prompt => self.step_prompt_focus(!mods.shift, window, cx),
                 _ => a11y::step_modal_focus(self, surface, !mods.shift, window, cx),
@@ -7074,13 +7433,25 @@ impl Render for OnyxExplorer {
     }
 }
 
-fn spawn_directory_watcher(
+/// Creates the command channel a directory watcher consumes once it starts.
+fn directory_watcher_channel() -> (
+    mpsc::UnboundedSender<PathBuf>,
+    mpsc::UnboundedReceiver<PathBuf>,
+) {
+    mpsc::unbounded_channel()
+}
+
+/// Starts the blocking watcher worker of `pane` on `cmd_rx`.
+///
+/// The channel is created during `OnyxExplorer::new` so the `initial_path`
+/// queued for Frame 1 is watched as soon as the worker starts after Frame 1.
+fn start_directory_watcher_worker(
     runtime: Arc<Runtime>,
     shutdown: CancellationToken,
     pane: PaneId,
+    mut cmd_rx: mpsc::UnboundedReceiver<PathBuf>,
     cx: &mut Context<OnyxExplorer>,
-) -> mpsc::UnboundedSender<PathBuf> {
-    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<PathBuf>();
+) {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<WatchEvent>();
     let handle = runtime.handle().clone();
 
@@ -7121,8 +7492,6 @@ fn spawn_directory_watcher(
         }
     })
     .detach();
-
-    cmd_tx
 }
 
 /// Registers a raw window mouse listener that hands an armed drag to the shell
@@ -7212,6 +7581,46 @@ pub(crate) fn same_path(first: &Path, second: &Path) -> bool {
             .to_ascii_lowercase()
     };
     first == second || normalize(first) == normalize(second)
+}
+
+/// Formats a concise status-bar notification for a volume arrival or removal.
+fn drive_change_status_message(event: &DriveChangeEvent) -> String {
+    let verb = match event.kind {
+        DriveChangeKind::Arrived => "connected",
+        DriveChangeKind::Removed => "removed",
+    };
+    match event.drive_letters.as_slice() {
+        [] => format!("Drive {verb}"),
+        [letter] => format!("Drive {}: {verb}", letter.to_ascii_uppercase()),
+        letters => {
+            let list = letters
+                .iter()
+                .map(|letter| format!("{}:", letter.to_ascii_uppercase()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Drives {list} {verb}")
+        }
+    }
+}
+
+/// Returns `true` when `path` resides on any of the drive roots in `letters` (`<L>:\`).
+fn path_is_on_drive_letters(path: &Path, letters: &[char]) -> bool {
+    if letters.is_empty() {
+        return false;
+    }
+    let normalized = normalize_display_path(path);
+    let bytes = normalized.as_bytes();
+    if bytes.len() >= 2
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || matches!(bytes[2], b'\\' | b'/'))
+    {
+        let drive = char::from(bytes[0]).to_ascii_uppercase();
+        letters
+            .iter()
+            .any(|&letter| letter.to_ascii_uppercase() == drive)
+    } else {
+        false
+    }
 }
 
 /// Builds the list row for one Recycle Bin item.
