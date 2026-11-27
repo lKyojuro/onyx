@@ -167,6 +167,7 @@ pub enum ViewMode {
 pub enum ThemeMode {
     #[default]
     Dark,
+    Oled,
     Light,
     System,
 }

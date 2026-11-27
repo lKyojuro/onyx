@@ -78,6 +78,17 @@ Nach jedem Meilenstein die Qualitätschecks aus [AGENTS.md](../AGENTS.md) ausfü
   - `crates/onyx-ui-gpui` ist in den Root-Workspace integriert und baut das Haupt-Binary `onyx.exe`; die alten Slint-Crates (`onyx-ui`, `onyx-app`) wurden entfernt.
 - [ ] **Inline-Fuzzy-Filter & „Group By“ in GPUI verdrahten:** Die fertige Engine in `onyx-core` (`filter.rs`, `group.rs`) in die Dateiliste von `onyx-ui-gpui` einbinden.
 - [ ] **Weitere Phase-8-Ideen** siehe [Roadmap](ROADMAP.md) (Inline-Baumansicht, anpassbare Spalten & Per-Folder-Views, USB/Netzwerk-Hotplug, `.7z`, RAM-Optimierung `< 50 MB`, USN-Journal, signierte Releases).
+- [ ] **Startup-Performance („nahezu instant“):**
+  - **Deferred Init nach Frame 1:** `rayon`-Pool, `IndexController`, Directory-Watcher, Clipboard-Monitor und nicht sofort sichtbare `InputState`-Widgets erst nach dem ersten gerenderten Frame initialisieren; selten genutzte Windows-DLLs per `/DELAYLOAD` verzögert laden.
+  - **Single-Instance & Warm-Background-Modus (optional):** Laufende Hintergrund-Instanz (System Tray, warmer DirectX/GPUI-Kontext, ~0 % CPU), sodass neue Starts oder Hotkeys per Named Pipe in `< 20–40 ms` ein Fenster öffnen.
+- [ ] **Ordnergrößen-Scan der nächsten Stufe (schnell & ohne Last-Spikes):**
+  - **Win32 Low-Level + Low-Priority-I/O:** `FindFirstFileExW` (`FindExInfoBasic` + `FIND_FIRST_EX_LARGE_FETCH`) bzw. `NtQueryDirectoryFileEx` mit `SetThreadPriority(THREAD_MODE_BACKGROUND_BEGIN)` (drosselt CPU & Disk-I/O automatisch für andere Apps) + **Bottom-up-Caching** aller traversierten Unterordner.
+  - **SSD-bewusste Parallelisierung:** 4–8 Low-Priority-Worker auf SSDs (per `StorageDeviceSeekPenaltyProperty` erkannt), 1 Worker auf rotierenden HDDs.
+  - **Optionaler NTFS MFT + USN-Journal-Modus:** Sequenzielles MFT-Lesen + Live-USN-Updates (über optionalen kleinen Windows-Dienst / Admin-Modus) für `< 1 ms` Ordnergrößen auf dem gesamten Laufwerk.
+- [ ] **High-Speed Copy/Move-Engine (`onyx-operations`):**
+  - **Viele kleine Dateien (3×–8× schneller auf SSDs):** Parallele Copy-Worker (4–8 Threads) bei SSDs, sequenziell auf HDDs (automatische Erkennung via `IOCTL_STORAGE_QUERY_PROPERTY`).
+  - **Große Dateien (+30–100 % Durchsatz):** Windows-natives `CopyFile2` oder Overlapped/Double-Buffered Async I/O (`FILE_FLAG_OVERLAPPED` + `FILE_FLAG_NO_BUFFERING`, 4–16 MiB Puffer) + Vorab-Allokation (`SetFileInformationByHandle` / `FileEndOfFileInfo`) gegen Fragmentierung und RAM-Cache-Pollution.
+  - **Zero-Copy-Sonderfälle:** ReFS / Dev-Drive Block Cloning (`FSCTL_DUPLICATE_EXTENTS_TO_FILE`) sowie automatisches SMB Server-Side Copy (`FSCTL_SRV_COPYCHUNK` via `CopyFile2`) auf Netzlaufwerken.
 
 ## GPUI-Haupt-UI: Abgeschlossene Paritätspakete & Restpunkte
 

@@ -13,6 +13,7 @@ pub const DEFAULT_ACCENT_RGB: u32 = 0x9eafc5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OnyxTheme {
     pub dark_mode: bool,
+    pub oled_mode: bool,
     pub accent_rgb: u32,
 }
 
@@ -20,6 +21,7 @@ impl Default for OnyxTheme {
     fn default() -> Self {
         Self {
             dark_mode: true,
+            oled_mode: false,
             accent_rgb: DEFAULT_ACCENT_RGB,
         }
     }
@@ -32,6 +34,18 @@ impl OnyxTheme {
     pub const fn new(dark_mode: bool) -> Self {
         Self {
             dark_mode,
+            oled_mode: false,
+            accent_rgb: DEFAULT_ACCENT_RGB,
+        }
+    }
+
+    /// Creates a pure-black OLED dark theme with the default accent.
+    #[allow(dead_code)]
+    #[must_use]
+    pub const fn oled() -> Self {
+        Self {
+            dark_mode: true,
+            oled_mode: true,
             accent_rgb: DEFAULT_ACCENT_RGB,
         }
     }
@@ -50,7 +64,9 @@ impl OnyxTheme {
 
     #[must_use]
     pub fn bg_base(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x000000).into()
+        } else if self.dark_mode {
             rgb(0x101722).into()
         } else {
             rgb(0xedf1f6).into()
@@ -59,7 +75,9 @@ impl OnyxTheme {
 
     #[must_use]
     pub fn bg_chrome(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x000000).into()
+        } else if self.dark_mode {
             rgb(0x141c29).into()
         } else {
             rgb(0xe4eaf2).into()
@@ -68,7 +86,9 @@ impl OnyxTheme {
 
     #[must_use]
     pub fn bg_sidebar(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x000000).into()
+        } else if self.dark_mode {
             rgb(0x182230).into()
         } else {
             rgb(0xe8edf4).into()
@@ -77,7 +97,9 @@ impl OnyxTheme {
 
     #[must_use]
     pub fn bg_surface(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x0a0a0a).into()
+        } else if self.dark_mode {
             rgb(0x202a38).into()
         } else {
             rgb(0xffffff).into()
@@ -86,7 +108,9 @@ impl OnyxTheme {
 
     #[must_use]
     pub fn bg_surface_alt(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x080808).into()
+        } else if self.dark_mode {
             rgb(0x1c2634).into()
         } else {
             rgb(0xf5f7fa).into()
@@ -95,7 +119,9 @@ impl OnyxTheme {
 
     #[must_use]
     pub fn bg_elevated(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x121212).into()
+        } else if self.dark_mode {
             rgb(0x263242).into()
         } else {
             rgb(0xffffff).into()
@@ -104,7 +130,9 @@ impl OnyxTheme {
 
     #[must_use]
     pub fn bg_hover(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x181818).into()
+        } else if self.dark_mode {
             rgb(0x2c394b).into()
         } else {
             rgb(0xdfe7f1).into()
@@ -113,7 +141,9 @@ impl OnyxTheme {
 
     #[must_use]
     pub fn bg_pressed(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x222222).into()
+        } else if self.dark_mode {
             rgb(0x37475c).into()
         } else {
             rgb(0xcfdae8).into()
@@ -122,7 +152,9 @@ impl OnyxTheme {
 
     #[must_use]
     pub fn bg_selected(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x1c232d).into()
+        } else if self.dark_mode {
             rgb(0x35465d).into()
         } else {
             rgb(0xd5e0ee).into()
@@ -131,7 +163,9 @@ impl OnyxTheme {
 
     #[must_use]
     pub fn bg_input(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x080808).into()
+        } else if self.dark_mode {
             rgb(0x141e2b).into()
         } else {
             rgb(0xffffff).into()
@@ -141,7 +175,9 @@ impl OnyxTheme {
     #[allow(dead_code)]
     #[must_use]
     pub fn bg_code(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x070707).into()
+        } else if self.dark_mode {
             rgb(0x131d2b).into()
         } else {
             rgb(0xeef2f7).into()
@@ -150,7 +186,9 @@ impl OnyxTheme {
 
     #[must_use]
     pub fn bg_badge(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x161616).into()
+        } else if self.dark_mode {
             rgb(0x2b394b).into()
         } else {
             rgb(0xdfe7f1).into()
@@ -160,7 +198,9 @@ impl OnyxTheme {
     #[allow(dead_code)]
     #[must_use]
     pub fn bg_backdrop(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgba(0x000000cc).into()
+        } else if self.dark_mode {
             rgba(0x0d1520c4).into()
         } else {
             rgba(0x202a3870).into()
@@ -171,7 +211,9 @@ impl OnyxTheme {
 
     #[must_use]
     pub fn border_subtle(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x1f1f1f).into()
+        } else if self.dark_mode {
             rgb(0x334154).into()
         } else {
             rgb(0xcbd5e2).into()
@@ -180,7 +222,9 @@ impl OnyxTheme {
 
     #[must_use]
     pub fn border_strong(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x363636).into()
+        } else if self.dark_mode {
             rgb(0x586b83).into()
         } else {
             rgb(0x8798ac).into()
@@ -406,7 +450,9 @@ impl OnyxTheme {
     /// Recessed pill surface for the hardware-inspired 7x7 LED dot-matrix pill.
     #[must_use]
     pub fn bg_led_pill(self) -> Hsla {
-        if self.dark_mode {
+        if self.oled_mode {
+            rgb(0x050505).into()
+        } else if self.dark_mode {
             rgb(0x0b1018).into()
         } else {
             rgb(0x161f2c).into()
@@ -465,5 +511,20 @@ mod tests {
         assert_ne!(dark.bg_chrome(), light.bg_chrome());
         assert_ne!(dark.bg_surface(), light.bg_surface());
         assert_ne!(dark.text_primary(), light.text_primary());
+    }
+
+    #[test]
+    fn oled_tokens_use_pure_black_surfaces() {
+        let oled = OnyxTheme::oled();
+        let dark = OnyxTheme::new(true);
+        let black: Hsla = rgb(0x000000).into();
+        assert!(oled.dark_mode);
+        assert!(oled.oled_mode);
+        assert_eq!(oled.bg_base(), black);
+        assert_eq!(oled.bg_chrome(), black);
+        assert_eq!(oled.bg_sidebar(), black);
+        assert_ne!(oled.bg_base(), dark.bg_base());
+        assert_ne!(oled.bg_surface(), dark.bg_surface());
+        assert_ne!(oled.border_subtle(), dark.border_subtle());
     }
 }

@@ -49,10 +49,16 @@ pub fn next_terminal(current: &str) -> &'static str {
 #[must_use]
 pub fn resolve_dark_mode(mode: ThemeMode) -> bool {
     match mode {
-        ThemeMode::Dark => true,
+        ThemeMode::Dark | ThemeMode::Oled => true,
         ThemeMode::Light => false,
         ThemeMode::System => onyx_windows::detect_system_theme() == ThemeMode::Dark,
     }
+}
+
+/// Maps a [`ThemeMode`] onto the palette's pure-black OLED flag.
+#[must_use]
+pub const fn resolve_oled_mode(mode: ThemeMode) -> bool {
+    matches!(mode, ThemeMode::Oled)
 }
 
 /// Short label of a theme mode for the segmented control.
@@ -60,6 +66,7 @@ pub fn resolve_dark_mode(mode: ThemeMode) -> bool {
 pub const fn theme_label(mode: ThemeMode) -> &'static str {
     match mode {
         ThemeMode::Dark => "Dark",
+        ThemeMode::Oled => "OLED",
         ThemeMode::Light => "Light",
         ThemeMode::System => "System",
     }
@@ -172,6 +179,8 @@ pub fn render_settings_overlay(
     let config = &view.config;
     let theme_mode = if config.theme == ThemeMode::System {
         ThemeMode::System
+    } else if theme.oled_mode {
+        ThemeMode::Oled
     } else if theme.dark_mode {
         ThemeMode::Dark
     } else {
@@ -194,28 +203,33 @@ pub fn render_settings_overlay(
     let esc_focus = ring.slot();
     let close_focus = ring.slot();
 
-    let theme_controls: Vec<AnyElement> = [ThemeMode::Dark, ThemeMode::Light, ThemeMode::System]
-        .into_iter()
-        .map(|mode| {
-            let handle = ring.slot();
-            fluent_chip(
-                format!("settings-theme-{}", theme_label(mode)).into(),
-                theme_label(mode),
-                theme_mode == mode,
-                true,
-                theme,
-                Some(Box::new(cx.listener(move |explorer, _, window, cx| {
-                    explorer.set_theme_mode(mode, window, cx);
-                }))),
-            )
-            .role(Role::RadioButton)
-            .aria_label(format!("Theme: {}", theme_label(mode)))
-            .aria_selected(theme_mode == mode)
-            .track_focus(&handle)
-            .focus_visible(move |style| a11y::focus_ring_style(theme, style))
-            .into_any_element()
-        })
-        .collect();
+    let theme_controls: Vec<AnyElement> = [
+        ThemeMode::Dark,
+        ThemeMode::Oled,
+        ThemeMode::Light,
+        ThemeMode::System,
+    ]
+    .into_iter()
+    .map(|mode| {
+        let handle = ring.slot();
+        fluent_chip(
+            format!("settings-theme-{}", theme_label(mode)).into(),
+            theme_label(mode),
+            theme_mode == mode,
+            true,
+            theme,
+            Some(Box::new(cx.listener(move |explorer, _, window, cx| {
+                explorer.set_theme_mode(mode, window, cx);
+            }))),
+        )
+        .role(Role::RadioButton)
+        .aria_label(format!("Theme: {}", theme_label(mode)))
+        .aria_selected(theme_mode == mode)
+        .track_focus(&handle)
+        .focus_visible(move |style| a11y::focus_ring_style(theme, style))
+        .into_any_element()
+    })
+    .collect();
 
     let view_controls: Vec<AnyElement> = [ViewMode::Details, ViewMode::Grid]
         .into_iter()
@@ -722,12 +736,17 @@ mod tests {
     #[test]
     fn dark_mode_resolution_covers_explicit_modes() {
         assert!(resolve_dark_mode(ThemeMode::Dark));
+        assert!(resolve_dark_mode(ThemeMode::Oled));
         assert!(!resolve_dark_mode(ThemeMode::Light));
+        assert!(resolve_oled_mode(ThemeMode::Oled));
+        assert!(!resolve_oled_mode(ThemeMode::Dark));
+        assert!(!resolve_oled_mode(ThemeMode::Light));
     }
 
     #[test]
     fn labels_match_the_slint_settings_copy() {
         assert_eq!(theme_label(ThemeMode::Dark), "Dark");
+        assert_eq!(theme_label(ThemeMode::Oled), "OLED");
         assert_eq!(theme_label(ThemeMode::Light), "Light");
         assert_eq!(theme_label(ThemeMode::System), "System");
         assert_eq!(view_label(ViewMode::Details), "Details");

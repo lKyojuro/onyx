@@ -73,5 +73,8 @@
 - [ ] Live USB/removable drive hotplug & network share detection
 - [ ] Extended archive formats (`.tar.gz`/`.tgz` implemented in `onyx-operations`; `.7z` pending)
 - [ ] Idle memory footprint optimization (stretch target `< 50 MB` working set)
+- [ ] Near-instant startup (post-Frame-1 deferred init, `/DELAYLOAD`, optional single-instance warm background tray mode `< 40 ms`)
+- [ ] Low-overhead fast folder-size scanner (Win32 `FindFirstFileExW`/`NtQueryDirectoryFileEx`, `THREAD_MODE_BACKGROUND_BEGIN` low CPU/I/O priority, bottom-up subtree caching, optional NTFS MFT + USN live sizes)
+- [ ] High-speed file transfer engine (SSD-aware parallel copy for small files, `CopyFile2` / overlapped unbuffered I/O + pre-allocation for large files, ReFS block cloning & SMB server-side copy)
 - [ ] Full NTFS USN Journal real-time indexing integration
 - [ ] Code-signed MSI/MSIX installers and official GitHub `v0.2.0` / `v1.0.0` release

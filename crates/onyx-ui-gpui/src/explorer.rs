@@ -1721,9 +1721,8 @@ impl OnyxExplorer {
                 if matches!(config.default_view, ViewMode::Grid) {
                     explorer.view_mode = ViewMode::Grid;
                 }
-                if config.theme == ThemeMode::Light {
-                    explorer.theme.dark_mode = false;
-                }
+                explorer.theme.dark_mode = settings_overlay::resolve_dark_mode(config.theme);
+                explorer.theme.oled_mode = settings_overlay::resolve_oled_mode(config.theme);
                 explorer.config = config;
                 explorer.apply_session_layout(&session, cx);
                 if explorer.config.indexed_search {
@@ -3206,8 +3205,13 @@ impl OnyxExplorer {
 
     pub fn toggle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.theme.dark_mode = !self.theme.dark_mode;
+        if !self.theme.dark_mode {
+            self.theme.oled_mode = false;
+        }
         self.theme.sync_gpui_theme(Some(window), cx);
-        self.config.theme = if self.theme.dark_mode {
+        self.config.theme = if self.theme.oled_mode {
+            ThemeMode::Oled
+        } else if self.theme.dark_mode {
             ThemeMode::Dark
         } else {
             ThemeMode::Light
@@ -6293,6 +6297,7 @@ impl OnyxExplorer {
     pub fn set_theme_mode(&mut self, mode: ThemeMode, window: &mut Window, cx: &mut Context<Self>) {
         self.config.theme = mode;
         self.theme.dark_mode = settings_overlay::resolve_dark_mode(mode);
+        self.theme.oled_mode = settings_overlay::resolve_oled_mode(mode);
         self.theme.sync_gpui_theme(Some(window), cx);
         self.persist_config();
         cx.notify();

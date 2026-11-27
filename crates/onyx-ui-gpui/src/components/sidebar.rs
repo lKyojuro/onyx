@@ -317,19 +317,19 @@ pub fn render_sidebar(
                 } else if is_active {
                     theme.accent_border()
                 } else {
-                    theme.border_subtle()
+                    gpui_kit::transparent_black()
                 })
                 .bg(if drive_drop_hover {
                     theme.accent_subtle()
                 } else if is_active {
                     theme.bg_selected()
                 } else {
-                    theme.bg_surface_alt()
+                    gpui_kit::transparent_black()
                 })
                 .cursor_pointer()
                 .hover(move |s| {
                     if !is_active {
-                        s.bg(theme.bg_hover()).border_color(theme.border_strong())
+                        s.bg(theme.bg_hover())
                     } else {
                         s
                     }
@@ -402,7 +402,7 @@ pub fn render_sidebar(
 
     Some(
         div()
-            .id("onyx-sidebar-scroll")
+            .id("onyx-sidebar")
             .role(Role::Navigation)
             .aria_label("Sidebar")
             .flex()
@@ -410,15 +410,30 @@ pub fn render_sidebar(
             .w(px(width))
             .h_full()
             .flex_shrink_0()
-            .overflow_y_scroll()
             .bg(theme.bg_sidebar())
-            .p(px(10.0))
-            .gap(px(12.0))
-            .child(home_row)
-            .child(fav_col)
-            .child(qa_col)
-            .child(recycle_row)
-            .child(drives_col),
+            .child(
+                div()
+                    .id("onyx-sidebar-scroll")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_y_scroll()
+                    .p(px(10.0))
+                    .gap(px(12.0))
+                    .child(home_row)
+                    .child(fav_col)
+                    .child(qa_col)
+                    .child(recycle_row),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px(px(10.0))
+                    .pb(px(10.0))
+                    .pt(px(4.0))
+                    .child(drives_col),
+            ),
     )
 }
 
